@@ -279,24 +279,16 @@ Energy Supply System Optimisation:
                  thermal-network-optimization]
 
   - name: building-clustering
-    label: "Building Clustering"
-    description: >
-      Cluster buildings based on annual heat demand (QH_sys_MWhyr) and geographic proximity.
-      Optionally, reserve an existing District Thermal Network (DTN) either automatically (by reading the
-      nodes shapefile) or manually (via a CSV file).
+    label: Building Clustering for District Thermal Network Expansion
+    description: Generate building clusters based on heat demand, proximity, and existing DTN.
     interfaces: [cli, dashboard]
     module: cea.optimization_new.building_clustering
-    parameters:
-      - general:scenario
-      - extra_clusters
-      - dtn_method         # Accepts 'automatic' or 'manual'
-      - existing_dtn_filepath  # Only used if dtn_method == 'manual'
-      - network_type       # 'DH' or 'DC'
+    parameters: ['general:scenario', 'optimization-new:extra_clusters', 'optimization-new:dtn_method', 
+                  'optimization-new:existing_dtn_filepath', 'optimization-new:network-type']
     input-files:
       - [get_zone_geometry]
       - [get_total_demand]
-      - [get_network_layout_nodes]  # Optional if using automatic DTN identification
-
+      - [get_network_layout_nodes_shapefile, "network_type"]  # For automatic DTN detection
 
   - name: decentralized
     label: "Supply System Part 1: decentralised"

@@ -14451,6 +14451,7 @@ get_network_layout_nodes_shapefile:
         values: 'NA'
   used_by:
   - thermal_network
+  - building_clustering
 get_network_linear_pressure_drop_edges:
   created_by:
   - thermal_network
@@ -18431,6 +18432,40 @@ get_optimization_substations_total_file:
         values: '{0...n}'
         min: 0.0
   used_by: []
+get_building_clusters:
+  created_by:
+    - building-clustering
+  file_path: outputs/data/optimization_new/building_clusters.csv
+  file_type: csv
+  schema:
+    columns:
+      name:
+        description: Unique building ID.
+        type: string
+        unit: '[-]'
+        values: alphanumeric
+      cluster:
+        description: Cluster ID assigned to each building.
+        type: int
+        unit: '[-]'
+        values: '{0...n}'
+      x:
+        description: X-coordinate of building centroid.
+        type: float
+        unit: '[m]'
+        values: '{0.0...n}'
+      y:
+        description: Y-coordinate of building centroid.
+        type: float
+        unit: '[m]'
+        values: '{0.0...n}'
+  used_by: []
+get_building_clusters_shapefile:
+  created_by:
+    - building-clustering
+  file_path: outputs/data/optimization_new/building_clusters.shp
+  file_type: shp
+  used_by: []
 get_new_optimization_optimal_network_layout_file:
   created_by:
   - optimization_new
@@ -20667,6 +20702,7 @@ get_total_demand:
   - optimization
   - sewage_potential
   - thermal_network
+  - building_clustering
 get_water_body_potential:
   created_by:
   - water_body_potential
@@ -21192,3 +21228,4 @@ get_zone_geometry:
   - shallow_geothermal_potential
   - solar_collector
   - thermal_network
+  - building_clustering

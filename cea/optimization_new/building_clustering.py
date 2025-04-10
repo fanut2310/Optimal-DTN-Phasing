@@ -131,13 +131,17 @@ def perform_clustering(scaled_features, n_clusters):
 
 def save_results(merged_df, locator, output_name='building_clusters'):
     """
-    Saves the results as CSV and as a shapefile in the CEA output folder.
+    Saves the results using CEA-compliant locator methods.
     """
-    out_csv = os.path.join(locator.get_output_folder(), f"{output_name}.csv")
+    # Use locator methods defined in schemas.yml
+    out_csv = locator.get_building_clusters()
     merged_df.to_csv(out_csv, index=False)
-    out_shp = os.path.join(locator.get_output_folder(), f"{output_name}.shp")
+    
+    out_shp = locator.get_building_clusters_shapefile()
     merged_df.to_file(out_shp, driver="ESRI Shapefile")
+    
     return out_csv, out_shp
+
 
 
 def visualize_clusters(merged_df):

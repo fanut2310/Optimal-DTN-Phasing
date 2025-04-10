@@ -245,7 +245,7 @@ def main(config):
     existing_dtn_filepath = None  # For manual selection, e.g., "inputs/dtn_selection.csv"
 
     # Specify extra clusters for non-DTN buildings.
-    extra_clusters = 3
+    extra_clusters = ''
     network_type = 'DH'  # or 'DC'
 
     cluster_buildings(buildings_shp, demand_df, locator,

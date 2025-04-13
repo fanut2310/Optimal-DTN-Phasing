@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+
 """
 Building Clustering Script for DTN Phased Optimization
 
@@ -73,73 +74,115 @@ def read_automatic_dtn(locator, network_type='DH'):
 def merge_building_data(buildings_shp, demand_df):
     """
     Merge building spatial data (from zone shapefile) with demand data (from Total_demand.csv).
-
     - Makes sure both inputs have the "name" field as string.
     - Calculates each building's centroid and extracts the x and y coordinates.
 
     Returns:
-      A merged DataFrame containing building footprints, demand data, and centroid coordinates.
+    A merged DataFrame containing building footprints, demand data, and centroid coordinates.
     """
     buildings_shp['name'] = buildings_shp['name'].astype(str)
     demand_df['name'] = demand_df['name'].astype(str)
+
     merged_df = buildings_shp.merge(demand_df, on='name', how='inner')
+
     # Store centroid coordinates directly without saving the Point objects
     centroids = merged_df.geometry.centroid
     merged_df['x'] = centroids.x
     merged_df['y'] = centroids.y
+
     return merged_df
 
 
-def prepare_features(merged_df, heat_col='QH_sys_MWhyr'):
+def prepare_features(merged_df, heat_col='QH_sys_MWhyr', spatial_weight=2.0):
     """
-    Prepares the feature matrix for clustering:
+    Prepares the feature matrix for clustering with adjustable spatial weighting.
 
-    - Converts the annual heat demand from MWh/yr to kWh/yr (multiplication by 1000).
-    - Selects the "heat_kWhyr" alongside the x and y coordinates.
-    - Normalizes the features using StandardScaler.
+    Parameters:
+    -----------
+    merged_df : DataFrame
+        The merged dataframe with building information
+    heat_col : str
+        The column name for heat demand
+    spatial_weight : float
+        Weight multiplier for spatial coordinates (higher values emphasize spatial proximity)
 
     Returns:
-      - scaled_features: a NumPy array with zero mean and unit variance.
-      - scaler: the StandardScaler object (in case you need to reverse-transform).
+    --------
+    scaled_features : ndarray
+        Normalized features array
+    scaler : StandardScaler
+        The scaler object used for normalization
     """
     merged_df['heat_kWhyr'] = merged_df[heat_col] * 1000
+
+    # Create initial features array
     features = merged_df[['heat_kWhyr', 'x', 'y']].copy()
+
+    # Normalize features
     scaler = StandardScaler()
     scaled_features = scaler.fit_transform(features)
+
+    # Apply spatial weight to x,y coordinates
+    scaled_features[:, 1] *= spatial_weight  # x coordinate
+    scaled_features[:, 2] *= spatial_weight  # y coordinate
+
     return scaled_features, scaler
 
 
-def perform_clustering(scaled_features, n_clusters):
+def perform_clustering(scaled_features, n_clusters, min_buildings_per_cluster=5):
     """
-    Runs KMeans clustering on the standardized feature set.
+    Runs KMeans clustering with minimum cluster size constraint.
 
     Parameters:
-      - scaled_features: The normalized array of features (heat demand, x, y).
-      - n_clusters: Number of clusters for the non-DTN buildings.
-
-    Key Points:
-      - random_state is set to 42 to guarantee reproducible results.
-      - KMeans clusters the data into n_clusters by minimizing the within-cluster sum of squares.
+    -----------
+    scaled_features : ndarray
+        The normalized feature array
+    n_clusters : int
+        Initial number of clusters to create
+    min_buildings_per_cluster : int
+        Minimum number of buildings per cluster
 
     Returns:
-      The cluster labels and the fitted KMeans model.
+    --------
+    labels : ndarray
+        Cluster labels for each building
+    kmeans : KMeans
+        The fitted KMeans model
     """
+    # Calculate maximum clusters based on data size and minimum buildings per cluster
+    max_possible_clusters = max(2, min(n_clusters, len(scaled_features) // min_buildings_per_cluster))
+
+    # Ensure we don't try to create more clusters than data points
+    n_clusters = min(max_possible_clusters, len(scaled_features))
+
+    # Run KMeans clustering
     kmeans = KMeans(n_clusters=n_clusters, random_state=42)
     kmeans.fit(scaled_features)
     labels = kmeans.labels_
+
+    # Check if any cluster is too small
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    too_small = counts < min_buildings_per_cluster
+
+    # If some clusters are too small, try fewer clusters
+    if np.any(too_small) and n_clusters > 2:
+        print(f"Some clusters are too small. Reducing clusters from {n_clusters} to {n_clusters - 1}.")
+        return perform_clustering(scaled_features, n_clusters - 1, min_buildings_per_cluster)
+
     return labels, kmeans
 
 
 def save_results(cluster_data, locator):
     """
     Save clustering results to the project outputs directory.
+    Only saves the name column and the 5 new columns.
 
     Parameters:
     ----------
     cluster_data : DataFrame
         Data containing building IDs and their assigned clusters
     locator : InputLocator
-        CEA InputLocator object containing scenario path information
+        CEA InputLocator object
 
     Returns:
     -------
@@ -159,36 +202,22 @@ def save_results(cluster_data, locator):
     csv_path = os.path.join(output_dir, 'building_clusters.csv')
     shp_path = os.path.join(output_dir, 'building_clusters.shp')
 
-    # Save the results
-    cluster_data.to_csv(csv_path, index=False)
-
-    # Save as shapefile if it's a GeoDataFrame
+    # Select only required columns
+    columns_to_keep = ['name', 'x', 'y', 'in_existing_DTN', 'cluster', 'heat_kWhyr']
     if isinstance(cluster_data, gpd.GeoDataFrame):
-        # Create a copy of the data to avoid modifying the original
-        shp_data = cluster_data.copy()
+        columns_to_keep.append('geometry')
 
-        # Make sure to only include columns that can be saved in a shapefile
-        # Explicitly drop columns that might cause issues
-        columns_to_drop = []
-        # For each column, check if it might cause problems with shapefile export
-        for col in shp_data.columns:
-            # Skip the geometry column
-            if col == 'geometry':
-                continue
-            # Check if the column contains complex objects
-            if shp_data[col].dtype.name == 'object':
-                # Sample the first non-null value
-                sample = shp_data[col].dropna().iloc[0] if not shp_data[col].dropna().empty else None
-                # If it's a complex object like Point, drop the column
-                if sample is not None and isinstance(sample, (Point, gpd.array.GeometryArray)):
-                    columns_to_drop.append(col)
+    save_data = cluster_data[columns_to_keep].copy()
 
-        # Drop problematic columns
-        if columns_to_drop:
-            shp_data = shp_data.drop(columns=columns_to_drop)
+    # Save CSV without the geometry column
+    if 'geometry' in save_data.columns:
+        save_data.drop(columns=['geometry']).to_csv(csv_path, index=False)
+    else:
+        save_data.to_csv(csv_path, index=False)
 
-        # Save to shapefile
-        shp_data.to_file(shp_path)
+    # Save as shapefile
+    if isinstance(cluster_data, gpd.GeoDataFrame):
+        save_data.to_file(shp_path)
 
     print(f"Results saved to {output_dir}")
     return csv_path, shp_path
@@ -196,38 +225,85 @@ def save_results(cluster_data, locator):
 
 def visualize_clusters(merged_df):
     """
-    Visualizes the clustered buildings using a scatter plot of centroids.
+    Visualizes the clustered buildings using a scatter plot with discrete colors.
+
+    Parameters:
+    -----------
+    merged_df : DataFrame
+        The dataframe with cluster assignments
     """
+    # Get unique cluster numbers
+    clusters = merged_df['cluster'].unique()
+    n_clusters = len(clusters)
+
+    # Choose a discrete colormap based on number of clusters
+    if n_clusters <= 10:
+        # For small number of clusters, use a qualitative colormap
+        colormap = plt.cm.get_cmap('tab10', n_clusters)
+    else:
+        # For more clusters, use a larger discrete colormap
+        colormap = plt.cm.get_cmap('tab20', n_clusters)
+
+    # Create a scatter plot
     plt.figure(figsize=(10, 8))
-    scatter = plt.scatter(merged_df['x'], merged_df['y'], c=merged_df['cluster'],
-                          cmap='viridis', s=50, edgecolor='k')
+
+    # Plot each cluster with a discrete color
+    for i, cluster in enumerate(sorted(clusters)):
+        cluster_data = merged_df[merged_df['cluster'] == cluster]
+        plt.scatter(cluster_data['x'], cluster_data['y'],
+                    color=colormap(i), s=50, edgecolor='k',
+                    label=f'Cluster {cluster}')
+
+    # Add labels and title
     plt.xlabel('X Coordinate')
     plt.ylabel('Y Coordinate')
     plt.title('Building Clusters based on Thermal Demand and Proximity')
-    plt.colorbar(scatter, label='Cluster Label')
+
+    # Add a legend
+    plt.legend(title='Clusters', loc='best', bbox_to_anchor=(1.05, 1), borderaxespad=0.)
+
+    # Make layout tight to accommodate legend
+    plt.tight_layout()
+
+    # Show plot
     plt.show()
 
 
 def cluster_buildings(buildings_shp, demand_df, locator,
                       dtn_method='automatic',
                       existing_dtn_filepath=None,
-                      extra_clusters=2, network_type='DH'):
+                      extra_clusters=2,
+                      network_type='DH',
+                      spatial_weight=2.0,
+                      min_buildings_per_cluster=5):
     """
     Main clustering function.
 
-    The DTN selection can be done in two ways:
-      - "automatic": Reads the network nodes shapefile to get buildings with non-"NONE" building.
-                     Currently only for DH networks.
-      - "manual": Reads a user-specified CSV file (existing_dtn_filepath).
-
-    Buildings in the DTN are assigned a cluster label 0.
-    Buildings not in the DTN are clustered into extra_clusters (minimum 2),
-    and their labels are shifted by +1.
+    Parameters:
+    -----------
+    buildings_shp : GeoDataFrame
+        Building footprints from shapefile
+    demand_df : DataFrame
+        Building demand data
+    locator : InputLocator
+        CEA InputLocator object
+    dtn_method : str
+        Method to identify existing DTN buildings ('automatic' or 'manual')
+    existing_dtn_filepath : str
+        Path to CSV file for manual DTN selection
+    extra_clusters : int
+        Number of clusters for non-DTN buildings
+    network_type : str
+        'DH' for district heating or 'DC' for district cooling
+    spatial_weight : float
+        Weight multiplier for spatial coordinates (higher values emphasize spatial proximity)
+    min_buildings_per_cluster : int
+        Minimum number of buildings per cluster
     """
-    # Merge spatial data and demand data.
+    # Merge spatial data and demand data
     merged_df = merge_building_data(buildings_shp, demand_df)
 
-    # Identify DTN buildings.
+    # Identify DTN buildings
     if dtn_method == 'automatic':
         dtn_buildings = read_automatic_dtn(locator, network_type)
     elif dtn_method == 'manual':
@@ -237,29 +313,33 @@ def cluster_buildings(buildings_shp, demand_df, locator,
 
     print("DTN Buildings:", dtn_buildings)
 
-    # Add a flag to mark DTN buildings.
+    # Add a flag to mark DTN buildings
     merged_df['in_existing_DTN'] = merged_df['name'].isin(dtn_buildings)
 
-    # Separate DTN and non-DTN buildings.
+    # Separate DTN and non-DTN buildings
     dtn_df = merged_df[merged_df['in_existing_DTN']].copy()
     non_dtn_df = merged_df[~merged_df['in_existing_DTN']].copy()
 
-    # For non-DTN buildings, prepare features and perform clustering.
-    scaled_features, scaler = prepare_features(non_dtn_df, heat_col='QH_sys_MWhyr')
-    extra_clusters = max(2, extra_clusters)
-    labels, kmeans = perform_clustering(scaled_features, n_clusters=extra_clusters)
-    non_dtn_df['cluster'] = labels + 1  # Shift labels so that DTN becomes cluster 0.
+    # For non-DTN buildings, prepare features and perform clustering
+    scaled_features, scaler = prepare_features(non_dtn_df, heat_col='QH_sys_MWhyr', spatial_weight=spatial_weight)
 
-    # For DTN buildings, assign a cluster label of 0.
+    extra_clusters = max(2, extra_clusters)
+    labels, kmeans = perform_clustering(scaled_features, n_clusters=extra_clusters,
+                                        min_buildings_per_cluster=min_buildings_per_cluster)
+
+    non_dtn_df['cluster'] = labels + 1  # Shift labels so that DTN becomes cluster 0
+
+    # For DTN buildings, assign a cluster label of 0
     if not dtn_df.empty:
         dtn_df['cluster'] = 0
         final_df = pd.concat([dtn_df, non_dtn_df], ignore_index=True)
     else:
         final_df = non_dtn_df
 
-    # Save results and visualize.
+    # Save results and visualize
     out_csv, out_shp = save_results(final_df, locator)
     print(f"Results saved to:\nCSV: {out_csv}\nShapefile: {out_shp}")
+
     visualize_clusters(final_df)
 
 
@@ -277,6 +357,10 @@ def main(config):
     existing_dtn_filepath = config.optimization_new.existing_dtn_filepath
     network_type = config.optimization_new.network_type
 
+    # Additional parameters with default values
+    spatial_weight = 2.0  # Give more weight to spatial coordinates
+    min_buildings_per_cluster = 5  # Minimum buildings per cluster
+
     # Setup locator and load data
     locator = cea.inputlocator.InputLocator(scenario=scenario)
     buildings_shp = gpd.read_file(locator.get_zone_geometry())
@@ -291,7 +375,9 @@ def main(config):
                       dtn_method=dtn_method,
                       existing_dtn_filepath=existing_dtn_filepath,
                       extra_clusters=extra_clusters,
-                      network_type=network_type)
+                      network_type=network_type,
+                      spatial_weight=spatial_weight,
+                      min_buildings_per_cluster=min_buildings_per_cluster)
 
 
 if __name__ == "__main__":
@@ -301,7 +387,7 @@ if __name__ == "__main__":
     config = Configuration()
     # Try to use environment variable, fall back to hardcoded path
     scenario_path = os.environ.get('CEA_SCENARIO_PATH',
-                                   r"C:\Users\User\OneDrive - ETH Zurich\CEA_projects\base_design\01_base_design_2025")
+                                   r"C:\Users\changf\OneDrive - ETH Zurich\CEA_projects\base_design\01_base_design_2025")
     config.scenario = scenario_path
     # Other settings
     main(config)

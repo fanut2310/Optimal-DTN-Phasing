@@ -33,7 +33,7 @@ import geopandas as gpd
 from shapely.geometry import Point
 
 # Clustering libraries
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, DBSCAN
 from sklearn.preprocessing import StandardScaler
 
 # Visualization library
@@ -83,9 +83,10 @@ def merge_building_data(buildings_shp, demand_df):
     buildings_shp['name'] = buildings_shp['name'].astype(str)
     demand_df['name'] = demand_df['name'].astype(str)
     merged_df = buildings_shp.merge(demand_df, on='name', how='inner')
-    merged_df['centroid'] = merged_df.geometry.centroid
-    merged_df['x'] = merged_df['centroid'].apply(lambda pt: pt.x)
-    merged_df['y'] = merged_df['centroid'].apply(lambda pt: pt.y)
+    # Store centroid coordinates directly without saving the Point objects
+    centroids = merged_df.geometry.centroid
+    merged_df['x'] = centroids.x
+    merged_df['y'] = centroids.y
     return merged_df
 
 
@@ -129,19 +130,68 @@ def perform_clustering(scaled_features, n_clusters):
     return labels, kmeans
 
 
-def save_results(merged_df, locator, output_name='building_clusters'):
+def save_results(cluster_data, locator):
     """
-    Saves the results using CEA-compliant locator methods.
-    """
-    # Use locator methods defined in schemas.yml
-    out_csv = locator.get_building_clusters()
-    merged_df.to_csv(out_csv, index=False)
-    
-    out_shp = locator.get_building_clusters_shapefile()
-    merged_df.to_file(out_shp, driver="ESRI Shapefile")
-    
-    return out_csv, out_shp
+    Save clustering results to the project outputs directory.
 
+    Parameters:
+    ----------
+    cluster_data : DataFrame
+        Data containing building IDs and their assigned clusters
+    locator : InputLocator
+        CEA InputLocator object containing scenario path information
+
+    Returns:
+    -------
+    tuple
+        Paths to the saved CSV and shapefile
+    """
+    # Get scenario path from locator
+    scenario_path = locator.scenario
+
+    # Define the output directory
+    output_dir = os.path.join(scenario_path, 'outputs', 'data', 'optimization')
+
+    # Create directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Define output paths
+    csv_path = os.path.join(output_dir, 'building_clusters.csv')
+    shp_path = os.path.join(output_dir, 'building_clusters.shp')
+
+    # Save the results
+    cluster_data.to_csv(csv_path, index=False)
+
+    # Save as shapefile if it's a GeoDataFrame
+    if isinstance(cluster_data, gpd.GeoDataFrame):
+        # Create a copy of the data to avoid modifying the original
+        shp_data = cluster_data.copy()
+
+        # Make sure to only include columns that can be saved in a shapefile
+        # Explicitly drop columns that might cause issues
+        columns_to_drop = []
+        # For each column, check if it might cause problems with shapefile export
+        for col in shp_data.columns:
+            # Skip the geometry column
+            if col == 'geometry':
+                continue
+            # Check if the column contains complex objects
+            if shp_data[col].dtype.name == 'object':
+                # Sample the first non-null value
+                sample = shp_data[col].dropna().iloc[0] if not shp_data[col].dropna().empty else None
+                # If it's a complex object like Point, drop the column
+                if sample is not None and isinstance(sample, (Point, gpd.array.GeometryArray)):
+                    columns_to_drop.append(col)
+
+        # Drop problematic columns
+        if columns_to_drop:
+            shp_data = shp_data.drop(columns=columns_to_drop)
+
+        # Save to shapefile
+        shp_data.to_file(shp_path)
+
+    print(f"Results saved to {output_dir}")
+    return csv_path, shp_path
 
 
 def visualize_clusters(merged_df):
@@ -208,7 +258,7 @@ def cluster_buildings(buildings_shp, demand_df, locator,
         final_df = non_dtn_df
 
     # Save results and visualize.
-    out_csv, out_shp = save_results(final_df, locator, output_name='building_clusters')
+    out_csv, out_shp = save_results(final_df, locator)
     print(f"Results saved to:\nCSV: {out_csv}\nShapefile: {out_shp}")
     visualize_clusters(final_df)
 
@@ -217,37 +267,26 @@ def main(config):
     """
     Main function to run the building clustering.
 
-    Inputs:
-      - Uses the scenario folder specified by config.
-      - Loads the zone shapefile (building footprints).
-      - Loads Total_demand.csv for thermal demand (using QH_sys_MWhyr).
-      - DTN selection method can be specified:
-          * dtn_method = 'automatic'  OR  'manual'
-      - For manual, set existing_dtn_filepath to a CSV file path.
-      - extra_clusters: number of extra clusters to generate for non-DTN buildings.
-      - network_type: typically 'DH' for district heating (or 'DC' for cooling).
-
-    Outputs:
-      - Saves clustered building data to CSV and shapefile.
-      - Visualizes the clusters.
+    Args:
+        config: Configuration object with all parameters
     """
-    if not os.path.exists(config.scenario):
-        raise FileNotFoundError(f"Scenario not found: {config.scenario}")
+    # Get parameters from config
+    scenario = config.scenario
+    extra_clusters = config.optimization_new.extra_clusters
+    dtn_method = config.optimization_new.dtn_method
+    existing_dtn_filepath = config.optimization_new.existing_dtn_filepath
+    network_type = config.optimization_new.network_type
 
-    locator = cea.inputlocator.InputLocator(scenario=config.scenario)
+    # Setup locator and load data
+    locator = cea.inputlocator.InputLocator(scenario=scenario)
     buildings_shp = gpd.read_file(locator.get_zone_geometry())
     demand_df = pd.read_csv(locator.get_total_demand())
 
-    # --- DTN Selection ---
-    # Specify DTN method: use 'automatic' to read from network nodes shapefile,
-    # or 'manual' to provide a CSV file.
-    dtn_method = 'automatic'
-    existing_dtn_filepath = None  # For manual selection, e.g., "inputs/dtn_selection.csv"
+    # Check if extra_clusters is empty string or None and set default
+    if not extra_clusters:
+        extra_clusters = 3
 
-    # Specify extra clusters for non-DTN buildings.
-    extra_clusters = ''
-    network_type = 'DH'  # or 'DC'
-
+    # Call the cluster_buildings function with parameters from config
     cluster_buildings(buildings_shp, demand_df, locator,
                       dtn_method=dtn_method,
                       existing_dtn_filepath=existing_dtn_filepath,
@@ -255,5 +294,14 @@ def main(config):
                       network_type=network_type)
 
 
-if __name__ == '__main__':
-    main(cea.config.Configuration())
+if __name__ == "__main__":
+    import os
+    from cea.config import Configuration
+
+    config = Configuration()
+    # Try to use environment variable, fall back to hardcoded path
+    scenario_path = os.environ.get('CEA_SCENARIO_PATH',
+                                   r"C:\Users\User\OneDrive - ETH Zurich\CEA_projects\base_design\01_base_design_2025")
+    config.scenario = scenario_path
+    # Other settings
+    main(config)

@@ -284,7 +284,7 @@ Energy Supply System Optimisation:
     interfaces: [cli, dashboard]
     module: cea.optimization_new.building_clustering
     parameters: ['general:scenario', 'general:multiprocessing', 'building-clustering:extra-clusters',
-                  'building-clustering:dtn-method', 'building-clustering:existing-dtn-filepath', 'optimization-new:network-type']
+                  'building-clustering:dtn-method', 'building-clustering:existing-dtn-filepath', 'building-clustering:network-type']
     input-files:
       - [get_zone_geometry]
       - [get_total_demand]

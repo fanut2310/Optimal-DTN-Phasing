@@ -283,8 +283,8 @@ Energy Supply System Optimisation:
     description: Generate building clusters based on heat demand, proximity, and existing DTN.
     interfaces: [cli, dashboard]
     module: cea.optimization_new.building_clustering
-    parameters: ['general:scenario', 'general:multiprocessing', 'optimization-new:extra_clusters',
-                  'optimization-new:dtn_method', 'optimization-new:existing_dtn_filepath', 'optimization-new:network-type']
+    parameters: ['general:scenario', 'general:multiprocessing', 'building-clustering:extra-clusters',
+                  'building-clustering:dtn-method', 'building-clustering:existing-dtn-filepath', 'optimization-new:network-type']
     input-files:
       - [get_zone_geometry]
       - [get_total_demand]

@@ -204,7 +204,7 @@ def process_archetypes(buildings_df):
     return df
 
 
-def prepare_features(merged_df, heat_col='QH_sys_MWhyr', spatial_weight=2.0, archetype_weight=0.8):
+def prepare_features(merged_df, heat_col='QH_sys_MWhyr', spatial_weight=2.5, archetype_weight=0.8):
     """
     Prepares the feature matrix for clustering with adjustable feature weighting.
 

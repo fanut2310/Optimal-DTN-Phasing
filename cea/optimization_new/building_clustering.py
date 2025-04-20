@@ -41,8 +41,9 @@ from shapely.geometry import Point, LineString
 from scipy.spatial.distance import cdist, pdist, squareform
 
 # Clustering libraries
-from sklearn.cluster import KMeans, SpectralClustering
+from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
+from hdbscan import HDBSCAN
 
 # Visualization library
 import matplotlib.pyplot as plt
@@ -142,7 +143,57 @@ def merge_building_data(buildings_shp, demand_df):
     return merged_df
 
 
-def process_archetypes(buildings_df):
+def process_construction_year(buildings_df, year_weight=1.0):
+    """
+    Process construction year into meaningful categories based on building regulations periods.
+
+    Parameters:
+    -----------
+    buildings_df : GeoDataFrame
+        Building data with construction year information
+    year_weight : float
+        Weight to apply to construction year features (0-1)
+
+    Returns:
+    --------
+    GeoDataFrame
+        DataFrame with processed construction year features
+    """
+    df = buildings_df.copy()
+
+    # Check if construction year column exists
+    year_column = None
+    potential_columns = ['year_built', 'construction_year', 'YEAR_BUILT', 'CONSTRUCTION_YEAR', 'YEAR', 'year']
+
+    for col in potential_columns:
+        if col in df.columns:
+            year_column = col
+            break
+
+    if year_column is None:
+        print("Warning: Construction year information not found. Skipping construction year processing.")
+        return df
+
+    # Define periods based on significant building code changes
+    year_breaks = [1900, 1945, 1970, 1985, 2000, 2010, 2020]
+    period_labels = ['pre1900', '1900_1945', '1946_1970', '1971_1985', '1986_2000', '2001_2010', 'post2010', 'future']
+
+    # Make sure we have one fewer label than bin edges
+    # Create a categorical period column
+    df['constr_period'] = pd.cut(df[year_column],
+                                 bins=[-float('inf')] + year_breaks + [float('inf')],
+                                 labels=period_labels,
+                                 ordered=True)  # Using ordered=True instead of right=False which is unrelated
+
+    # Create binary columns for each period with the specified weight
+    for period in period_labels:
+        col_name = f"period_{period}"
+        df[col_name] = (df['constr_period'] == period).astype(float) * year_weight
+
+    return df
+
+
+def process_archetypes(buildings_df, encourage_diversity=False):
     """
     Process building archetypes from CEA-4 use_type format with mixed-use buildings support.
 
@@ -150,6 +201,8 @@ def process_archetypes(buildings_df):
     -----------
     buildings_df : GeoDataFrame
         Building data with use_type1, use_type2, use_type3 columns
+    encourage_diversity : bool
+        If True, invert use type features to encourage diversity instead of similarity
 
     Returns:
     --------
@@ -163,7 +216,7 @@ def process_archetypes(buildings_df):
         print("Warning: Building use type information not found. Skipping archetype processing.")
         return df
 
-    # Create an archetype field based on use_type1 (renamed from dominant_use)
+    # Create an archetype field based on use_type1
     df['archetype'] = df['use_type1']
 
     # Flag mixed-use buildings (those with a non-zero secondary use type)
@@ -185,10 +238,12 @@ def process_archetypes(buildings_df):
                 if use_type and not pd.isna(use_type) and ratio > 0:
                     use_types.add(use_type)
 
-    # Now create columns for each use type with their ratio values, without 'use_' prefix
+    # Now create one-hot encoded columns for each use type
     for use_type in use_types:
         # Truncate building type if too long for shapefile (max 10 chars)
         column_name = use_type[:10] if len(use_type) > 10 else use_type
+
+        # Initialize with zero
         df[column_name] = 0.0
 
         # Fill in values from each use_type column
@@ -199,12 +254,70 @@ def process_archetypes(buildings_df):
             if type_col in df.columns and ratio_col in df.columns:
                 # Where this use type matches, set the ratio
                 match_mask = (df[type_col] == use_type) & (df[ratio_col] > 0)
-                df.loc[match_mask, column_name] = df.loc[match_mask, ratio_col]
+
+                # If encouraging diversity, invert the values (1 - value) so that
+                # different use types are closer in feature space
+                if encourage_diversity:
+                    df.loc[match_mask, column_name] = 1.0 - df.loc[match_mask, ratio_col]
+                else:
+                    df.loc[match_mask, column_name] = df.loc[match_mask, ratio_col]
 
     return df
 
 
-def prepare_features(merged_df, heat_col='QH_sys_MWhyr', spatial_weight=2.5, archetype_weight=0.8):
+def ensure_use_type_diversity(merged_df, min_use_types_per_cluster=2):
+    """
+    Post-process clusters to ensure minimum use type diversity.
+
+    Parameters:
+    -----------
+    merged_df : DataFrame
+        The dataframe with building information and cluster assignments
+    min_use_types_per_cluster : int
+        Minimum number of different use types required in each cluster
+
+    Returns:
+    --------
+    DataFrame
+        Post-processed dataframe with updated cluster assignments
+    """
+    df = merged_df.copy()
+
+    # Skip if archetype column doesn't exist
+    if 'archetype' not in df.columns:
+        print("Warning: No archetype information available for diversity check.")
+        return df
+
+    # For each cluster, check the diversity of use types
+    clusters = df['cluster'].unique()
+    next_cluster_id = int(max(clusters)) + 1 if len(clusters) > 0 else 1
+
+    for cluster in clusters:
+        if cluster < 0:  # Skip noise points
+            continue
+
+        cluster_buildings = df[df['cluster'] == cluster]
+        unique_use_types = cluster_buildings['archetype'].nunique()
+
+        # If diversity requirement not met, split the cluster
+        if unique_use_types < min_use_types_per_cluster and len(cluster_buildings) > min_use_types_per_cluster:
+            print(f"Cluster {cluster} has only {unique_use_types} use types. Splitting to increase diversity.")
+
+            # Group buildings by use type
+            use_type_groups = cluster_buildings.groupby('archetype')
+
+            # Assign buildings to new clusters to maximize diversity
+            for i, (use_type, group) in enumerate(use_type_groups):
+                # First use type stays in original cluster
+                if i > 0:
+                    df.loc[group.index, 'cluster'] = next_cluster_id
+                    next_cluster_id += 1
+
+    return df
+
+
+def prepare_features(merged_df, heat_col='QH_sys_MWhyr', spatial_weight=15.0,
+                     archetype_weight=1.0, year_weight=1.0, include_heat_demand=False):
     """
     Prepares the feature matrix for clustering with adjustable feature weighting.
 
@@ -218,6 +331,10 @@ def prepare_features(merged_df, heat_col='QH_sys_MWhyr', spatial_weight=2.5, arc
         Weight multiplier for spatial coordinates (higher values emphasize spatial proximity)
     archetype_weight : float
         Weight multiplier for building archetype features
+    year_weight : float
+        Weight multiplier for construction year features (already applied in process_construction_year)
+    include_heat_demand : bool
+        Whether to include heat demand as a clustering feature
 
     Returns:
     --------
@@ -229,22 +346,47 @@ def prepare_features(merged_df, heat_col='QH_sys_MWhyr', spatial_weight=2.5, arc
     # Keep as MWh instead of converting to kWh
     merged_df['heat_MWhyr'] = merged_df[heat_col]
 
-    # Create initial numeric features array with heat demand and coordinates
-    numeric_features = merged_df[['heat_MWhyr', 'x', 'y']].copy()
+    # Create initial numeric features array (with or without heat demand)
+    if include_heat_demand:
+        numeric_features = merged_df[['heat_MWhyr', 'x', 'y']].copy()
+    else:
+        numeric_features = merged_df[['x', 'y']].copy()
 
     # Normalize numeric features
     scaler = StandardScaler()
     scaled_features = scaler.fit_transform(numeric_features)
 
     # Apply weights to spatial coordinates
-    scaled_features[:, 1] *= spatial_weight  # x coordinate
-    scaled_features[:, 2] *= spatial_weight  # y coordinate
+    if include_heat_demand:
+        # Apply weights to spatial coordinates (x and y are at indices 1 and 2)
+        scaled_features[:, 1] *= spatial_weight  # x coordinate
+        scaled_features[:, 2] *= spatial_weight  # y coordinate
+    else:
+        # Apply weights to spatial coordinates (x and y are at indices 0 and 1)
+        scaled_features[:, 0] *= spatial_weight  # x coordinate
+        scaled_features[:, 1] *= spatial_weight  # y coordinate
+
+    # Get construction year features (columns starting with 'period_')
+    year_cols = [col for col in merged_df.columns if col.startswith('period_')]
 
     # Get archetype features (columns that represent building types, without the 'use_' prefix)
     use_cols = [col for col in merged_df.columns if col not in
                 ['name', 'geometry', 'x', 'y', 'heat_MWhyr', 'archetype', 'is_mixed_use',
-                 'use_type1', 'use_type2', 'use_type3', 'use_type1r', 'use_type2r', 'use_type3r']
+                 'use_type1', 'use_type2', 'use_type3', 'use_type1r', 'use_type2r', 'use_type3r',
+                 'constr_period'] + year_cols
                 and col not in merged_df.columns[:20]]  # Heuristic to exclude original columns
+
+    # If construction year features exist, include them in clustering
+    if year_cols:
+        year_features = merged_df[year_cols].values
+
+        # Normalize construction year features
+        if np.any(year_features):  # Only if there are non-zero values
+            year_scaler = StandardScaler()
+            scaled_year_features = year_scaler.fit_transform(year_features)
+
+            # Combine with existing features
+            scaled_features = np.hstack((scaled_features, scaled_year_features))
 
     # If archetype features exist, include them in clustering
     if use_cols:
@@ -258,16 +400,15 @@ def prepare_features(merged_df, heat_col='QH_sys_MWhyr', spatial_weight=2.5, arc
             # Apply weight to archetype features
             scaled_archetype_features *= archetype_weight
 
-            # Combine numeric and archetype features
+            # Combine with existing features
             scaled_features = np.hstack((scaled_features, scaled_archetype_features))
 
     return scaled_features, scaler
 
 
-def perform_clustering(scaled_features, n_clusters, min_buildings_per_cluster=1,
-                       use_spectral=False, n_neighbors=10):
+def perform_clustering_kmeans(scaled_features, n_clusters, min_buildings_per_cluster=5):
     """
-    Runs clustering with options for KMeans or SpectralClustering.
+    Runs KMeans clustering with minimum cluster size constraint.
 
     Parameters:
     -----------
@@ -276,53 +417,175 @@ def perform_clustering(scaled_features, n_clusters, min_buildings_per_cluster=1,
     n_clusters : int
         Number of clusters to create
     min_buildings_per_cluster : int
-        Minimum number of buildings per cluster (only used with KMeans)
-    use_spectral : bool
-        If True, use SpectralClustering instead of KMeans
-    n_neighbors : int
-        Number of neighbors for affinity matrix in SpectralClustering
+        Minimum number of buildings per cluster
 
     Returns:
     --------
     labels : ndarray
         Cluster labels for each building
-    model : object
-        The fitted clustering model
+    model : KMeans
+        The fitted KMeans model
     """
     # Ensure we don't try to create more clusters than data points
     n_clusters = min(n_clusters, len(scaled_features))
 
-    if use_spectral:
-        print(f"Using Spectral Clustering with {n_clusters} clusters")
-        # Spectral clustering preserves spatial relationships better
-        model = SpectralClustering(
-            n_clusters=n_clusters,
-            affinity='nearest_neighbors',
-            n_neighbors=n_neighbors,
-            random_state=42,
-            n_jobs=-1  # Use all available cores
-        )
-        labels = model.fit_predict(scaled_features)
-        return labels, model
-    else:
-        print(f"Using KMeans Clustering with target of {n_clusters} clusters")
-        # For KMeans, we can check minimum cluster sizes
-        model = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        model.fit(scaled_features)
-        labels = model.labels_
+    print(f"Using KMeans Clustering with target of {n_clusters} clusters")
 
-        # Check if any cluster is too small (only if min_buildings_per_cluster > 1)
-        if min_buildings_per_cluster > 1:
-            unique_labels, counts = np.unique(labels, return_counts=True)
-            too_small = counts < min_buildings_per_cluster
+    # For KMeans, we can check minimum cluster sizes
+    model = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    model.fit(scaled_features)
+    labels = model.labels_
 
-            # If some clusters are too small, try fewer clusters
-            if np.any(too_small) and n_clusters > 2:
-                print(f"Some clusters are too small. Reducing clusters from {n_clusters} to {n_clusters - 1}.")
-                return perform_clustering(scaled_features, n_clusters - 1,
-                                          min_buildings_per_cluster, use_spectral, n_neighbors)
+    # Check if any cluster is too small (only if min_buildings_per_cluster > 1)
+    if min_buildings_per_cluster > 1:
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        too_small = counts < min_buildings_per_cluster
 
-        return labels, model
+        # If some clusters are too small, try fewer clusters
+        if np.any(too_small) and n_clusters > 2:
+            print(f"Some clusters are too small. Reducing clusters from {n_clusters} to {n_clusters - 1}.")
+            return perform_clustering_kmeans(scaled_features, n_clusters - 1, min_buildings_per_cluster)
+
+    return labels, model
+
+
+def perform_clustering_hdbscan(scaled_features, min_cluster_size=5, min_samples=None,
+                               cluster_selection_epsilon=0.0, cluster_selection_method='eom',
+                               demand_values=None, max_demand_ratio=3.0):
+    """
+    Runs HDBSCAN clustering with optional demand-based post-processing.
+
+    Parameters:
+    -----------
+    scaled_features : ndarray
+        The normalized feature array
+    min_cluster_size : int
+        Minimum size of clusters (smaller clusters are considered noise)
+    min_samples : int or None
+        Number of samples in a neighborhood for a point to be a core point
+    cluster_selection_epsilon : float
+        Distance threshold for expanding clusters
+    cluster_selection_method : str
+        Method for selecting flat clusters from the hierarchy ('eom' or 'leaf')
+    demand_values : array-like or None
+        Heat demand values for each building for demand-based post-processing
+    max_demand_ratio : float
+        Maximum allowed ratio between highest and lowest cluster demand
+
+    Returns:
+    --------
+    labels : ndarray
+        Cluster labels for each building (-1 for noise points)
+    clusterer : HDBSCAN
+        The fitted HDBSCAN model
+    """
+    # Set min_samples to same as min_cluster_size if not provided
+    if min_samples is None:
+        min_samples = min_cluster_size
+
+    print(f"Using HDBSCAN clustering with min_cluster_size={min_cluster_size}")
+
+    # Create and fit HDBSCAN clusterer
+    clusterer = HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        cluster_selection_epsilon=cluster_selection_epsilon,
+        metric='euclidean',
+        cluster_selection_method=cluster_selection_method,
+        prediction_data=True
+    )
+
+    # Perform clustering
+    labels = clusterer.fit_predict(scaled_features)
+
+    # Print summary
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    n_noise = list(labels).count(-1)
+    print(f"HDBSCAN found {n_clusters} clusters and {n_noise} noise points")
+
+    # If no demand values provided, return the HDBSCAN results directly
+    if demand_values is None:
+        return labels, clusterer
+
+    # Post-process to ensure demand balance between clusters
+    labels = balance_cluster_demands(labels, demand_values, max_demand_ratio)
+
+    return labels, clusterer
+
+
+def balance_cluster_demands(labels, demand_values, max_ratio=3.0):
+    """
+    Post-processes clustering results to balance demands between clusters.
+
+    Parameters:
+    -----------
+    labels : ndarray
+        Cluster labels from HDBSCAN
+    demand_values : array-like
+        Heat demand values for each building
+    max_ratio : float
+        Maximum allowed ratio between highest and lowest cluster demand
+
+    Returns:
+    --------
+    balanced_labels : ndarray
+        Adjusted cluster labels with balanced demands
+    """
+    # Convert to numpy arrays if not already
+    labels = np.array(labels)
+    demand_values = np.array(demand_values)
+
+    # Get unique cluster labels (excluding -1 which is noise)
+    unique_clusters = np.unique(labels)
+    unique_clusters = unique_clusters[unique_clusters >= 0]
+
+    if len(unique_clusters) <= 1:
+        return labels  # No balancing needed with 0 or 1 cluster
+
+    # Calculate total demand per cluster
+    cluster_demands = {}
+    for cluster in unique_clusters:
+        cluster_demand = np.sum(demand_values[labels == cluster])
+        cluster_demands[cluster] = cluster_demand
+
+    # Check if demand ratio is within threshold
+    max_demand = max(cluster_demands.values())
+    min_demand = min(cluster_demands.values())
+
+    if min_demand > 0 and (max_demand / min_demand) <= max_ratio:
+        return labels  # Already balanced
+
+    # If imbalanced, identify the high-demand buildings in the high-demand clusters
+    high_demand_threshold = np.percentile(demand_values, 80)  # Top 20% buildings by demand
+
+    balanced_labels = labels.copy()
+    next_cluster_id = max(unique_clusters) + 1
+
+    # Create new clusters for high-demand buildings from overloaded clusters
+    for cluster in unique_clusters:
+        # Skip clusters with demand below average
+        if cluster_demands[cluster] < (sum(cluster_demands.values()) / len(cluster_demands)):
+            continue
+
+        # Find high-demand buildings in this cluster
+        cluster_mask = (labels == cluster)
+        high_demand_mask = (demand_values > high_demand_threshold) & cluster_mask
+
+        # If significant number of high-demand buildings, create a new cluster
+        if np.sum(high_demand_mask) >= min(3, np.sum(cluster_mask) // 3):
+            balanced_labels[high_demand_mask] = next_cluster_id
+            next_cluster_id += 1
+
+    # Assign noise points (-1) to nearest cluster or their own clusters if high demand
+    noise_mask = (labels == -1)
+    if np.any(noise_mask):
+        for i in np.where(noise_mask)[0]:
+            if demand_values[i] > high_demand_threshold:
+                # High-demand noise points get their own cluster
+                balanced_labels[i] = next_cluster_id
+                next_cluster_id += 1
+
+    return balanced_labels
 
 
 def save_results(cluster_data, locator):
@@ -442,6 +705,10 @@ def save_cluster_centroids(cluster_data, locator):
     divisor = 1.0 if heat_col == 'heat_MWhyr' else 1000.0  # To convert kWh to MWh if needed
 
     for cluster_num, group in cluster_data.groupby('cluster'):
+        # Skip noise points (labeled as -1) if any
+        if cluster_num == -1:
+            continue
+
         # Calculate the mean position of all buildings in this cluster
         mean_x = group['x'].mean()
         mean_y = group['y'].mean()
@@ -525,15 +792,21 @@ def visualize_clusters(merged_df, show_interactive=False, save_path=None):
 
     # Plot each cluster with a discrete color
     for i, cluster in enumerate(clusters):
-        cluster_data = merged_df[merged_df['cluster'] == cluster]
-        plt.scatter(cluster_data['x'], cluster_data['y'],
-                    color=colors[i % len(colors)], s=100, edgecolor='k', alpha=0.7,
-                    label=f'Cluster {cluster} ({len(cluster_data)} bldgs)')
+        if cluster == -1:  # Noise points in HDBSCAN
+            cluster_data = merged_df[merged_df['cluster'] == cluster]
+            plt.scatter(cluster_data['x'], cluster_data['y'],
+                        color='black', s=50, edgecolor='k', alpha=0.5,
+                        label=f'Noise ({len(cluster_data)} bldgs)')
+        else:
+            cluster_data = merged_df[merged_df['cluster'] == cluster]
+            plt.scatter(cluster_data['x'], cluster_data['y'],
+                        color=colors[i % len(colors)], s=100, edgecolor='k', alpha=0.7,
+                        label=f'Cluster {cluster} ({len(cluster_data)} bldgs)')
 
     # Add labels and title
     plt.xlabel('X Coordinate', fontsize=12)
     plt.ylabel('Y Coordinate', fontsize=12)
-    plt.title('Building Clusters based on Heat Demand and Proximity', fontsize=14)
+    plt.title('Building Clusters based on Location and Archetypes', fontsize=14)
 
     # Add a legend
     plt.legend(title='Clusters', loc='best', bbox_to_anchor=(1.05, 1), borderaxespad=0., fontsize=10)
@@ -558,15 +831,26 @@ def visualize_clusters(merged_df, show_interactive=False, save_path=None):
 def cluster_buildings(buildings_shp, demand_df, locator,
                       dtn_method='automatic',
                       existing_dtn_filepath=None,
-                      extra_clusters=2,
+                      clustering_algorithm='hdbscan',  # Changed default to HDBSCAN
+                      extra_clusters=10,  # For K-means
+                      min_cluster_size=5,  # For HDBSCAN
+                      min_samples=None,  # For HDBSCAN
+                      cluster_selection_epsilon=0.0,  # For HDBSCAN
+                      cluster_selection_method='eom',  # For HDBSCAN
                       network_type='DH',
-                      spatial_weight=2.5,
-                      archetype_weight=0.8,
+                      spatial_weight=15.0,
+                      archetype_weight=1.0,
+                      year_weight=1.0,  # Increased from 0.6
+                      use_construction_year=True,
+                      encourage_archetype_diversity=False,
+                      ensure_min_use_types=False,
+                      min_use_types_per_cluster=2,
                       min_buildings_per_cluster=1,
-                      use_spectral_clustering=False,
+                      include_heat_demand=False,
+                      max_demand_ratio=3.0,
                       show_interactive_plot=False):
     """
-    Main clustering function.
+    Main clustering function with support for K-means or HDBSCAN algorithms.
 
     Parameters:
     -----------
@@ -580,23 +864,49 @@ def cluster_buildings(buildings_shp, demand_df, locator,
         Method to identify existing DTN buildings ('automatic' or 'manual')
     existing_dtn_filepath : str
         Path to CSV file for manual DTN selection
+    clustering_algorithm : str
+        Clustering algorithm to use ('kmeans' or 'hdbscan')
     extra_clusters : int
-        Number of clusters for non-DTN buildings
+        Number of clusters for K-means algorithm
+    min_cluster_size : int
+        Minimum size of clusters for HDBSCAN algorithm
+    min_samples : int or None
+        Number of samples in a neighborhood for HDBSCAN
+    cluster_selection_epsilon : float
+        Distance threshold for expanding clusters in HDBSCAN
+    cluster_selection_method : str
+        Method for selecting flat clusters ('eom' or 'leaf')
     network_type : str
         'DH' for district heating or 'DC' for district cooling
     spatial_weight : float
         Weight multiplier for spatial coordinates
     archetype_weight : float
         Weight multiplier for building archetypes
+    year_weight : float
+        Weight multiplier for construction year
+    use_construction_year : bool
+        Whether to include construction year in clustering
+    encourage_archetype_diversity : bool
+        If true, encourages diversity of archetypes in clusters
+    ensure_min_use_types : bool
+        If true, enforces minimum number of use types per cluster
+    min_use_types_per_cluster : int
+        Minimum number of use types required in each cluster
     min_buildings_per_cluster : int
-        Minimum number of buildings per cluster
-    use_spectral_clustering : bool
-        If True, use SpectralClustering instead of KMeans
+        Minimum number of buildings per cluster for K-means
+    include_heat_demand : bool
+        Whether to include heat demand as a clustering feature
+    max_demand_ratio : float
+        Maximum ratio between highest and lowest cluster demand
     show_interactive_plot : bool
         If True, shows interactive plot (blocks execution)
     """
-    # Process archetypes in the building data
-    buildings_shp = process_archetypes(buildings_shp)
+    # Process archetypes with diversity option
+    buildings_shp = process_archetypes(buildings_shp, encourage_diversity=encourage_archetype_diversity)
+
+    # Process construction year if enabled
+    if use_construction_year:
+        buildings_shp = process_construction_year(buildings_shp, year_weight)
 
     # Merge spatial data and demand data
     merged_df = merge_building_data(buildings_shp, demand_df)
@@ -621,27 +931,71 @@ def cluster_buildings(buildings_shp, demand_df, locator,
     dtn_df = merged_df[merged_df['in_existing_DTN']].copy()
     non_dtn_df = merged_df[~merged_df['in_existing_DTN']].copy()
 
+    # Extract heat demand for potential post-processing
+    demand_values = non_dtn_df['heat_MWhyr'].values
+
     # For non-DTN buildings, prepare features and perform clustering
     scaled_features, scaler = prepare_features(
         non_dtn_df,
         heat_col='QH_sys_MWhyr',
         spatial_weight=spatial_weight,
-        archetype_weight=archetype_weight
+        archetype_weight=archetype_weight,
+        year_weight=year_weight,
+        include_heat_demand=include_heat_demand
     )
 
-    # Ensure minimum number of clusters
-    extra_clusters = max(2, extra_clusters)
+    # Perform clustering based on selected algorithm
+    if clustering_algorithm.lower() == 'hdbscan':
+        labels, clusterer = perform_clustering_hdbscan(
+            scaled_features,
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            cluster_selection_epsilon=cluster_selection_epsilon,
+            cluster_selection_method=cluster_selection_method,
+            demand_values=demand_values if not include_heat_demand else None,
+            max_demand_ratio=max_demand_ratio
+        )
 
-    # Perform clustering
-    labels, clustering_model = perform_clustering(
-        scaled_features,
-        n_clusters=extra_clusters,
-        min_buildings_per_cluster=min_buildings_per_cluster,
-        use_spectral=use_spectral_clustering
-    )
+        # Handle noise points (labeled as -1)
+        if -1 in labels:
+            noise_count = np.sum(labels == -1)
+            print(f"Found {noise_count} buildings not assigned to any cluster (noise)")
+
+            # Create a new cluster ID for noise points
+            next_cluster_id = max(labels[labels >= 0]) + 1 if any(labels >= 0) else 1
+
+            # For buildings with high heat demand, create individual clusters
+            high_demand_threshold = np.percentile(demand_values, 80)  # Top 20% by demand
+
+            for i in np.where(labels == -1)[0]:
+                if demand_values[i] > high_demand_threshold:
+                    # High demand buildings get their own clusters
+                    labels[i] = next_cluster_id
+                    next_cluster_id += 1
+                else:
+                    # Other noise points form a single cluster
+                    labels[i] = -2  # Temporary value to distinguish them
+
+            # Convert all remaining noise to a single cluster
+            if np.any(labels == -2):
+                labels[labels == -2] = next_cluster_id
+    else:  # Default to kmeans
+        labels, clusterer = perform_clustering_kmeans(
+            scaled_features,
+            n_clusters=extra_clusters,
+            min_buildings_per_cluster=min_buildings_per_cluster
+        )
 
     # Assign cluster labels to non-DTN buildings (shift labels to start from 1)
-    non_dtn_df['cluster'] = labels + 1  # Shift labels so that DTN becomes cluster 0
+    # For HDBSCAN, some labels might be -1 (noise points), so we need to handle those
+    if clustering_algorithm.lower() == 'hdbscan' and -1 in labels:
+        # Remap labels to ensure they're all >= 0 before adding 1
+        unique_labels = np.unique(labels)
+        label_map = {old_label: i for i, old_label in enumerate(unique_labels)}
+        remapped_labels = np.array([label_map[label] for label in labels])
+        non_dtn_df['cluster'] = remapped_labels + 1  # Shift labels so that DTN becomes cluster 0
+    else:
+        non_dtn_df['cluster'] = labels + 1  # Shift labels so that DTN becomes cluster 0
 
     # For DTN buildings, assign a cluster label of 0
     if not dtn_df.empty:
@@ -649,6 +1003,10 @@ def cluster_buildings(buildings_shp, demand_df, locator,
         final_df = pd.concat([dtn_df, non_dtn_df], ignore_index=True)
     else:
         final_df = non_dtn_df
+
+    # Ensure minimum use type diversity if requested
+    if ensure_min_use_types:
+        final_df = ensure_use_type_diversity(final_df, min_use_types_per_cluster)
 
     # Save results and cluster centroids
     out_csv, out_shp = save_results(final_df, locator)
@@ -679,20 +1037,37 @@ def main(config):
     """
     # Get parameters from config
     scenario = config.scenario
-    extra_clusters = 15
+
+    # Algorithm selection
+    clustering_algorithm = config.building_clustering.clustering_algorithm
+
+    # K-means parameters
+    extra_clusters = config.building_clustering.extra_clusters
+    min_buildings_per_cluster = config.building_clustering.min_buildings_per_cluster
+
+    # HDBSCAN parameters
+    min_cluster_size = config.building_clustering.min_cluster_size
+    min_samples = config.building_clustering.min_samples
+    cluster_selection_epsilon = config.building_clustering.cluster_selection_epsilon
+    cluster_selection_method = config.building_clustering.cluster_selection_method
+    max_demand_ratio = config.building_clustering.max_demand_ratio
+
+    # General parameters
     dtn_method = config.building_clustering.dtn_method
     existing_dtn_filepath = config.building_clustering.existing_dtn_filepath
     network_type = config.building_clustering.network_type
 
-    # Additional parameters with default values
-    spatial_weight = 2.5  # Increased from 2.0 to emphasize spatial proximity
-    archetype_weight = 0.8  # Weight for building archetypes
-    min_buildings_per_cluster = 1  # Reduced from 5 to allow for single-building clusters
+    # Feature weighting
+    spatial_weight = config.building_clustering.spatial_weight
+    archetype_weight = config.building_clustering.archetype_weight
+    use_construction_year = config.building_clustering.use_construction_year
+    year_weight = config.building_clustering.year_weight
+    include_heat_demand = config.building_clustering.include_heat_demand
 
-    # Get clustering algorithm choice if available
-    use_spectral_clustering = False
-    if hasattr(config.building_clustering, 'clustering_algorithm'):
-        use_spectral_clustering = (config.building_clustering.clustering_algorithm == 'spectral')
+    # Diversity options
+    encourage_archetype_diversity = config.building_clustering.encourage_archetype_diversity
+    ensure_min_use_types = config.building_clustering.ensure_min_use_types
+    min_use_types_per_cluster = config.building_clustering.min_use_types_per_cluster
 
     # Determine if we're running from GUI or command line
     # In GUI mode, don't show interactive plots to avoid blocking
@@ -703,21 +1078,28 @@ def main(config):
     buildings_shp = gpd.read_file(locator.get_zone_geometry())
     demand_df = pd.read_csv(locator.get_total_demand())
 
-    # Check if extra_clusters is empty string or None and set default
-    if not extra_clusters:
-        extra_clusters = 15
-
     # Call the cluster_buildings function with parameters from config
     cluster_buildings(
         buildings_shp, demand_df, locator,
         dtn_method=dtn_method,
         existing_dtn_filepath=existing_dtn_filepath,
+        clustering_algorithm=clustering_algorithm,
         extra_clusters=extra_clusters,
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        cluster_selection_epsilon=cluster_selection_epsilon,
+        cluster_selection_method=cluster_selection_method,
         network_type=network_type,
         spatial_weight=spatial_weight,
         archetype_weight=archetype_weight,
+        year_weight=year_weight,
+        use_construction_year=use_construction_year,
+        encourage_archetype_diversity=encourage_archetype_diversity,
+        ensure_min_use_types=ensure_min_use_types,
+        min_use_types_per_cluster=min_use_types_per_cluster,
         min_buildings_per_cluster=min_buildings_per_cluster,
-        use_spectral_clustering=use_spectral_clustering,
+        include_heat_demand=include_heat_demand,
+        max_demand_ratio=max_demand_ratio,
         show_interactive_plot=show_interactive_plot
     )
 
@@ -732,4 +1114,13 @@ if __name__ == "__main__":
                                    r"C:\Users\changf\OneDrive - ETH Zurich\CEA_projects\base_design\01_base_design_2025")
     config.scenario = scenario_path
 
+    # Instead of assigning, just access the section directly
+    # The section will be available through config.sections
+    if 'building-clustering' in config.sections:
+        main(config)
+    else:
+        print("Error: 'building-clustering' section not found in configuration.")
+        print("Available sections:", list(config.sections.keys()))
+
+    config.building_clustering = config.sections['building-clustering']
     main(config)

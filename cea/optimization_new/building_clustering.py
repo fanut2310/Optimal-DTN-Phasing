@@ -11,7 +11,6 @@ or manually (Option 2: using a user-provided CSV file with building IDs).
 Outputs include:
 1. A CSV file with building cluster assignments
 2. A shapefile with individual building geometries and cluster assignments
-3. A shapefile with cluster centroids for network optimization
 
 The script handles mixed-use buildings and supports multi-stage district thermal network planning.
 """
@@ -21,7 +20,7 @@ __copyright__ = "Copyright 2025"
 __credits__ = ["Fan Ut Chang"]
 __license__ = "MIT"
 __version__ = "0.1"
-__maintainer__ = "NA"
+__maintainer__ = "Fan Ut Chang"
 __email__ = "changf@ethz.ch"
 __status__ = "Production"
 
@@ -44,6 +43,7 @@ from scipy.spatial.distance import cdist, pdist, squareform
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from hdbscan import HDBSCAN
+from scipy.spatial import cKDTree
 
 # Visualization library
 import matplotlib.pyplot as plt
@@ -52,6 +52,8 @@ from matplotlib.colors import ListedColormap
 # CEA configuration and file locator
 import cea.config
 import cea.inputlocator
+
+os.environ['OMP_NUM_THREADS'] = '1'
 
 
 def read_automatic_dtn(locator, network_type='DH'):
@@ -191,9 +193,9 @@ def process_construction_year(buildings_df, year_weight=1.0):
     return df
 
 
-def process_archetypes(buildings_df, encourage_diversity=False):
+def process_use_type(buildings_df, encourage_diversity=False):
     """
-    Process building archetypes from CEA-4 use_type format with mixed-use buildings support.
+    Process building use types from CEA-4 use_type format with mixed-use buildings support.
 
     Parameters:
     -----------
@@ -205,7 +207,7 @@ def process_archetypes(buildings_df, encourage_diversity=False):
     Returns:
     --------
     GeoDataFrame
-        DataFrame with processed archetype information
+        DataFrame with processed use type information
     """
     df = buildings_df.copy()
 
@@ -214,8 +216,8 @@ def process_archetypes(buildings_df, encourage_diversity=False):
         print("Warning: Building use type information not found. Skipping archetype processing.")
         return df
 
-    # Create an archetype field based on use_type1
-    df['archetype'] = df['use_type1']
+    # Create an use type field based on use_type1
+    df['use_type'] = df['use_type1']
 
     # Flag mixed-use buildings (those with a non-zero secondary use type)
     if 'use_type2' in df.columns and 'use_type2r' in df.columns:
@@ -313,136 +315,158 @@ def ensure_use_type_diversity(merged_df, min_use_types_per_cluster=2):
 
     return df
 
-def split_large_clusters(df, max_size=25):
-    """Split clusters larger than max_size using K-means"""
-    clusters = df['cluster'].unique()
-    next_id = df['cluster'].max() + 1
-    for c in clusters:
-        cluster_df = df[df['cluster'] == c]
-        if len(cluster_df) > max_size:
-            kmeans = KMeans(n_clusters=2)
-            sub_labels = kmeans.fit_predict(cluster_df[['x', 'y']])
-            df.loc[cluster_df.index, 'cluster'] = [next_id + l for l in sub_labels]
-            next_id += 2
+def split_large_clusters(df, max_size=None, min_size=5):
+    """
+    Split large clusters into smaller ones using KMeans within the cluster.
+    """
+    # First, check if we need to define max_size
+    if max_size is None:
+        # Calculate average size and set max_size to 2x average
+        avg_size = df[df['cluster'] >= 0]['cluster'].value_counts().mean()
+        max_size = max(int(avg_size * 2), min_size * 2)
+        print(f"Automatically determined max_size: {max_size} buildings")
+
+    # Get cluster sizes
+    cluster_sizes = df['cluster'].value_counts()
+    print(f"Before splitting: {len(cluster_sizes)} clusters")
+    print(f"Cluster sizes: {dict(cluster_sizes.sort_index())}")
+
+    # Start numbering new clusters after the highest existing cluster number
+    next_cluster_id = df['cluster'].max() + 1
+
+    # Track if any splitting was done
+    split_performed = False
+
+    # Check each cluster
+    for cluster_id, size in cluster_sizes.items():
+        if cluster_id == -1:  # Skip noise points
+            continue
+
+        if size > max_size:
+            # This cluster needs to be split
+            print(f"Splitting cluster {cluster_id} with {size} buildings (exceeds max size of {max_size})")
+            split_performed = True
+
+            # Get the buildings in this cluster
+            cluster_buildings = df[df['cluster'] == cluster_id]
+
+            # Calculate how many subclusters we need
+            n_subclusters = max(2, int(np.ceil(size / max_size)))
+            print(f"  → Creating {n_subclusters} subclusters")
+
+            # Use KMeans to split this cluster
+            from sklearn.cluster import KMeans
+            kmeans = KMeans(n_clusters=n_subclusters, random_state=42, n_init=10)
+
+            # Get coordinates for clustering
+            X = cluster_buildings[['x', 'y']].values
+            subclusters = kmeans.fit_predict(X)
+
+            # Assign new cluster IDs
+            for i in range(n_subclusters):
+                # Get buildings that belong to this subcluster
+                subcluster_idx = cluster_buildings.index[subclusters == i]
+
+                if i == 0:
+                    # Keep the first subcluster with original ID
+                    print(f"  → Keeping original cluster {cluster_id} with {len(subcluster_idx)} buildings")
+                else:
+                    # Assign new IDs to other subclusters
+                    print(f"  → Creating new cluster {next_cluster_id} with {len(subcluster_idx)} buildings")
+                    df.loc[subcluster_idx, 'cluster'] = next_cluster_id
+                    next_cluster_id += 1
+
+    # Print summary after splitting
+    final_cluster_sizes = df['cluster'].value_counts()
+    print(f"After splitting: {len(final_cluster_sizes)} clusters")
+    print(f"Final cluster sizes: {dict(final_cluster_sizes.sort_index())}")
+
+    if not split_performed:
+        print("No clusters exceeded size threshold. No splitting performed.")
+
     return df
 
 def reassign_noise(df, max_distance=300):
     """Reassign noise points to nearest cluster"""
     noise = df[df['cluster'] == -1]
+    print(f"Reassigning {len(noise)} noise points...")
     for idx, row in noise.iterrows():
         distances = cdist([[row.x, row.y]], df[df['cluster'] != -1][['x', 'y']])
         if distances.min() < max_distance:
             nearest_cluster = df.iloc[distances.argmin()]['cluster']
             df.at[idx, 'cluster'] = nearest_cluster
+    print(f"After reassignment: {len(set(df['cluster']))} clusters")
     return df
 
 # For spatial-only feature preparation
-def prepare_features(merged_df, heat_col='QH_sys_MWhyr', spatial_weight=25.0,  # Increased from 15.0
-                    archetype_weight=1.0, year_weight=1.0, include_heat_demand=False):
-    # Keep only spatial features for HDBSCAN
-    if clustering_algorithm == 'hdbscan':
-        numeric_features = merged_df[['x', 'y']].copy()
-        scaled_features = scaler.fit_transform(numeric_features)
-        scaled_features *= spatial_weight
-        return scaled_features, scaler
-    else:
-        # Original K-means code with all features
-
-
-
-def prepare_features(merged_df, heat_col='QH_sys_MWhyr', spatial_weight=15.0,
-                     archetype_weight=1.0, year_weight=1.0, include_heat_demand=False):
+def prepare_features(merged_df, heat_col='QH_sys_MWhyr', spatial_weight=25.0,
+                     use_type_weight=1.0, year_weight=1.0,
+                     include_heat_demand=False, clustering_algorithm='hdbscan'):
     """
     Prepares the feature matrix for clustering with adjustable feature weighting.
-    Used primarily for K-means clustering.
-
-    Parameters:
-    -----------
-    merged_df : DataFrame
-        The merged dataframe with building information
-    heat_col : str
-        The column name for heat demand
-    spatial_weight : float
-        Weight multiplier for spatial coordinates (higher values emphasize spatial proximity)
-    archetype_weight : float
-        Weight multiplier for building archetype features
-    year_weight : float
-        Weight multiplier for construction year features (already applied in process_construction_year)
-    include_heat_demand : bool
-        Whether to include heat demand as a clustering feature
-
-    Returns:
-    --------
-    scaled_features : ndarray
-        Normalized features array
-    scaler : StandardScaler
-        The scaler object used for normalization
+    Handles both HDBSCAN (spatial-only) and K-means (multi-feature) approaches.
     """
-    # Keep as MWh instead of converting to kWh
-    merged_df['heat_MWhyr'] = merged_df[heat_col]
-
-    # Create initial numeric features array (with or without heat demand)
-    if include_heat_demand:
-        numeric_features = merged_df[['heat_MWhyr', 'x', 'y']].copy()
-    else:
+    # For HDBSCAN: use only spatial features with increased weight
+    if clustering_algorithm.lower() == 'hdbscan':
         numeric_features = merged_df[['x', 'y']].copy()
+        scaler = StandardScaler()
+        scaled_features = scaler.fit_transform(numeric_features)
+        scaled_features[:, 0] *= spatial_weight
+        scaled_features[:, 1] *= spatial_weight
+        return scaled_features, scaler
 
-    # Normalize numeric features
-    scaler = StandardScaler()
-    scaled_features = scaler.fit_transform(numeric_features)
-
-    # Apply weights to spatial coordinates
-    if include_heat_demand:
-        # Apply weights to spatial coordinates (x and y are at indices 1 and 2)
-        scaled_features[:, 1] *= spatial_weight  # x coordinate
-        scaled_features[:, 2] *= spatial_weight  # y coordinate
+    # For K-means: use all specified features
     else:
-        # Apply weights to spatial coordinates (x and y are at indices 0 and 1)
-        scaled_features[:, 0] *= spatial_weight  # x coordinate
-        scaled_features[:, 1] *= spatial_weight  # y coordinate
+        # Keep as MWh instead of converting to kWh
+        merged_df['heat_MWhyr'] = merged_df[heat_col]
 
-    # Get construction year features (columns starting with 'period_')
-    year_cols = [col for col in merged_df.columns if col.startswith('period_')]
+        # Create initial numeric features array (with or without heat demand)
+        if include_heat_demand:
+            numeric_features = merged_df[['heat_MWhyr', 'x', 'y']].copy()
+        else:
+            numeric_features = merged_df[['x', 'y']].copy()
 
-    # Get archetype features (columns that represent building types, without the 'use_' prefix)
-    use_cols = [col for col in merged_df.columns if col not in
-                ['name', 'geometry', 'x', 'y', 'heat_MWhyr', 'archetype', 'is_mixed_use',
-                 'use_type1', 'use_type2', 'use_type3', 'use_type1r', 'use_type2r', 'use_type3r',
-                 'constr_period'] + year_cols
-                and col not in merged_df.columns[:20]]  # Heuristic to exclude original columns
+        # Normalize numeric features
+        scaler = StandardScaler()
+        scaled_features = scaler.fit_transform(numeric_features)
 
-    # If construction year features exist, include them in clustering
-    if year_cols:
-        year_features = merged_df[year_cols].values
+        # Apply weights to spatial coordinates
+        if include_heat_demand:
+            scaled_features[:, 1] *= spatial_weight  # x coordinate
+            scaled_features[:, 2] *= spatial_weight  # y coordinate
+        else:
+            scaled_features[:, 0] *= spatial_weight  # x coordinate
+            scaled_features[:, 1] *= spatial_weight  # y coordinate
 
-        # Normalize construction year features
-        if np.any(year_features):  # Only if there are non-zero values
-            year_scaler = StandardScaler()
-            scaled_year_features = year_scaler.fit_transform(year_features)
+        # Add construction year features
+        year_cols = [col for col in merged_df.columns if col.startswith('period_')]
+        if year_cols:
+            year_features = merged_df[year_cols].values
+            if np.any(year_features):
+                year_scaler = StandardScaler()
+                scaled_year_features = year_scaler.fit_transform(year_features)
+                scaled_features = np.hstack((scaled_features, scaled_year_features))
 
-            # Combine with existing features
-            scaled_features = np.hstack((scaled_features, scaled_year_features))
+        # Add archetype features
+        use_cols = [col for col in merged_df.columns if col not in
+                    ['name', 'geometry', 'x', 'y', 'heat_MWhyr', 'archetype', 'is_mixed_use',
+                     'use_type1', 'use_type2', 'use_type3', 'use_type1r', 'use_type2r', 'use_type3r',
+                     'constr_period'] + year_cols
+                    and col not in merged_df.columns[:20]]
 
-    # If archetype features exist, include them in clustering
-    if use_cols:
-        archetype_features = merged_df[use_cols].values
+        if use_cols:
+            archetype_features = merged_df[use_cols].values
+            if np.any(archetype_features):
+                archetype_scaler = StandardScaler()
+                scaled_archetype_features = archetype_scaler.fit_transform(archetype_features)
+                scaled_archetype_features *= use_type_weight
+                scaled_features = np.hstack((scaled_features, scaled_archetype_features))
 
-        # Normalize archetype features
-        if np.any(archetype_features):  # Only if there are non-zero values
-            archetype_scaler = StandardScaler()
-            scaled_archetype_features = archetype_scaler.fit_transform(archetype_features)
-
-            # Apply weight to archetype features
-            scaled_archetype_features *= archetype_weight
-
-            # Combine with existing features
-            scaled_features = np.hstack((scaled_features, scaled_archetype_features))
-
-    return scaled_features, scaler
+        return scaled_features, scaler
 
 
 # New function to ensure spatial coherence in clusters
-def ensure_spatial_coherence(df, max_distance_threshold=300):
+def ensure_spatial_coherence(df, max_distance_threshold=50):
     """
     Post-process clusters to ensure buildings in the same cluster are spatially coherent.
     Buildings farther than max_distance_threshold from all other buildings in their cluster
@@ -619,6 +643,8 @@ def balance_cluster_demands(labels, demand_values, max_ratio=3.0):
     balanced_labels : ndarray
         Adjusted cluster labels with balanced demands
     """
+    print(f"Before demand balancing: {len(set(labels)) - 1 if -1 in labels else len(set(labels))} clusters")
+
     # Convert to numpy arrays if not already
     labels = np.array(labels)
     demand_values = np.array(demand_values)
@@ -673,179 +699,25 @@ def balance_cluster_demands(labels, demand_values, max_ratio=3.0):
                 balanced_labels[i] = next_cluster_id
                 next_cluster_id += 1
 
+    print(f"After demand balancing: {len(set(labels)) - 1 if -1 in labels else len(set(labels))} clusters")
+
     return balanced_labels
 
-
-def save_results(cluster_data, locator):
+def spatial_majority_reassignment(df, n_neighbors=3):
     """
-    Save clustering results to the project outputs directory.
-    Only saves essential columns for further analysis.
-
-    Parameters:
-    ----------
-    cluster_data : DataFrame
-        Data containing building IDs and their assigned clusters
-    locator : InputLocator
-        CEA InputLocator object
-
-    Returns:
-    -------
-    tuple
-        Paths to the saved CSV and shapefile
+    For each building, assign it to the majority cluster among its n nearest neighbors (excluding itself).
     """
-    # Get scenario path from locator
-    scenario_path = locator.scenario
-
-    # Define the output directory
-    output_dir = os.path.join(scenario_path, 'outputs', 'data', 'optimization')
-
-    # Create directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Define output paths
-    csv_path = os.path.join(output_dir, 'building_clusters.csv')
-    shp_path = os.path.join(output_dir, 'building_clusters.shp')
-
-    # Define core columns to keep with new order and renamed columns
-    # Put 'archetype' right after 'heat_MWhyr' as requested
-    core_columns = ['name', 'x', 'y', 'in_existing_DTN', 'cluster', 'heat_MWhyr', 'archetype']
-
-    # Create a copy to avoid modifying the original dataframe
-    save_data = cluster_data.copy()
-
-    # Ensure all columns in core_columns exist
-    for col in core_columns:
-        if col not in save_data.columns and col == 'archetype' and 'dominant_use' in save_data.columns:
-            save_data[col] = save_data['dominant_use']
-        elif col not in save_data.columns and col == 'heat_MWhyr' and 'heat_kWhyr' in save_data.columns:
-            save_data[col] = save_data['heat_kWhyr'] / 1000  # Convert kWh to MWh if needed
-        elif col not in save_data.columns:
-            save_data[col] = np.nan
-
-    # Get geometry if it exists
-    if isinstance(save_data, gpd.GeoDataFrame) and 'geometry' in save_data.columns:
-        has_geometry = True
-    else:
-        has_geometry = False
-
-    # Create the final dataframe with selected columns
-    columns_to_keep = core_columns
-    if has_geometry:
-        columns_to_keep.append('geometry')
-
-    # Create a trimmed dataframe with just the core columns
-    trimmed_data = save_data[columns_to_keep].copy()
-
-    # Save CSV (without geometry column if present)
-    if has_geometry:
-        trimmed_data.drop(columns=['geometry']).to_csv(csv_path, index=False)
-    else:
-        trimmed_data.to_csv(csv_path, index=False)
-
-    # Save shapefile (only possible if geometry exists)
-    if has_geometry:
-        # Convert to GeoDataFrame if not already
-        if not isinstance(trimmed_data, gpd.GeoDataFrame):
-            trimmed_data = gpd.GeoDataFrame(trimmed_data, geometry='geometry')
-
-        # Set CRS if available from original data
-        if hasattr(cluster_data, 'crs'):
-            trimmed_data.crs = cluster_data.crs
-
-        # Save to shapefile
-        trimmed_data.to_file(shp_path)
-
-    print(f"Results saved to {output_dir}")
-    return csv_path, shp_path
-
-
-def save_cluster_centroids(cluster_data, locator):
-    """
-    Create and save centroid points for each cluster.
-    Centroids represent the geographic center of buildings in each cluster,
-    along with aggregate statistics.
-
-    Parameters:
-    ----------
-    cluster_data : GeoDataFrame
-        Data containing building geometries and cluster assignments
-    locator : InputLocator
-        CEA InputLocator object
-
-    Returns:
-    -------
-    str
-        Path to the saved centroid shapefile
-    """
-    # Get scenario path from locator
-    scenario_path = locator.scenario
-
-    # Define the output directory and path
-    output_dir = os.path.join(scenario_path, 'outputs', 'data', 'optimization')
-    os.makedirs(output_dir, exist_ok=True)
-    centroid_shp_path = os.path.join(output_dir, 'cluster_centroids.shp')
-
-    # Group by cluster and calculate centroids
-    cluster_centroids = []
-
-    # Identify which heat column is available
-    heat_col = 'heat_MWhyr' if 'heat_MWhyr' in cluster_data.columns else 'heat_kWhyr'
-    divisor = 1.0 if heat_col == 'heat_MWhyr' else 1000.0  # To convert kWh to MWh if needed
-
-    for cluster_num, group in cluster_data.groupby('cluster'):
-        # Skip noise points (labeled as -1) if any
-        if cluster_num == -1:
-            continue
-
-        # Calculate the mean position of all buildings in this cluster
-        mean_x = group['x'].mean()
-        mean_y = group['y'].mean()
-
-        # Calculate total and average attributes for the cluster
-        total_heat = group[heat_col].sum() / divisor
-        avg_heat = group[heat_col].mean() / divisor
-
-        # Get the archetype information
-        if 'archetype' in group.columns:
-            archetype_col = 'archetype'
-        elif 'dominant_use' in group.columns:
-            archetype_col = 'dominant_use'
-        else:
-            archetype_col = None
-
-        archetype = "unknown"
-        if archetype_col is not None:
-            use_counts = Counter(group[archetype_col].dropna())
-            if use_counts:
-                archetype = use_counts.most_common(1)[0][0]
-                # Truncate if too long for shapefile
-                if len(archetype) > 10:
-                    archetype = archetype[:10]
-
-        # Create a Point geometry for this cluster centroid
-        centroid_geom = Point(mean_x, mean_y)
-
-        # Add to the list with renamed and shortened column names
-        cluster_centroids.append({
-            'cluster': int(cluster_num),
-            'n_bldgs': len(group),
-            'tot_heat': total_heat,
-            'avg_heat': avg_heat,
-            'archetype': archetype,
-            'x': mean_x,
-            'y': mean_y,
-            'geometry': centroid_geom
-        })
-
-    # Create a GeoDataFrame from the centroids list
-    centroids_gdf = gpd.GeoDataFrame(cluster_centroids, crs=cluster_data.crs)
-
-    # Save as shapefile
-    centroids_gdf.to_file(centroid_shp_path)
-    print(f"Cluster centroids saved to: {centroid_shp_path}")
-
-    return centroid_shp_path
-
+    coords = df[['x', 'y']].values
+    tree = cKDTree(coords)
+    clusters = df['cluster'].values.copy()
+    for i, (x, y) in enumerate(coords):
+        dists, idxs = tree.query([x, y], k=n_neighbors+1)
+        neighbor_clusters = clusters[idxs[1:]]  # Exclude self
+        majority = pd.Series(neighbor_clusters).mode()
+        if len(majority) > 0 and clusters[i] != majority[0]:
+            clusters[i] = majority[0]
+    df['cluster'] = clusters
+    return df
 
 def visualize_clusters(merged_df, show_interactive=False, save_path=None):
     """
@@ -915,6 +787,87 @@ def visualize_clusters(merged_df, show_interactive=False, save_path=None):
         plt.pause(0.001)  # Small pause to render the figure
         plt.close()
 
+def save_results(cluster_data, locator):
+    """
+    Save clustering results to the project outputs directory.
+    Only saves essential columns for further analysis.
+
+    Parameters:
+    ----------
+    cluster_data : DataFrame
+        Data containing building IDs and their assigned clusters
+    locator : InputLocator
+        CEA InputLocator object
+
+    Returns:
+    -------
+    tuple
+        Paths to the saved CSV and shapefile
+    """
+    # Get scenario path from locator
+    scenario_path = locator.scenario
+
+    # Define the output directory
+    output_dir = os.path.join(scenario_path, 'outputs', 'data', 'optimization')
+
+    # Create directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Define output paths
+    csv_path = os.path.join(output_dir, 'building_clusters.csv')
+    shp_path = os.path.join(output_dir, 'building_clusters.shp')
+
+    # Define core columns to keep with new order and renamed columns
+    # Put 'archetype' right after 'heat_MWhyr' as requested
+    core_columns = ['name', 'x', 'y', 'in_existing_DTN', 'cluster', 'heat_MWhyr', 'use_type']
+
+    # Create a copy to avoid modifying the original dataframe
+    save_data = cluster_data.copy()
+
+    # Ensure all columns in core_columns exist
+    for col in core_columns:
+        if col not in save_data.columns and col == 'use_type' and 'dominant_use' in save_data.columns:
+            save_data[col] = save_data['dominant_use']
+        elif col not in save_data.columns and col == 'heat_MWhyr' and 'heat_kWhyr' in save_data.columns:
+            save_data[col] = save_data['heat_kWhyr'] / 1000  # Convert kWh to MWh if needed
+        elif col not in save_data.columns:
+            save_data[col] = np.nan
+
+    # Get geometry if it exists
+    if isinstance(save_data, gpd.GeoDataFrame) and 'geometry' in save_data.columns:
+        has_geometry = True
+    else:
+        has_geometry = False
+
+    # Create the final dataframe with selected columns
+    columns_to_keep = core_columns
+    if has_geometry:
+        columns_to_keep.append('geometry')
+
+    # Create a trimmed dataframe with just the core columns
+    trimmed_data = save_data[columns_to_keep].copy()
+
+    # Save CSV (without geometry column if present)
+    if has_geometry:
+        trimmed_data.drop(columns=['geometry']).to_csv(csv_path, index=False)
+    else:
+        trimmed_data.to_csv(csv_path, index=False)
+
+    # Save shapefile (only possible if geometry exists)
+    if has_geometry:
+        # Convert to GeoDataFrame if not already
+        if not isinstance(trimmed_data, gpd.GeoDataFrame):
+            trimmed_data = gpd.GeoDataFrame(trimmed_data, geometry='geometry')
+
+        # Set CRS if available from original data
+        if hasattr(cluster_data, 'crs'):
+            trimmed_data.crs = cluster_data.crs
+
+        # Save to shapefile
+        trimmed_data.to_file(shp_path)
+
+    print(f"Results saved to {output_dir}")
+    return csv_path, shp_path
 
 def cluster_buildings(buildings_shp, demand_df, locator,
                       dtn_method='automatic',
@@ -926,8 +879,8 @@ def cluster_buildings(buildings_shp, demand_df, locator,
                       cluster_selection_epsilon=0.0,  # For HDBSCAN
                       cluster_selection_method='leaf',  # Changed from 'eom' to 'leaf' for better spatial coherence
                       network_type='DH',
-                      spatial_weight=25.0,  # Increased from 15.0 to 25.0
-                      archetype_weight=1.0,
+                      spatial_weight=25.0,
+                      use_type_weight=1.0,
                       year_weight=1.0,
                       use_construction_year=True,
                       encourage_archetype_diversity=False,
@@ -936,7 +889,7 @@ def cluster_buildings(buildings_shp, demand_df, locator,
                       min_buildings_per_cluster=1,
                       include_heat_demand=False,
                       max_demand_ratio=3.0,
-                      max_distance_threshold=300,  # Maximum distance between buildings in same cluster
+                      max_distance_threshold=50,  # Maximum distance between buildings in same cluster
                       show_interactive_plot=False):
     """
     Main clustering function with support for K-means or HDBSCAN algorithms.
@@ -969,8 +922,8 @@ def cluster_buildings(buildings_shp, demand_df, locator,
         'DH' for district heating or 'DC' for district cooling
     spatial_weight : float
         Weight multiplier for spatial coordinates
-    archetype_weight : float
-        Weight multiplier for building archetypes
+    use_type_weight : float
+        Weight multiplier for building use_types
     year_weight : float
         Weight multiplier for construction year
     use_construction_year : bool
@@ -993,7 +946,7 @@ def cluster_buildings(buildings_shp, demand_df, locator,
         If True, shows interactive plot (blocks execution)
     """
     # Process archetypes with diversity option
-    buildings_shp = process_archetypes(buildings_shp, encourage_diversity=encourage_archetype_diversity)
+    buildings_shp = process_use_type(buildings_shp, encourage_diversity=encourage_archetype_diversity)
 
     # Process construction year if enabled
     if use_construction_year:
@@ -1028,27 +981,32 @@ def cluster_buildings(buildings_shp, demand_df, locator,
     # For non-DTN buildings, prepare features and perform clustering
     # Perform clustering based on selected algorithm
     if clustering_algorithm.lower() == 'hdbscan':
-        # ========== MODIFIED SECTION START ==========
-        # Prepare spatial-only features with increased weight
-        scaled_features, scaler = prepare_features_spatial_only(
+        # Prepare features with clustering_algorithm parameter
+        scaled_features, scaler = prepare_features(
             non_dtn_df,
-            spatial_weight=spatial_weight
+            heat_col='QH_sys_MWhyr',
+            spatial_weight=spatial_weight,
+            use_type_weight=use_type_weight,
+            year_weight=year_weight,
+            include_heat_demand=include_heat_demand,
+            clustering_algorithm='hdbscan'  # Explicitly set algorithm
         )
 
-        # Perform HDBSCAN with spatial focus
+        # Perform HDBSCAN clustering
         labels, clusterer = perform_clustering_hdbscan(
             scaled_features,
             min_cluster_size=min_cluster_size,
             min_samples=min_samples,
             cluster_selection_epsilon=cluster_selection_epsilon,
-            cluster_selection_method='leaf'  # Better for compact clusters
+            cluster_selection_method=cluster_selection_method
         )
 
         # Assign initial labels
         non_dtn_df['cluster'] = labels
 
-        # Post-processing steps
-        non_dtn_df = split_large_clusters(non_dtn_df, max_cluster_size=25)  # Split oversized clusters
+        # Post-processing steps - FIXED LINE BELOW
+        non_dtn_df = split_large_clusters(non_dtn_df,
+                                          max_size=25)  # Changed parameter name from max_cluster_size to max_size
         non_dtn_df = ensure_spatial_coherence(non_dtn_df, max_distance_threshold=300)  # Remove spatial outliers
         non_dtn_df = reassign_noise(non_dtn_df, max_distance=200)  # Reassign nearby noise
 
@@ -1069,9 +1027,10 @@ def cluster_buildings(buildings_shp, demand_df, locator,
             non_dtn_df,
             heat_col='QH_sys_MWhyr',
             spatial_weight=spatial_weight,
-            archetype_weight=archetype_weight,
+            use_type_weight=use_type_weight,
             year_weight=year_weight,
-            include_heat_demand=include_heat_demand
+            include_heat_demand=include_heat_demand,
+            clustering_algorithm='kmeans'
         )
 
         # Perform K-means clustering
@@ -1111,14 +1070,14 @@ def cluster_buildings(buildings_shp, demand_df, locator,
     if ensure_min_use_types:
         final_df = ensure_use_type_diversity(final_df, min_use_types_per_cluster)
 
-    # Save results and cluster centroids
+    final_df = spatial_majority_reassignment(final_df, n_neighbors=3)
+
+    # Save results
     out_csv, out_shp = save_results(final_df, locator)
-    centroid_shp = save_cluster_centroids(final_df, locator)
 
     print(f"Results saved to:")
     print(f"  - Building clusters CSV: {out_csv}")
     print(f"  - Building clusters shapefile: {out_shp}")
-    print(f"  - Cluster centroids shapefile: {centroid_shp}")
 
     # Generate visualization for clusters
     plot_path = os.path.join(os.path.dirname(out_csv), 'building_clusters_plot.png')
@@ -1162,7 +1121,7 @@ def main(config):
 
     # Feature weighting
     spatial_weight = config.building_clustering.spatial_weight
-    archetype_weight = config.building_clustering.archetype_weight
+    use_type_weight = config.building_clustering.archetype_weight
     use_construction_year = config.building_clustering.use_construction_year
     year_weight = config.building_clustering.year_weight
     include_heat_demand = config.building_clustering.include_heat_demand
@@ -1197,7 +1156,7 @@ def main(config):
         cluster_selection_method=cluster_selection_method,
         network_type=network_type,
         spatial_weight=spatial_weight,
-        archetype_weight=archetype_weight,
+        use_type_weight=use_type_weight,
         year_weight=year_weight,
         use_construction_year=use_construction_year,
         encourage_archetype_diversity=encourage_archetype_diversity,
@@ -1218,7 +1177,7 @@ if __name__ == "__main__":
     config = Configuration()
     # Try to use environment variable, fall back to hardcoded path
     scenario_path = os.environ.get('CEA_SCENARIO_PATH',
-                                   r"C:\Users\User\OneDrive - ETH Zurich\CEA_projects\base_design\01_base_design_2025")
+                                   r"C:\Users\changf\OneDrive - ETH Zurich\CEA_projects\base_design\01_base_design_2025")
     config.scenario = scenario_path
 
     # Check if the 'building-clustering' section exists in the configuration

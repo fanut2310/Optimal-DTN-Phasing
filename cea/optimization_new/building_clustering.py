@@ -16,7 +16,7 @@ The script handles mixed-use buildings and supports multi-stage district thermal
 """
 
 __author__ = "Fan Ut Chang"
-__copyright__ = "Copyright 2025"
+__copyright__ = "Copyright 2025, Architecture and Building Systems - ETH Zurich"
 __credits__ = ["Fan Ut Chang"]
 __license__ = "MIT"
 __version__ = "0.1"
@@ -386,7 +386,7 @@ def split_large_clusters(df, max_size=None, min_size=5):
 
     return df
 
-def reassign_noise(df, max_distance=300):
+def reassign_noise(df, max_distance=100):
     """Reassign noise points to nearest cluster"""
     noise = df[df['cluster'] == -1]
     print(f"Reassigning {len(noise)} noise points...")
@@ -884,12 +884,12 @@ def cluster_buildings(buildings_shp, demand_df, locator,
                       year_weight=1.0,
                       use_construction_year=True,
                       encourage_archetype_diversity=False,
-                      ensure_min_use_types=False,
+                      ensure_min_use_types=True,
                       min_use_types_per_cluster=2,
                       min_buildings_per_cluster=1,
                       include_heat_demand=False,
                       max_demand_ratio=3.0,
-                      max_distance_threshold=50,  # Maximum distance between buildings in same cluster
+                      max_distance_threshold=100,  # Maximum distance between buildings in same cluster
                       show_interactive_plot=False):
     """
     Main clustering function with support for K-means or HDBSCAN algorithms.
@@ -1007,7 +1007,7 @@ def cluster_buildings(buildings_shp, demand_df, locator,
         # Post-processing steps - FIXED LINE BELOW
         non_dtn_df = split_large_clusters(non_dtn_df,
                                           max_size=25)  # Changed parameter name from max_cluster_size to max_size
-        non_dtn_df = ensure_spatial_coherence(non_dtn_df, max_distance_threshold=300)  # Remove spatial outliers
+        non_dtn_df = ensure_spatial_coherence(non_dtn_df, max_distance_threshold=100)  # Remove spatial outliers
         non_dtn_df = reassign_noise(non_dtn_df, max_distance=200)  # Reassign nearby noise
 
         # Enforce use-type diversity after spatial processing
@@ -1132,7 +1132,7 @@ def main(config):
     min_use_types_per_cluster = config.building_clustering.min_use_types_per_cluster
 
     # Spatial coherence parameters
-    max_distance_threshold = 300  # Limit in map units; buildings farther than this won't be in same cluster
+    max_distance_threshold = 100  # Limit in map units; buildings farther than this won't be in same cluster
 
     # Determine if we're running from GUI or command line
     # In GUI mode, don't show interactive plots to avoid blocking
@@ -1177,7 +1177,7 @@ if __name__ == "__main__":
     config = Configuration()
     # Try to use environment variable, fall back to hardcoded path
     scenario_path = os.environ.get('CEA_SCENARIO_PATH',
-                                   r"C:\Users\changf\OneDrive - ETH Zurich\CEA_projects\base_design\01_base_design_2025")
+                                   r"C:\Users\User\OneDrive - ETH Zurich\CEA_projects\base_design\01_base_design_2025")
     config.scenario = scenario_path
 
     # Check if the 'building-clustering' section exists in the configuration

@@ -296,11 +296,12 @@ Energy Supply System Optimisation:
                   'building-clustering:existing-dtn-filepath',
                   'building-clustering:network-type',
                   'building-clustering:spatial-weight',
-                  'building-clustering:archetype-weight',
+                  'building-clustering:use-type-weight',
                   'building-clustering:use-construction-year',
                   'building-clustering:year-weight',
                   'building-clustering:include-heat-demand',
-                  'building-clustering:encourage-archetype-diversity',
+                  'building-clustering:reassign-noise',
+                  'building-clustering:noise-reassign-distance',
                   'building-clustering:ensure-min-use-types',
                   'building-clustering:min-use-types-per-cluster' ]
     input-files:

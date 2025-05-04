@@ -193,52 +193,50 @@ def process_construction_year(buildings_df, year_weight=1.0):
     return df
 
 
-def process_use_type(buildings_df, encourage_diversity=False):
+def process_use_type(buildings_df):
     """
-    Process building use types from CEA-4 use_type format with mixed-use buildings support.
+    Process building use_types from CEA-4 use_type format with mixed-use buildings support.
 
     Parameters:
     -----------
     buildings_df : GeoDataFrame
         Building data with use_type1, use_type2, use_type3 columns
-    encourage_diversity : bool
-        If True, invert use type features to encourage diversity instead of similarity
 
     Returns:
     --------
     GeoDataFrame
-        DataFrame with processed use type information
+        DataFrame with processed use_type information
     """
     df = buildings_df.copy()
 
     # Check if use_type columns exist
     if 'use_type1' not in df.columns:
-        print("Warning: Building use type information not found. Skipping archetype processing.")
+        print("Warning: Building use_type information not found. Skipping use_type processing.")
         return df
 
-    # Create an use type field based on use_type1
+    # Create an use_type field based on use_type1
     df['use_type'] = df['use_type1']
 
-    # Flag mixed-use buildings (those with a non-zero secondary use type)
+    # Flag mixed-use buildings (those with a non-zero secondary use_type)
     if 'use_type2' in df.columns and 'use_type2r' in df.columns:
         mixed_use_mask = (df['use_type2'].notna()) & (df['use_type2r'] > 0)
         df['is_mixed_use'] = False
         df.loc[mixed_use_mask, 'is_mixed_use'] = True
 
-    # Create numerical representations for each use type
-    # First collect all unique use types
+    # Create numerical representations for each use_type
+    # First collect all unique use_types
     use_types = set()
     for i in range(1, 4):
         type_col = f'use_type{i}'
         ratio_col = f'use_type{i}r'
 
-        # Add to use types if present with non-zero ratio
+        # Add to use_types if present with non-zero ratio
         if type_col in df.columns and ratio_col in df.columns:
             for use_type, ratio in zip(df[type_col], df[ratio_col]):
                 if use_type and not pd.isna(use_type) and ratio > 0:
                     use_types.add(use_type)
 
-    # Now create one-hot encoded columns for each use type
+    # Now create one-hot encoded columns for each use_type
     for use_type in use_types:
         # Truncate building type if too long for shapefile (max 10 chars)
         column_name = use_type[:10] if len(use_type) > 10 else use_type
@@ -252,67 +250,47 @@ def process_use_type(buildings_df, encourage_diversity=False):
             ratio_col = f'use_type{i}r'
 
             if type_col in df.columns and ratio_col in df.columns:
-                # Where this use type matches, set the ratio
+                # Where this use_type matches, set the ratio
                 match_mask = (df[type_col] == use_type) & (df[ratio_col] > 0)
-
-                # If encouraging diversity, invert the values (1 - value) so that
-                # different use types are closer in feature space
-                if encourage_diversity:
-                    df.loc[match_mask, column_name] = 1.0 - df.loc[match_mask, ratio_col]
-                else:
-                    df.loc[match_mask, column_name] = df.loc[match_mask, ratio_col]
 
     return df
 
 
-def ensure_use_type_diversity(merged_df, min_use_types_per_cluster=2):
+def ensure_use_type_diversity(df, min_use_types):
     """
-    Post-process clusters to ensure minimum use type diversity.
-
-    Parameters:
-    -----------
-    merged_df : DataFrame
-        The dataframe with building information and cluster assignments
-    min_use_types_per_cluster : int
-        Minimum number of different use types required in each cluster
-
-    Returns:
-    --------
-    DataFrame
-        Post-processed dataframe with updated cluster assignments
+    For each non-noise cluster, ensure it contains at least `min_use_types` distinct
+    use_types. If not, attempt to swap in nearby buildings of missing use_types.
     """
-    df = merged_df.copy()
+    # Build spatial index once
+    coords = df[['x', 'y']].values
+    tree = cKDTree(coords)
+    clusters = df['cluster'].values
 
-    # Skip if archetype column doesn't exist
-    if 'archetype' not in df.columns:
-        print("Warning: No archetype information available for diversity check.")
-        return df
+    for cluster_id in sorted(set(clusters)):
+        if cluster_id < 0:
+            continue  # skip noise
 
-    # For each cluster, check the diversity of use types
-    clusters = df['cluster'].unique()
-    next_cluster_id = int(max(clusters)) + 1 if len(clusters) > 0 else 1
-
-    for cluster in clusters:
-        if cluster < 0:  # Skip noise points
+        mask = clusters == cluster_id
+        use_types = set(df.loc[mask, 'use_type'])
+        if len(use_types) >= min_use_types:
             continue
 
-        cluster_buildings = df[df['cluster'] == cluster]
-        unique_use_types = cluster_buildings['archetype'].nunique()
+        # Find nearby candidates from other clusters
+        for idx in np.where(mask)[0]:
+            # Query nearest neighbors
+            dists, nbrs = tree.query(coords[idx], k=10)
+            for dist, nbr in zip(dists[1:], nbrs[1:]):
+                if clusters[nbr] != cluster_id:
+                    nbr_use = df.at[nbr, 'use_type']
+                    if nbr_use not in use_types:
+                        # Swap this neighbor into current cluster
+                        clusters[nbr] = cluster_id
+                        use_types.add(nbr_use)
+                        break
+            if len(use_types) >= min_use_types:
+                break
 
-        # If diversity requirement not met, split the cluster
-        if unique_use_types < min_use_types_per_cluster and len(cluster_buildings) > min_use_types_per_cluster:
-            print(f"Cluster {cluster} has only {unique_use_types} use types. Splitting to increase diversity.")
-
-            # Group buildings by use type
-            use_type_groups = cluster_buildings.groupby('archetype')
-
-            # Assign buildings to new clusters to maximize diversity
-            for i, (use_type, group) in enumerate(use_type_groups):
-                # First use type stays in original cluster
-                if i > 0:
-                    df.loc[group.index, 'cluster'] = next_cluster_id
-                    next_cluster_id += 1
-
+    df['cluster'] = clusters
     return df
 
 def split_large_clusters(df, max_size=None, min_size=5):
@@ -386,16 +364,31 @@ def split_large_clusters(df, max_size=None, min_size=5):
 
     return df
 
-def reassign_noise(df, max_distance=100):
-    """Reassign noise points to nearest cluster"""
-    noise = df[df['cluster'] == -1]
-    print(f"Reassigning {len(noise)} noise points...")
-    for idx, row in noise.iterrows():
-        distances = cdist([[row.x, row.y]], df[df['cluster'] != -1][['x', 'y']])
-        if distances.min() < max_distance:
-            nearest_cluster = df.iloc[distances.argmin()]['cluster']
-            df.at[idx, 'cluster'] = nearest_cluster
-    print(f"After reassignment: {len(set(df['cluster']))} clusters")
+
+def reassign_noise(df, max_distance):
+    """
+    Reassign HDBSCAN “noise” points (cluster = ‑1) to the nearest non-noise cluster
+    if they lie within max_distance meters of any cluster member.
+    """
+    coords = df[['x', 'y']].values
+    tree = cKDTree(coords)
+    clusters = df['cluster'].values.copy()
+
+    # Identify noise point indices
+    noise_idxs = np.where(clusters == -1)[0]
+
+    for idx in noise_idxs:
+        # Query the nearest non-noise neighbor
+        dists, nbrs = tree.query(coords[idx], k=len(coords))
+        # Filter out self and all noise neighbors
+        valid = [(d, n) for d, n in zip(dists[1:], nbrs[1:]) if clusters[n] != -1]
+        if not valid:
+            continue
+        nearest_dist, nearest_idx = min(valid, key=lambda x: x[0])
+        if nearest_dist <= max_distance:
+            clusters[idx] = clusters[nearest_idx]
+
+    df['cluster'] = clusters
     return df
 
 # For spatial-only feature preparation
@@ -447,20 +440,20 @@ def prepare_features(merged_df, heat_col='QH_sys_MWhyr', spatial_weight=25.0,
                 scaled_year_features = year_scaler.fit_transform(year_features)
                 scaled_features = np.hstack((scaled_features, scaled_year_features))
 
-        # Add archetype features
+        # Add use_type features
         use_cols = [col for col in merged_df.columns if col not in
-                    ['name', 'geometry', 'x', 'y', 'heat_MWhyr', 'archetype', 'is_mixed_use',
+                    ['name', 'geometry', 'x', 'y', 'heat_MWhyr', 'use_type', 'is_mixed_use',
                      'use_type1', 'use_type2', 'use_type3', 'use_type1r', 'use_type2r', 'use_type3r',
                      'constr_period'] + year_cols
                     and col not in merged_df.columns[:20]]
 
         if use_cols:
-            archetype_features = merged_df[use_cols].values
-            if np.any(archetype_features):
-                archetype_scaler = StandardScaler()
-                scaled_archetype_features = archetype_scaler.fit_transform(archetype_features)
-                scaled_archetype_features *= use_type_weight
-                scaled_features = np.hstack((scaled_features, scaled_archetype_features))
+            use_type_features = merged_df[use_cols].values
+            if np.any(use_type_features):
+                use_type_scaler = StandardScaler()
+                scaled_use_type_features = use_type_scaler.fit_transform(use_type_features)
+                scaled_use_type_features *= use_type_weight
+                scaled_features = np.hstack((scaled_features, scaled_use_type_features))
 
         return scaled_features, scaler
 
@@ -766,7 +759,7 @@ def visualize_clusters(merged_df, show_interactive=False, save_path=None):
     # Add labels and title
     plt.xlabel('X Coordinate', fontsize=12)
     plt.ylabel('Y Coordinate', fontsize=12)
-    plt.title('Building Clusters based on Location and Archetypes', fontsize=14)
+    plt.title('Building Clusters based on Location and use_types', fontsize=14)
 
     # Add a legend
     plt.legend(title='Clusters', loc='best', bbox_to_anchor=(1.05, 1), borderaxespad=0., fontsize=10)
@@ -818,7 +811,7 @@ def save_results(cluster_data, locator):
     shp_path = os.path.join(output_dir, 'building_clusters.shp')
 
     # Define core columns to keep with new order and renamed columns
-    # Put 'archetype' right after 'heat_MWhyr' as requested
+    # Put 'use_type' right after 'heat_MWhyr' as requested
     core_columns = ['name', 'x', 'y', 'in_existing_DTN', 'cluster', 'heat_MWhyr', 'use_type']
 
     # Create a copy to avoid modifying the original dataframe
@@ -882,8 +875,9 @@ def cluster_buildings(buildings_shp, demand_df, locator,
                       spatial_weight=25.0,
                       use_type_weight=1.0,
                       year_weight=1.0,
-                      use_construction_year=True,
-                      encourage_archetype_diversity=False,
+                      use_construction_year=False,
+                      noise_flag=True,
+                      noise_reassign_distance=100,
                       ensure_min_use_types=True,
                       min_use_types_per_cluster=2,
                       min_buildings_per_cluster=1,
@@ -928,16 +922,18 @@ def cluster_buildings(buildings_shp, demand_df, locator,
         Weight multiplier for construction year
     use_construction_year : bool
         Whether to include construction year in clustering
-    encourage_archetype_diversity : bool
-        If true, encourages diversity of archetypes in clusters
     ensure_min_use_types : bool
-        If true, enforces minimum number of use types per cluster
+        If true, enforces minimum number of use_types per cluster
     min_use_types_per_cluster : int
-        Minimum number of use types required in each cluster
+        Minimum number of use_types required in each cluster
     min_buildings_per_cluster : int
         Minimum number of buildings per cluster for K-means
     include_heat_demand : bool
         Whether to include heat demand as a clustering feature
+    reassign_noise : bool
+        Whether to reassign the noise to the best match of the other clusters
+    noise_reassign_distance : float
+        The max distance threshold for reassigning noise points
     max_demand_ratio : float
         Maximum ratio between highest and lowest cluster demand
     max_distance_threshold : float
@@ -945,8 +941,8 @@ def cluster_buildings(buildings_shp, demand_df, locator,
     show_interactive_plot : bool
         If True, shows interactive plot (blocks execution)
     """
-    # Process archetypes with diversity option
-    buildings_shp = process_use_type(buildings_shp, encourage_diversity=encourage_archetype_diversity)
+    # Process use_types with diversity option
+    buildings_shp = process_use_type(buildings_shp)
 
     # Process construction year if enabled
     if use_construction_year:
@@ -1008,7 +1004,7 @@ def cluster_buildings(buildings_shp, demand_df, locator,
         non_dtn_df = split_large_clusters(non_dtn_df,
                                           max_size=25)  # Changed parameter name from max_cluster_size to max_size
         non_dtn_df = ensure_spatial_coherence(non_dtn_df, max_distance_threshold=100)  # Remove spatial outliers
-        non_dtn_df = reassign_noise(non_dtn_df, max_distance=200)  # Reassign nearby noise
+        non_dtn_df = reassign_noise(non_dtn_df, max_distance=100)  # Reassign nearby noise
 
         # Enforce use-type diversity after spatial processing
         if ensure_min_use_types:
@@ -1066,7 +1062,11 @@ def cluster_buildings(buildings_shp, demand_df, locator,
     else:
         final_df = non_dtn_df
 
-    # Ensure minimum use type diversity if requested
+    # Reassign noise buildings to the clusters that are within the noise_reassign_distance
+    if noise_flag:
+        final_df = reassign_noise(final_df, max_distance=noise_reassign_distance)
+
+    # Ensure minimum use_type diversity if requested
     if ensure_min_use_types:
         final_df = ensure_use_type_diversity(final_df, min_use_types_per_cluster)
 
@@ -1121,18 +1121,18 @@ def main(config):
 
     # Feature weighting
     spatial_weight = config.building_clustering.spatial_weight
-    use_type_weight = config.building_clustering.archetype_weight
+    use_type_weight = config.building_clustering.use_type_weight
     use_construction_year = config.building_clustering.use_construction_year
     year_weight = config.building_clustering.year_weight
     include_heat_demand = config.building_clustering.include_heat_demand
 
+    # Noise reassignment options
+    noise_flag = config.building_clustering.reassign_noise
+    noise_reassign_distance = config.building_clustering.noise_reassign_distance
+
     # Diversity options
-    encourage_archetype_diversity = config.building_clustering.encourage_archetype_diversity
     ensure_min_use_types = config.building_clustering.ensure_min_use_types
     min_use_types_per_cluster = config.building_clustering.min_use_types_per_cluster
-
-    # Spatial coherence parameters
-    max_distance_threshold = 100  # Limit in map units; buildings farther than this won't be in same cluster
 
     # Determine if we're running from GUI or command line
     # In GUI mode, don't show interactive plots to avoid blocking
@@ -1144,7 +1144,7 @@ def main(config):
     demand_df = pd.read_csv(locator.get_total_demand())
 
     # Call the cluster_buildings function with parameters from config
-    cluster_buildings(
+    final_df = cluster_buildings(
         buildings_shp, demand_df, locator,
         dtn_method=dtn_method,
         existing_dtn_filepath=existing_dtn_filepath,
@@ -1159,15 +1159,16 @@ def main(config):
         use_type_weight=use_type_weight,
         year_weight=year_weight,
         use_construction_year=use_construction_year,
-        encourage_archetype_diversity=encourage_archetype_diversity,
         ensure_min_use_types=ensure_min_use_types,
         min_use_types_per_cluster=min_use_types_per_cluster,
         min_buildings_per_cluster=min_buildings_per_cluster,
         include_heat_demand=include_heat_demand,
         max_demand_ratio=max_demand_ratio,
-        max_distance_threshold=max_distance_threshold,
+        noise_flag=reassign_noise,
+        noise_reassign_distance=noise_reassign_distance,
         show_interactive_plot=show_interactive_plot
     )
+
 
 
 if __name__ == "__main__":
@@ -1177,7 +1178,7 @@ if __name__ == "__main__":
     config = Configuration()
     # Try to use environment variable, fall back to hardcoded path
     scenario_path = os.environ.get('CEA_SCENARIO_PATH',
-                                   r"C:\Users\User\OneDrive - ETH Zurich\CEA_projects\base_design\01_base_design_2025")
+                                   r"C:\Users\changf\OneDrive - ETH Zurich\CEA_projects\base_design\01_base_design_2025")
     config.scenario = scenario_path
 
     # Check if the 'building-clustering' section exists in the configuration

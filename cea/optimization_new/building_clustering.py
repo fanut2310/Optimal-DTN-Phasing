@@ -365,7 +365,9 @@ def split_large_clusters(df, max_size=None, min_size=5):
     return df
 
 
-def reassign_noise(df, max_distance):
+def reassign_noise(df, max_distance=200):
+    print("DEBUG: Inside reassign_noise function")
+    print("DEBUG: Before reassignment, number of noise points (-1):", sum(df['cluster'] == -1))
     """
     Reassign HDBSCAN “noise” points (cluster = ‑1) to the nearest non-noise cluster
     if they lie within max_distance meters of any cluster member.
@@ -389,6 +391,7 @@ def reassign_noise(df, max_distance):
             clusters[idx] = clusters[nearest_idx]
 
     df['cluster'] = clusters
+    print("DEBUG: After reassignment in function, number of noise points (-1):", sum(df['cluster'] == -1))
     return df
 
 # For spatial-only feature preparation
@@ -459,7 +462,7 @@ def prepare_features(merged_df, heat_col='QH_sys_MWhyr', spatial_weight=25.0,
 
 
 # New function to ensure spatial coherence in clusters
-def ensure_spatial_coherence(df, max_distance_threshold=50):
+def ensure_spatial_coherence(df, max_distance_threshold=100):
     """
     Post-process clusters to ensure buildings in the same cluster are spatially coherent.
     Buildings farther than max_distance_threshold from all other buildings in their cluster
@@ -697,6 +700,7 @@ def balance_cluster_demands(labels, demand_values, max_ratio=3.0):
     return balanced_labels
 
 def spatial_majority_reassignment(df, n_neighbors=3):
+    print("DEBUG: spatial_majority_reassignment function called with n_neighbors =", n_neighbors)
     """
     For each building, assign it to the majority cluster among its n nearest neighbors (excluding itself).
     """
@@ -877,7 +881,7 @@ def cluster_buildings(buildings_shp, demand_df, locator,
                       year_weight=1.0,
                       use_construction_year=False,
                       noise_flag=True,
-                      noise_reassign_distance=100,
+                      noise_reassign_distance=200,
                       ensure_min_use_types=True,
                       min_use_types_per_cluster=2,
                       min_buildings_per_cluster=1,
@@ -1004,7 +1008,7 @@ def cluster_buildings(buildings_shp, demand_df, locator,
         non_dtn_df = split_large_clusters(non_dtn_df,
                                           max_size=25)  # Changed parameter name from max_cluster_size to max_size
         non_dtn_df = ensure_spatial_coherence(non_dtn_df, max_distance_threshold=100)  # Remove spatial outliers
-        non_dtn_df = reassign_noise(non_dtn_df, max_distance=100)  # Reassign nearby noise
+        non_dtn_df = reassign_noise(non_dtn_df, max_distance=200)  # Reassign nearby noise
 
         # Enforce use-type diversity after spatial processing
         if ensure_min_use_types:
@@ -1063,8 +1067,13 @@ def cluster_buildings(buildings_shp, demand_df, locator,
         final_df = non_dtn_df
 
     # Reassign noise buildings to the clusters that are within the noise_reassign_distance
+    print("DEBUG: noise_flag value:", noise_flag)
     if noise_flag:
+        print("DEBUG: Calling reassign_noise function with max_distance =", noise_reassign_distance)
         final_df = reassign_noise(final_df, max_distance=noise_reassign_distance)
+        print("DEBUG: After reassign_noise, number of noise points (-1):", sum(final_df['cluster'] == -1))
+    else:
+        print("DEBUG: reassign_noise function NOT called because noise_flag is False")
 
     # Ensure minimum use_type diversity if requested
     if ensure_min_use_types:
@@ -1127,7 +1136,8 @@ def main(config):
     include_heat_demand = config.building_clustering.include_heat_demand
 
     # Noise reassignment options
-    noise_flag = config.building_clustering.reassign_noise
+    noise_flag = True  # Force enable noise reassignment
+    print("DEBUG: Forcing noise_flag to True")
     noise_reassign_distance = config.building_clustering.noise_reassign_distance
 
     # Diversity options

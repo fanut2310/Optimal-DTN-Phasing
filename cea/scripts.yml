@@ -318,7 +318,7 @@ Energy Supply System Optimisation:
                   'district-network-optimization' ]
     input-files:
       - [ get_zone_geometry ]
-      - [ get_building_thermal_loads ]
+      - [ get_total_demand ]
 
   - name: decentralized
     label: "Supply System Part 1: decentralised"

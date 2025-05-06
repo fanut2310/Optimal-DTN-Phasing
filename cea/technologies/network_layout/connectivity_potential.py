@@ -254,26 +254,62 @@ def near_analysis(building_centroids, street_network, crs):
 
 
 def snap_points(points, lines, tolerance):
+    """
+    Modified snap_points function with error handling and memory optimization
+    """
     length = lines.shape[0]
     for i in range(length):
         for point in points.geometry:
-            line = lines.loc[i, "geometry"]
-            point_inline_projection = line.interpolate(line.project(point))
-            distance_to_line = point.distance(point_inline_projection)
-            if (point.x, point.y) not in line.coords:
-                if distance_to_line < tolerance:
-                    buff = point.buffer(0.1)
-                    ### Split the line on the buffer
-                    geometry = split(line, buff)
-                    line_1_points = [tuple(xy) for xy in geometry.geoms[0].coords[:-1]]
-                    line_1_points.append((point.x, point.y))
-                    line_2_points = []
-                    line_2_points.append((point.x, point.y))
-                    line_2_points.extend([x for x in geometry.geoms[-1].coords[1:]])
-                    ### Stitch together the first segment, the interpolated point, and the last segment
-                    new_line = linemerge((LineString(line_1_points), LineString(line_2_points)))
-                    lines.loc[i, "geometry"] = new_line
+            try:
+                line = lines.loc[i, "geometry"]
+                if line is None or not line.is_valid:
+                    continue
 
+                point_inline_projection = line.interpolate(line.project(point))
+                distance_to_line = point.distance(point_inline_projection)
+
+                if (point.x, point.y) not in line.coords:
+                    if distance_to_line < tolerance:
+                        # Use a smaller buffer to reduce memory usage
+                        reduced_buffer = min(0.05, tolerance / 1000)  # Smaller buffer
+                        buff = point.buffer(reduced_buffer)
+
+                        try:
+                            # Try with smaller buffer first
+                            geometry = split(line, buff)
+                        except Exception:
+                            # If that fails, simplify the geometries before splitting
+                            simplified_line = line.simplify(tolerance / 100)
+                            simplified_buff = buff.simplify(tolerance / 100)
+                            try:
+                                geometry = split(simplified_line, simplified_buff)
+                            except Exception as e:
+                                # Log the error but continue processing
+                                print(f"Warning: Could not split line {i}: {e}")
+                                continue
+
+                        # Check if split was successful
+                        if len(geometry.geoms) < 2:
+                            continue
+
+                        line_1_points = [tuple(xy) for xy in geometry.geoms[0].coords[:-1]]
+                        line_1_points.append((point.x, point.y))
+                        line_2_points = []
+                        line_2_points.append((point.x, point.y))
+                        line_2_points.extend([x for x in geometry.geoms[-1].coords[1:]])
+
+                        # Create the new line
+                        try:
+                            new_line = linemerge((LineString(line_1_points), LineString(line_2_points)))
+                            lines.loc[i, "geometry"] = new_line
+                        except Exception as e:
+                            print(f"Warning: Could not merge lines: {e}")
+            except Exception as e:
+                # Skip problematic geometries
+                print(f"Warning: Error processing point at index {i}: {e}")
+                continue
+
+    # Remove duplicate geometries
     G = points["geometry"].apply(lambda geom: geom.wkb)
     points = points.loc[G.drop_duplicates().index]
 

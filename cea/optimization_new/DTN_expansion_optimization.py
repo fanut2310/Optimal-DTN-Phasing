@@ -1,88 +1,98 @@
+#!/usr/bin/env python3
 """
-Optimization for Multi-phased District Thermal Network Expansion.
+District‑Network‑Expansion
+
+Runs CEA network‑layout (Part 1) and thermal‑network (Part 2) on *all*
+buildings that are within SNAP_TOLERANCE of a street centre‑line.
+
+Outputs land in:  outputs/data/optimization/
+Diagnostics CSV : outputs/data/optimization/diagnostics/building_street_distances.csv
 """
 
-__author__ = "Fan Ut Chang"
-__copyright__ = "Copyright 2025, Architecture and Building Systems - ETH Zurich"
-__credits__ = ["Fan Ut Chang"]
-__license__ = "MIT"
-__version__ = "0.1"
-__maintainer__ = "Fan Ut Chang"
-__email__ = "changf@ethz.ch"
-__status__ = "Production"
-
-import os
-import types
-import cea.config
-from cea.technologies.network_layout.main import layout_network, NetworkLayout
-from cea.technologies.thermal_network.thermal_network import ThermalNetwork, thermal_network_main
+from __future__ import annotations
+import os, types
+import pandas as pd
 import geopandas as gpd
+import cea.config
 from cea.inputlocator import InputLocator
+import cea.constants as consts
+from cea.technologies.network_layout.main import layout_network, NetworkLayout
+from cea.technologies.thermal_network.thermal_network import (
+    ThermalNetwork, thermal_network_main)
 
-# read and drop Z‐dimension
-zone_gdf = gpd.read_file(zone_path)
-zone_gdf['geometry'] = zone_gdf.geometry.apply(lambda geom: geom if geom.has_z is False
-                                              else type(geom)([ (x, y) for x, y, *rest in geom.coords ]))
-# overwrite with plain 2D
-zone_gdf.to_file(zone_path, driver='ESRI Shapefile')
+SHAPEFILE_TOLERANCE_MM = consts.SHAPEFILE_TOLERANCE
+SNAP_TOLERANCE_M = consts.SNAP_TOLERANCE
 
-subprocess.check_call([cea_cli, "network-layout", "--scenario", config.scenario], cwd=config.scenario)
+print("Using SHAPEFILE_TOLERANCE =", consts.SHAPEFILE_TOLERANCE,  "mm")
+print("Using SNAP_TOLERANCE      =", consts.SNAP_TOLERANCE,  "m")
 
+# -------------------------------------------------------------------------
+def nearest_distance(points: gpd.GeoSeries,
+                     lines : gpd.GeoSeries) -> pd.Series:
+    """Vectorised min distance (m) from each point to its nearest line."""
+    idx = lines.sindex.nearest(points, return_all=False)[1]
+    # idx may be shorter than points if some return []  → pad with None
+    full_idx, it = [], iter(idx)
+    for _ in points:
+        full_idx.append(next(it, None))
+    nearest = [lines.iloc[i] if i is not None else None for i in full_idx]
+    return pd.Series([
+        p.distance(l) if l is not None else float("inf")
+        for p, l in zip(points, nearest)
+    ], index=points.index)
+
+# -------------------------------------------------------------------------
 def main(config):
-    locator = cea.inputlocator.InputLocator(config.scenario)
+    locator = InputLocator(config.scenario)
 
-    # Override certain network layout parameters bypassing the configuration check.
-    object.__setattr__(config.network_layout, "connected_buildings", [])
-    object.__setattr__(config.network_layout, "consider_only_buildings_with_demand", False)
+    # redirect thermal‑network outputs → optimization/
+    locator.get_thermal_network_folder = locator.get_optimization_results_folder
 
-    # Ensure the thermal_network configuration exists with network_type.
-    try:
-        network_type = config.thermal_network.network_type
-    except AttributeError:
-        # Create a minimal dummy thermal network configuration with a default network type.
-        thermal_network_config = types.SimpleNamespace()
-        thermal_network_config.network_type = "DH"  # default value, change if needed
-        object.__setattr__(config, "thermal_network", thermal_network_config)
-        network_type = config.thermal_network.network_type
+    # load geometry
+    zone   = gpd.read_file(locator.get_zone_geometry())
+    streets = gpd.read_file(locator.get_street_network())
 
-    # Initialize the network layout using the configuration.
-    network_layout = NetworkLayout(config.network_layout)
-    network_layout.network_type = network_type  # set network type from thermal_network configuration
+    # compute point‑to‑line distances
+    zone["centroid"]  = zone.geometry.centroid
+    zone["dist_m"]    = nearest_distance(zone["centroid"], streets.geometry)
 
-    print("Running network layout...")
-    layout_network(
-        network_layout=network_layout,
-        locator=locator,
-        output_name_network="",
-    )
+    # diagnostics
+    diag_dir = os.path.join(
+        config.scenario, "outputs", "data", "optimization", "diagnostics")
+    os.makedirs(diag_dir, exist_ok=True)
+    diag_csv = os.path.join(diag_dir, "building_street_distances.csv")
+    zone[["name", "dist_m"]].to_csv(diag_csv, index=False)
+    print("Diagnostics written ->", diag_csv)
 
-    # Run the thermal network simulation (Parts 1 & 2)
-    network_name = ""
-    thermal_network = ThermalNetwork(locator, network_name, config.thermal_network)
-    thermal_network_main(locator, thermal_network)
+    # filter buildings that can be snapped
+    keep   = zone["dist_m"] <= SNAP_TOLERANCE_M
+    kept_names = zone.loc[keep, "name"].astype(str).tolist()
+    dropped    = (~keep).sum()
+    if dropped:
+        print(f"{dropped} buildings farther than {SNAP_TOLERANCE_M} m "
+              "were excluded from the layout.")
 
-    print("Thermal network parts 1 & 2 completed successfully.")
+    # ------------- network‑layout configuration -----------------------
+    nl_cfg = config.network_layout
+    nl_cfg.connected_buildings = kept_names
+    nl_cfg.consider_only_buildings_with_demand = False
 
+    if not hasattr(config, "thermal_network"):
+        config.thermal_network = types.SimpleNamespace(network_type="DH")
 
-if __name__ == '__main__':
-    from cea.config import Configuration
+    # ------------------ Part 1: layout --------------------------------
+    print("Running network‑layout …")
+    netlay = NetworkLayout(nl_cfg)
+    netlay.network_type = config.thermal_network.network_type
+    layout_network(netlay, locator, output_name_network="")
 
-    config = Configuration()
+    # ------------------ Part 2: hydraulics / thermal ------------------
+    print("Running thermal‑network …")
+    tn = ThermalNetwork(locator, network_name="", config=config.thermal_network)
+    thermal_network_main(locator, tn)
 
-    # Allow scenario overriding via an environment variable.
-    scenario_path = os.environ.get(
-        'CEA_SCENARIO_PATH',
-        r"C:\Users\changf\OneDrive - ETH Zurich\CEA_projects\base_design\01_base_design_2025"
-    )
-    config.scenario = scenario_path
+    print("Finished – outputs in", locator.get_optimization_results_folder())
 
-    # Check for the presence of the 'thermal-network' section; if not present, we later
-    # create a dummy configuration on the fly.
-    if 'thermal-network' in config.sections:
-        main(config)
-    else:
-        # If not found in the sections, you may either choose to create a dummy
-        # configuration as above or show an error.
-        print("Warning: 'thermal-network' section not found in configuration.")
-        print("A default thermal network configuration will be used.")
-        main(config)
+# -------------------------------------------------------------------------
+if __name__ == "__main__":
+    main(cea.config.Configuration())

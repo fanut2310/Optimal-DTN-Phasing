@@ -319,6 +319,10 @@ class InputLocator(object):
         """scenario/export/rhino/from_cea/dc_nodes_out.csv"""
         return os.path.join(self.get_export_to_rhino_from_cea_folder(), 'dc_nodes_out.csv')
 
+    def get_dtn_expansion_optimization_results_folder(self):
+        """Returns the folder containing the scenario's district thermal network optimization results"""
+        return self._ensure_folder(self.scenario, 'outputs', 'data', 'optimization', 'dtn_expansion')
+
     def get_optimization_results_folder(self):
         """Returns the folder containing the scenario's optimization results"""
         return self._ensure_folder(self.scenario, 'outputs', 'data', 'optimization')

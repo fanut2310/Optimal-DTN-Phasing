@@ -254,62 +254,26 @@ def near_analysis(building_centroids, street_network, crs):
 
 
 def snap_points(points, lines, tolerance):
-    """
-    Modified snap_points function with error handling and memory optimization
-    """
     length = lines.shape[0]
     for i in range(length):
         for point in points.geometry:
-            try:
-                line = lines.loc[i, "geometry"]
-                if line is None or not line.is_valid:
-                    continue
+            line = lines.loc[i, "geometry"]
+            point_inline_projection = line.interpolate(line.project(point))
+            distance_to_line = point.distance(point_inline_projection)
+            if (point.x, point.y) not in line.coords:
+                if distance_to_line < tolerance:
+                    buff = point.buffer(0.1)
+                    ### Split the line on the buffer
+                    geometry = split(line, buff)
+                    line_1_points = [tuple(xy) for xy in geometry.geoms[0].coords[:-1]]
+                    line_1_points.append((point.x, point.y))
+                    line_2_points = []
+                    line_2_points.append((point.x, point.y))
+                    line_2_points.extend([x for x in geometry.geoms[-1].coords[1:]])
+                    ### Stitch together the first segment, the interpolated point, and the last segment
+                    new_line = linemerge((LineString(line_1_points), LineString(line_2_points)))
+                    lines.loc[i, "geometry"] = new_line
 
-                point_inline_projection = line.interpolate(line.project(point))
-                distance_to_line = point.distance(point_inline_projection)
-
-                if (point.x, point.y) not in line.coords:
-                    if distance_to_line < tolerance:
-                        # Use a smaller buffer to reduce memory usage
-                        reduced_buffer = min(0.05, tolerance / 1000)  # Smaller buffer
-                        buff = point.buffer(reduced_buffer)
-
-                        try:
-                            # Try with smaller buffer first
-                            geometry = split(line, buff)
-                        except Exception:
-                            # If that fails, simplify the geometries before splitting
-                            simplified_line = line.simplify(tolerance / 100)
-                            simplified_buff = buff.simplify(tolerance / 100)
-                            try:
-                                geometry = split(simplified_line, simplified_buff)
-                            except Exception as e:
-                                # Log the error but continue processing
-                                print(f"Warning: Could not split line {i}: {e}")
-                                continue
-
-                        # Check if split was successful
-                        if len(geometry.geoms) < 2:
-                            continue
-
-                        line_1_points = [tuple(xy) for xy in geometry.geoms[0].coords[:-1]]
-                        line_1_points.append((point.x, point.y))
-                        line_2_points = []
-                        line_2_points.append((point.x, point.y))
-                        line_2_points.extend([x for x in geometry.geoms[-1].coords[1:]])
-
-                        # Create the new line
-                        try:
-                            new_line = linemerge((LineString(line_1_points), LineString(line_2_points)))
-                            lines.loc[i, "geometry"] = new_line
-                        except Exception as e:
-                            print(f"Warning: Could not merge lines: {e}")
-            except Exception as e:
-                # Skip problematic geometries
-                print(f"Warning: Error processing point at index {i}: {e}")
-                continue
-
-    # Remove duplicate geometries
     G = points["geometry"].apply(lambda geom: geom.wkb)
     points = points.loc[G.drop_duplicates().index]
 
@@ -367,12 +331,28 @@ def create_terminals(building_centroids, crs, street_network):
     # extend to the building centroids
     all_points = pd.concat([near_points.to_crs(crs), building_centroids.to_crs(crs)])
     all_points.crs = crs
-    # Aggregate these points with the GroupBy
-    lines_to_buildings = all_points.groupby(['name'])['geometry'].apply(lambda x: LineString(x.tolist()))
-    lines_to_buildings = gdf(lines_to_buildings, geometry='geometry', crs=crs)
 
-    lines_to_buildings = pd.concat([lines_to_buildings, street_network]).reset_index(drop=True)
-    lines_to_buildings.crs = crs
+    # Create a list to store valid linestrings
+    valid_linestrings = []
+
+    # Process each group separately
+    for name, group in all_points.groupby(['name']):
+        point_list = group['geometry'].tolist()
+        # Check if we have at least 2 points to create a valid LineString
+        if len(point_list) >= 2:
+            valid_linestrings.append((name, LineString(point_list)))
+
+    # Create a GeoDataFrame from valid linestrings
+    if valid_linestrings:
+        lines_df = pd.DataFrame(valid_linestrings, columns=['name', 'geometry'])
+        lines_to_buildings = gdf(lines_df, geometry='geometry', crs=crs)
+
+        lines_to_buildings = pd.concat([lines_to_buildings, street_network]).reset_index(drop=True)
+        lines_to_buildings.crs = crs
+    else:
+        # No valid linestrings were created, return just the street network
+        lines_to_buildings = street_network.copy()
+
     return lines_to_buildings
 
 
@@ -389,7 +369,8 @@ def simplify_liness_accurracy(lines, decimals, crs):
     return df
 
 
-def calc_connectivity_network(path_streets_shp, building_centroids_df, optimisation_flag=False, path_potential_network=None):
+def calc_connectivity_network(path_streets_shp, building_centroids_shp, crs_projected, output_network_folder,
+                              output_edges_shp, output_nodes_shp, output_network_shp, weight_field, snap_tolerance=50):
     """
     This script outputs a potential network connecting a series of building points to the closest street network
     the street network is assumed to be a good path to the district heating or cooling network

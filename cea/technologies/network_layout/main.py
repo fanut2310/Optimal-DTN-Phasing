@@ -50,9 +50,27 @@ def layout_network(network_layout, locator, plant_building_names=None, output_na
                                                     total_demand_location)
 
     # Calculate potential network
-    crs_projected = calc_connectivity_network(path_streets_shp,
-                                              building_centroids_df,
-                                              path_potential_network=temp_path_potential_network_shp)
+    import cea.constants as consts
+
+    # 1) prepare the outputs that the new API expects
+    path_output_edges_shp = locator.get_network_layout_edges_shapefile(type_network, output_name_network)
+    path_output_nodes_shp = locator.get_network_layout_nodes_shapefile(type_network, output_name_network)
+    output_network_folder = locator.get_output_thermal_network_type_folder(type_network, output_name_network)
+    # 2) write the building centroids to the temporary shapefile
+    building_centroids_df.to_file(temp_path_building_centroids_shp, driver='ESRI Shapefile')
+
+    # 3) call the new API:
+    crs_projected = calc_connectivity_network(
+        path_streets_shp,  # 1) street network shapefile
+        temp_path_building_centroids_shp,  # 2) centroid shapefile
+        None,  # 3) project CRS (not used here)
+        output_network_folder,  # 4) folder to deposit output
+        path_output_edges_shp,  # 5) edges .shp
+        path_output_nodes_shp,  # 6) nodes .shp
+        temp_path_potential_network_shp,  # 7) “network” .shp
+        weight_field,  # 8) weight field name
+        consts.SNAP_TOLERANCE  # 9) your patched snap tolerance
+    )
 
     # calc minimum spanning tree and save results to disk
     path_output_edges_shp = locator.get_network_layout_edges_shapefile(type_network, output_name_network)

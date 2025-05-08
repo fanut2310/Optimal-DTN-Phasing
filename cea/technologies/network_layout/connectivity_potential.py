@@ -381,22 +381,24 @@ def calc_connectivity_network(path_streets_shp, building_centroids_shp, crs_proj
     :param path_potential_network: output path shapefile
     :return:
     """
-    # first get the street network
+    # load street network and project
     street_network = gdf.from_file(path_streets_shp)
-
-    # check coordinate system
     lat, lon = get_lat_lon_projected_shapefile(street_network)
     street_network = street_network.to_crs(get_projected_coordinate_system(lat, lon))
     crs = street_network.crs
 
     valid_geometries = street_network[street_network.geometry.is_valid].geometry
-
     if valid_geometries.empty:
         raise ValueError("No valid geometries found in the shapefile.")
     elif len(street_network) != len(valid_geometries):
-        warnings.warn("Invalid geometries found in the shapefile. Discarding all invalid geometries.")
-
+        warnings.warn("Invalid geometries found. Discarding them.")
     street_network = simplify_liness_accurracy(valid_geometries, SHAPEFILE_TOLERANCE, crs)
+
+    # *** NEW: read your building‐centroid shapefile into a GeoDataFrame ***
+    building_centroids_df = gdf.from_file(building_centroids_shp)
+
+    # now build the “prototype network” by snapping each building centroid
+    prototype_network = create_terminals(building_centroids_df, crs, street_network)
 
     # create terminals/branches form street to buildings
     prototype_network = create_terminals(building_centroids_df, crs, street_network)

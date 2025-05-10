@@ -331,28 +331,12 @@ def create_terminals(building_centroids, crs, street_network):
     # extend to the building centroids
     all_points = pd.concat([near_points.to_crs(crs), building_centroids.to_crs(crs)])
     all_points.crs = crs
+    # Aggregate these points with the GroupBy
+    lines_to_buildings = all_points.groupby(['name'])['geometry'].apply(lambda x: LineString(x.tolist()))
+    lines_to_buildings = gdf(lines_to_buildings, geometry='geometry', crs=crs)
 
-    # Create a list to store valid linestrings
-    valid_linestrings = []
-
-    # Process each group separately
-    for name, group in all_points.groupby(['name']):
-        point_list = group['geometry'].tolist()
-        # Check if we have at least 2 points to create a valid LineString
-        if len(point_list) >= 2:
-            valid_linestrings.append((name, LineString(point_list)))
-
-    # Create a GeoDataFrame from valid linestrings
-    if valid_linestrings:
-        lines_df = pd.DataFrame(valid_linestrings, columns=['name', 'geometry'])
-        lines_to_buildings = gdf(lines_df, geometry='geometry', crs=crs)
-
-        lines_to_buildings = pd.concat([lines_to_buildings, street_network]).reset_index(drop=True)
-        lines_to_buildings.crs = crs
-    else:
-        # No valid linestrings were created, return just the street network
-        lines_to_buildings = street_network.copy()
-
+    lines_to_buildings = pd.concat([lines_to_buildings, street_network]).reset_index(drop=True)
+    lines_to_buildings.crs = crs
     return lines_to_buildings
 
 
@@ -369,8 +353,7 @@ def simplify_liness_accurracy(lines, decimals, crs):
     return df
 
 
-def calc_connectivity_network(path_streets_shp, building_centroids_shp, crs_projected, output_network_folder,
-                              output_edges_shp, output_nodes_shp, output_network_shp, weight_field, snap_tolerance=50):
+def calc_connectivity_network(path_streets_shp, building_centroids_df, optimisation_flag=False, path_potential_network=None):
     """
     This script outputs a potential network connecting a series of building points to the closest street network
     the street network is assumed to be a good path to the district heating or cooling network
@@ -381,24 +364,22 @@ def calc_connectivity_network(path_streets_shp, building_centroids_shp, crs_proj
     :param path_potential_network: output path shapefile
     :return:
     """
-    # load street network and project
+    # first get the street network
     street_network = gdf.from_file(path_streets_shp)
+
+    # check coordinate system
     lat, lon = get_lat_lon_projected_shapefile(street_network)
     street_network = street_network.to_crs(get_projected_coordinate_system(lat, lon))
     crs = street_network.crs
 
     valid_geometries = street_network[street_network.geometry.is_valid].geometry
+
     if valid_geometries.empty:
         raise ValueError("No valid geometries found in the shapefile.")
     elif len(street_network) != len(valid_geometries):
-        warnings.warn("Invalid geometries found. Discarding them.")
+        warnings.warn("Invalid geometries found in the shapefile. Discarding all invalid geometries.")
+
     street_network = simplify_liness_accurracy(valid_geometries, SHAPEFILE_TOLERANCE, crs)
-
-    # *** NEW: read your building‐centroid shapefile into a GeoDataFrame ***
-    building_centroids_df = gdf.from_file(building_centroids_shp)
-
-    # now build the “prototype network” by snapping each building centroid
-    prototype_network = create_terminals(building_centroids_df, crs, street_network)
 
     # create terminals/branches form street to buildings
     prototype_network = create_terminals(building_centroids_df, crs, street_network)

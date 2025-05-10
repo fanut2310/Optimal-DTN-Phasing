@@ -266,7 +266,7 @@ Life Cycle Analysis:
     input-files:
       - [get_total_demand]
       - [get_building_supply]
-
+x
 
 Energy Supply System Optimisation:
 

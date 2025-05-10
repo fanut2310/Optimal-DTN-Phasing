@@ -293,6 +293,7 @@ Energy Supply System Optimisation:
                   'building-clustering:min-buildings-per-cluster',
                   'building-clustering:max-demand-ratio',
                   'building-clustering:dtn-method',
+                  'building-clustering:existing-dtn-buildings',
                   'building-clustering:existing-dtn-filepath',
                   'building-clustering:network-type',
                   'building-clustering:spatial-weight',

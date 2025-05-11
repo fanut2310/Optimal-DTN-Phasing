@@ -4,7 +4,7 @@
 Building Clustering Script for DTN Phased Optimization
 
 This script clusters buildings based on annual heat demand (column "QH_sys_MWhyr" in Total_demand.csv)
-and building proximity.
+and building proximity. *Cooling demand not yet considered and should be integrated later.
 
 Outputs include:
 1. A CSV file with building cluster assignments
@@ -906,7 +906,7 @@ def cluster_buildings(buildings_shp, demand_df, locator,
     merged_df['heat_MWhyr'] = merged_df['QH_sys_MWhyr']
 
     # Identify buildings in existing DTN from config
-    dtn_buildings = get_existing_DTN_buildings_list(config)
+    dtn_buildings = existing_dtn_buildings or []
     print(f"Using {len(dtn_buildings)} buildings from existing DTN: {dtn_buildings}")
 
     # Add a flag to mark DTN buildings
@@ -1095,8 +1095,10 @@ def main(config):
 
     # Call the cluster_buildings function with parameters from config
     final_df = cluster_buildings(
-        buildings_shp, demand_df, locator,
-        existing_dtn_buildings=config.building_clustering.existing_dtn_buildings,
+        buildings_shp,
+        demand_df,
+        locator,
+        existing_dtn_buildings=existing_dtn_buildings,        # use the local var
         clustering_algorithm=clustering_algorithm,
         extra_clusters=extra_clusters,
         min_cluster_size=min_cluster_size,
@@ -1106,17 +1108,17 @@ def main(config):
         network_type=network_type,
         spatial_weight=spatial_weight,
         use_type_weight=use_type_weight,
-        year_weight=year_weight,
         use_construction_year=use_construction_year,
         ensure_min_use_types=ensure_min_use_types,
         min_use_types_per_cluster=min_use_types_per_cluster,
         min_buildings_per_cluster=min_buildings_per_cluster,
         include_heat_demand=include_heat_demand,
         max_demand_ratio=max_demand_ratio,
-        noise_flag=reassign_noise,
+        noise_flag=noise_flag,                                  # fix typo here
         noise_reassign_distance=noise_reassign_distance,
         show_interactive_plot=show_interactive_plot
     )
+
 
 
 
@@ -1137,7 +1139,7 @@ if __name__ == "__main__":
 
     # Try to use environment variable, fall back to hardcoded path
     scenario_path = os.environ.get('CEA_SCENARIO_PATH',
-                                   r"C:\Users\User\OneDrive - ETH Zurich\CEA_projects\base_design\01_base_design_2025")
+                                   r"C:\Users\changf\OneDrive - ETH Zurich\CEA_projects\base_design\01_base_design_2025")
     config.scenario = scenario_path
 
     # Check if the 'building-clustering' section exists in the configuration

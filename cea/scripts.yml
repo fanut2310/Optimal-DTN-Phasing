@@ -266,7 +266,7 @@ Life Cycle Analysis:
     input-files:
       - [get_total_demand]
       - [get_building_supply]
-x
+
 
 Energy Supply System Optimisation:
 
@@ -292,9 +292,7 @@ Energy Supply System Optimisation:
                   'building-clustering:cluster-selection-method',
                   'building-clustering:min-buildings-per-cluster',
                   'building-clustering:max-demand-ratio',
-                  'building-clustering:dtn-method',
                   'building-clustering:existing-dtn-buildings',
-                  'building-clustering:existing-dtn-filepath',
                   'building-clustering:network-type',
                   'building-clustering:spatial-weight',
                   'building-clustering:use-type-weight',

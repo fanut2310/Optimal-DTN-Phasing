@@ -1,190 +1,279 @@
 #!/usr/bin/env python3
 """
 DTN_expansion_optimization.py
+=============================
+A workflow to stage the expansion of an existing (cluster‑0) District Thermal
+Network (DTN) into an arbitrary number of *phases* while maximising a financial
+objective (ROI, NPV or simple pay‑back).
 
-  • --test : run only TEST_BUILDINGS (hard-coded below)
-  • (no --test) : GUI/CLI mode, uses CEA’s connected_buildings or “Select all”
-Results & diagnostics land under:
-  ${SCENARIO}/outputs/data/optimization/dtn_expansion/
+Key design philosophy
+---------------------
+* **Single network layout** – we reuse the *Part 1* master layout that connects
+  **all** candidate buildings.  This avoids having to regenerate geometry for
+  each phase and ensures pipe positions & diameters stay consistent.
+* **Edge activation** – every pipe (edge) in that master graph carries a
+  Boolean `active` flag.  When a cluster is assigned to a phase we activate the
+  path that links its nodes to the already‑active network.  CAPEX is charged
+  *only once* per edge – the phase that first activates it.
+* **Modular optimization layer** – the cost / hydraulic model is kept strictly
+  separate from the search algorithm.  You may plug‑in Greedy, A*, Genetic
+  Algorithm, etc. simply by switching the `choose_next_phase()` strategy.
+* **CEA integration ready** – inputs are read via `cea.inputlocator.InputLocator`
+  and parameters via `cea.config.Configuration`.  The script therefore runs
+  seamlessly from the CEA CLI or Dashboard once registered in `scripts.yml`.
 """
 
-import os
 import argparse
-from typing import List, Optional
+import logging
+import math
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
-# ┌───────────────────────────────┐
-# │ 1) PATCH constants up front  │
-# └───────────────────────────────┘
-import cea.constants as constants
-# > set these larger than your ~130 m max building–street gap
-constants.SHAPEFILE_TOLERANCE = 1000  # mm
-constants.SNAP_TOLERANCE      = 150   # m
-print(f"Using SHAPEFILE_TOLERANCE = {constants.SHAPEFILE_TOLERANCE} mm")
-print(f"Using SNAP_TOLERANCE      = {constants.SNAP_TOLERANCE} m")
-
-# ┌───────────────────────────────────────────────────────────────────┐
-# │ 2) defer all other CEA imports until after the patch above     │
-# └───────────────────────────────────────────────────────────────────┘
-import types
+import networkx as nx
 import pandas as pd
-import geopandas as gpd
-from shapely.geometry import LineString
-from cea.config     import Configuration
-from cea.inputlocator import InputLocator
-from cea.technologies.network_layout.main import layout_network, NetworkLayout
-import cea.technologies.network_layout.connectivity_potential as cp
-from cea.technologies.thermal_network.thermal_network import thermal_network_main, ThermalNetwork
 
-# ┌─────────────────────────────────────────┐
-# │ 3) hard-coded test set of building IDs │
-# └─────────────────────────────────────────┘
-TEST_BUILDINGS = [
-    'B0000','B0001','B0002','B0003','B0019','B0020','B0021','B0022',
-    'B0034','B0035','B0036','B0041','B0053','B0054','B0055','B0056',
-    'B0074','B0075','B0076'
-]
+import cea.config               # type: ignore
+import cea.inputlocator         # type: ignore
+from cea.analysis.costs.equations import (
+    calc_capex_annualized,
+    calc_opex_annualized,
+)
 
-def strip_z(zone_path: str) -> None:
-    """Load zone.shp, drop any Z coords, overwrite it 2D."""
-    gdf = gpd.read_file(zone_path)
-    def dropz(g):
-        if not getattr(g, "has_z", False):
-            return g
-        return type(g)([(x, y) for x, y, *rest in g.coords])
-    gdf.geometry = gdf.geometry.map(dropz)
-    gdf.to_file(zone_path, driver="ESRI Shapefile")
+# ----------------------------------------------------------------------------
+# Default economic assumptions (if missing in config)
+# ----------------------------------------------------------------------------
+DEFAULT_IR_PERC          = 5.0    # [%]
+DEFAULT_LIFETIME_YR      = 25     # [yr]
+DEFAULT_FUEL_COST_USDkWh = 0.04   # [USD/kWh]
+DEFAULT_OANDM_PERC       = 1.0    # [% of CAPEX]
 
-def run_dtn_expansion(config: Configuration, test_ids: Optional[List[str]]):
-    locator = InputLocator(config.scenario)
+# ----------------------------------------------------------------------------
+# Logging setup
+# ----------------------------------------------------------------------------
 
-    # ┌────────────────────────────────────────────────────────────────┐
-    # │ 4) monkey-patch the broken near_analysis using this locator    │
-    # └────────────────────────────────────────────────────────────────┘
-    def near_analysis_fixed(blds: gpd.GeoDataFrame,
-                            streets: gpd.GeoDataFrame,
-                            crs) -> gpd.GeoDataFrame:
-
-        # Diagnostics for streets data
-        print(f"Street data: {len(streets)} rows, CRS: {streets.crs}")
-        if not streets.empty:
-            print(f"First street geometry type: {streets.iloc[0].geometry.type}")
-        else:
-            print("WARNING: Streets dataframe is empty!")
-
-        streets_p = streets.to_crs(crs).geometry.reset_index(drop=True)
-        blds_p = blds.to_crs(crs).reset_index(drop=True)
-
-        # Check if streets dataframe is empty
-        if streets.empty:
-            print("WARNING: Streets dataframe is empty! Using building centroids directly.")
-            return blds_p
-
-        # Process each point individually
-        names, snaps, dists = [], [], []
-        for i, row in blds_p.iterrows():
-            pt = row.geometry
-            # Find nearest street segment for a single point
-            nearest_results = streets_p.sindex.nearest(pt)
-
-            # Check if any results were found
-            if len(nearest_results[1]) > 0:
-                nearest_idx = nearest_results[1][0]
-                line = streets_p.iloc[nearest_idx]
-                dist = pt.distance(line)
-                snap = line.interpolate(line.project(pt))
-            else:
-                # Handle case where no streets are found near this building
-                print(f"Warning: No streets found near building {row['name']}. Using original point position.")
-                dist = float('inf')  # Set a large distance
-                snap = pt
-
-            names.append(row["name"])
-            snaps.append(snap)
-            dists.append(dist)
-
-        # --- diagnostics
-        df = pd.DataFrame({
-            "name": names,
-            "distance_to_street_m": dists
-        }).sort_values("distance_to_street_m", ascending=False)
-
-        diag_dir = os.path.join(
-            locator.get_dtn_expansion_optimization_results_folder(), "diagnostics"
+def log() -> logging.Logger:
+    logger = logging.getLogger("cea.dtn_expansion")
+    if not logger.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s | %(levelname)5s | %(message)s",
+            datefmt="%H:%M:%S",
         )
-        os.makedirs(diag_dir, exist_ok=True)
-        df.to_csv(os.path.join(diag_dir, "building_street_distances.csv"), index=False)
-        print("Diagnostics written →", diag_dir)
+    return logger
 
-        # --- Important modification: If all distances are beyond tolerance, use a larger tolerance
-        if all(dist > constants.SNAP_TOLERANCE for dist in dists):
-            print(f"All buildings are beyond {constants.SNAP_TOLERANCE}m from streets.")
-            print("Using building centroids directly instead of snapping to streets.")
-            return blds_p[["name"]].set_geometry(blds_p.geometry)
+# ----------------------------------------------------------------------------
+# Safe config fetch
+# ----------------------------------------------------------------------------
 
-        # Original filtering logic
-        keep = df["distance_to_street_m"] <= constants.SNAP_TOLERANCE
-        dropped = (~keep).sum()
-        if dropped:
-            print(f"Dropping {dropped} buildings beyond "
-                  f"{constants.SNAP_TOLERANCE} m")
-        kept = df[keep]["name"].tolist()
-        kept_pts = [snap for snap, ok in zip(snaps, keep) if ok]
+def safe_cfg(section, attr: str, default):
+    try:
+        return getattr(section, attr)
+    except Exception:
+        log().warning("Missing config.%s.%s → default %s", section, attr, default)
+        return default
 
-        return gpd.GeoDataFrame({"name": kept}, geometry=kept_pts, crs=crs)
+# ----------------------------------------------------------------------------
+# Data classes
+# ----------------------------------------------------------------------------
+@dataclass
+class Cluster:
+    cid: int
+    buildings: List[str]
+    peak_kW: float
+    annual_MWh: float
+    centroid: Tuple[float, float]
+    phase: Optional[int] = None
+    capex_USD: float = 0.0
+    opex_a_USD: float = 0.0
+    npv_USD: float = 0.0
+    path_nodes: List[str] = field(default_factory=list)
 
-    cp.near_analysis = near_analysis_fixed
+@dataclass
+class Econ:
+    IR: float
+    LT: int
+    fuel: float
+    fixed_pct: float
 
-    # ┌────────────────────────────────────────────────────┐
-    # │ 5) strip any Z dimension out of zone.shp once     │
-    # └────────────────────────────────────────────────────┘
-    strip_z(locator.get_zone_geometry())
+@dataclass
+class PipeCat:
+    df: Optional[pd.DataFrame]
+    default_cost: float = 450.0
 
-    # ┌─────────────────────────────────────────────────────────┐
-    # │ 6) pick your building list: TEST or GUI/CLI (Select all) │
-    # └─────────────────────────────────────────────────────────┘
-    if test_ids:
-        sel = test_ids
-        print(f"[TEST MODE] running on {len(sel)} buildings")
-    else:
-        sel = config.network_layout.connected_buildings or []
-        if not sel:
-            sel = gpd.read_file(locator.get_zone_geometry())["name"].astype(str).tolist()
+    @classmethod
+    def load(cls, path: Path):
+        if path.exists():
+            return cls(pd.read_csv(path))
+        log().warning("Thermal grid DB not found: %s", path)
+        return cls(None)
 
-    # ┌──────────────────────────────────────────────────┐
-    # │ 7) configure & run network-layout (Part 1)      │
-    # └──────────────────────────────────────────────────┘
-    cfg_nl = config.network_layout
-    cfg_nl.connected_buildings = sel
-    cfg_nl.consider_only_buildings_with_demand = False
+    def cost_per_m(self, dn_mm: float) -> float:
+        if self.df is None:
+            return self.default_cost
+        df = self.df[df["DN_int_m"] * 1000 >= dn_mm]
+        if df.empty:
+            row = self.df.iloc[-1]
+        else:
+            row = df.iloc[0]
+        return float(row.get("Pipe_cost_USD2015perm", self.default_cost))
 
-    print("Running network-layout …")
-    netlay = NetworkLayout(cfg_nl)
-    netlay.network_type = getattr(config, "thermal_network", types.SimpleNamespace(network_type="DH")).network_type
-    layout_network(netlay, locator, output_name_network="")
+# ----------------------------------------------------------------------------
+# Core Optimiser
+# ----------------------------------------------------------------------------
+class DTNOptimizer:
+    def __init__(self, scenario: str, net_type: str, net_name: str):
+        cfg = cea.config.Configuration()
+        cfg.scenario = scenario
+        self.loc = cea.inputlocator.InputLocator(cfg.scenario)
+        # economics
+        costs = getattr(cfg, 'costs', cfg)
+        self.econ = Econ(
+            IR        = safe_cfg(costs, 'interest_rate', DEFAULT_IR_PERC),
+            LT        = safe_cfg(costs, 'lifetime', DEFAULT_LIFETIME_YR),
+            fuel      = safe_cfg(costs, 'fuel_cost_usdperkwh', DEFAULT_FUEL_COST_USDkWh),
+            fixed_pct = safe_cfg(costs, 'maintenance_percent', DEFAULT_OANDM_PERC)
+        )
+        # load graph with fallback for edges.shp
+        try:
+            edges_shp = self.loc.get_network_layout_edges_shapefile(net_type, net_name)
+            if not Path(edges_shp).exists():
+                raise FileNotFoundError
+        except Exception:
+            scenario_root = Path(self.loc.scenario)
+            edges_shp = scenario_root / "outputs" / "data" / "thermal-network" / net_type / "edges.shp"
+            log().warning("Using fallback edges shapefile path: %s", edges_shp)
+        g0 = nx.read_shp(str(edges_shp), simplify=True)
+        self.graph = nx.Graph()
+        for u, v, d in g0.edges(data=True):
+            self.graph.add_edge(u, v,
+                length_m=float(d.get('length_m', 0.0)),
+                diameter_mm=float(d.get('D_int_m', 0.15)) * 1000,
+                active=False)
+        for n, d in g0.nodes(data=True):
+            self.graph.add_node(n, **d)
+        log().info("Loaded graph: %d nodes, %d edges", self.graph.number_of_nodes(), self.graph.number_of_edges())
+        # pipe catalogue
+        grid_csv = Path(self.loc.get_database_thermal_grid())
+        self.pipe_cat = PipeCat.load(grid_csv)
+        # clusters
+        csvc = self.loc.get_building_cluster_assignment_file()
+        df = pd.read_csv(csvc)
+        self.clusters: Dict[int, Cluster] = {}
+        for cid, grp in df.groupby('cluster'):
+            self.clusters[cid] = Cluster(
+                cid,
+                grp['name'].tolist(),
+                grp['peak_kW'].sum(),
+                grp['annual_MWh'].sum(),
+                (grp['x'].mean(), grp['y'].mean())
+            )
+        log().info("Loaded %d clusters", len(self.clusters))
+        # plant node
+        plants = [n for n, d in self.graph.nodes(data=True) if d.get('type', '').upper() == 'PLANT']
+        if not plants:
+            raise RuntimeError("No PLANT node found in network shapefile")
+        self.plant = plants[0]
+        self.active_edges: Set[Tuple[str, str]] = set()
 
-    # ┌──────────────────────────────────────────────────┐
-    # │ 8) run thermal-network (Part 2)                │
-    # └──────────────────────────────────────────────────┘
-    print("Running thermal-network …")
-    tn = ThermalNetwork(locator, network_name="", config=config.thermal_network)
-    thermal_network_main(locator, tn)
+    def _nearest(self, xy: Tuple[float, float]) -> str:
+        return min(self.graph.nodes, key=lambda n: math.hypot(n[0] - xy[0], n[1] - xy[1]))
 
-    print("✅ Done. Results under",
-          locator.get_dtn_expansion_optimization_results_folder())
+    def _compute_incremental(self, cluster: Cluster, phase_idx: int):
+        start = self._nearest(cluster.centroid)
+        path = nx.shortest_path(self.graph, self.plant, start, weight='length_m')
+        edges = {tuple(sorted(e)) for e in zip(path[:-1], path[1:])}
+        new = {e for e in edges if e not in self.active_edges}
+        cap_p = sum(
+            self.pipe_cat.cost_per_m(self.graph.edges[e]['diameter_mm']) * self.graph.edges[e]['length_m']
+            for e in new
+        )
+        cap_h = 50 * cluster.peak_kW
+        cap_tot = cap_p + cap_h
+        cap_a = calc_capex_annualized(cap_tot, self.econ.IR, self.econ.LT)
+        o_f = cap_tot * self.econ.fixed_pct / 100
+        o_v = cluster.annual_MWh * 1000 * self.econ.fuel
+        o_tot = o_f + o_v
+        o_a = calc_opex_annualized(o_tot, self.econ.IR, self.econ.LT)
+        disc = (1 + self.econ.IR / 100) ** -(phase_idx - 1)
+        npv = -(cap_tot + o_a * self.econ.LT) * disc
+        return new, cap_tot, cap_a, o_a, npv, path
+
+    def greedy(self, max_phases: int):
+        connected = {0}
+        phase = 1
+        while len(connected) < len(self.clusters) and phase <= max_phases:
+            candidates = [cid for cid in self.clusters if cid not in connected]
+            best_c, best_roi = None, -1e9
+            for cid in candidates:
+                new, cap, cap_a, op_a, npv, _ = self._compute_incremental(self.clusters[cid], phase)
+                roi = op_a / cap_a if cap_a else 0
+                if roi > best_roi:
+                    best_roi, best_c = roi, cid
+            self._activate(best_c, phase)
+            connected.add(best_c)
+            phase += 1
+
+    def _activate(self, cid: int, phase: int):
+        cl = self.clusters[cid]
+        new, cap, cap_a, op_a, npv, path = self._compute_incremental(cl, phase)
+        self.active_edges.update(new)
+        cl.phase, cl.capex_USD, cl.opex_a_USD, cl.npv_USD, cl.path_nodes = (
+            phase, cap, op_a, npv, path
+        )
+        for e in new:
+            self.graph.edges[e]['active'] = True
+        log().info("Phase %d: cluster %d | cap %0.f USD | ROI %0.1f%%",
+                   phase, cid, cap, 100 * op_a / cap_a)
+
+    def genetic(self):
+        raise NotImplementedError("GA not implemented in rev‑4")
+
+    def write(self):
+        out = Path(self.loc.get_dtn_expansion_optimization_results_folder())
+        out.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame([
+            {
+                'cluster': c.cid,
+                'phase': c.phase,
+                'Capex_USD': c.capex_USD,
+                'Opex_a_USD': c.opex_a_USD,
+                'NPV_USD': c.npv_USD
+            }
+            for c in self.clusters.values()
+        ])
+        df.to_csv(out / "cluster_phasing.csv", index=False)
+        log().info("Wrote %s", out / "cluster_phasing.csv")
+
+# ----------------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--scenario", required=True,
-                   help="CEA scenario folder")
-    p.add_argument("--test",   action="store_true",
-                   help="Run only TEST_BUILDINGS list")
+    p = argparse.ArgumentParser(description="DTN expansion phasing optimiser")
+    p.add_argument("scenario", help="CEA scenario root folder")
+    p.add_argument("--network-type", default="DH", choices=["DH", "DC"])
+    p.add_argument("--network-name", default="DH")
+    p.add_argument("--algorithm", default="greedy", choices=["greedy", "ga"],
+                   help="optimisation method")
+    p.add_argument("--max-phases", type=int, default=3, help="maximum phases")
     return p.parse_args()
 
-if __name__ == "__main__":
-    args   = parse_args()
-    cfg    = Configuration()
-    cfg.scenario = args.scenario
-    # ensure thermal_network exists
-    if not hasattr(cfg, "thermal_network"):
-        cfg.thermal_network = types.SimpleNamespace(network_type="DH")
-    run_dtn_expansion(cfg, TEST_BUILDINGS if args.test else None)
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+def main():
+    args = parse_args()
+    t0 = time.time()
+    opt = DTNOptimizer(args.scenario, args.network_type, args.network_name)
+    if args.algorithm == 'greedy':
+        opt.greedy(args.max_phases)
+    else:
+        opt.genetic()
+    opt.write()
+    log().info("Done in %.1fs", time.time() - t0)
+
+if __name__ == '__main__':
+    main()

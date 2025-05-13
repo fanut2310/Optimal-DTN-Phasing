@@ -323,6 +323,10 @@ class InputLocator(object):
         """Returns the folder containing the scenario's district thermal network optimization results"""
         return self._ensure_folder(self.scenario, 'outputs', 'data', 'optimization', 'dtn_expansion')
 
+    def get_dtn_cluster_assignment_file(self):
+        """Returns the csv file of the cluster assignment for DTN expansion"""
+        return os.path.join(self.get_dtn_expansion_optimization_results_folder(), 'dtn_cluster_assignment.csv')
+
     def get_optimization_results_folder(self):
         """Returns the folder containing the scenario's optimization results"""
         return self._ensure_folder(self.scenario, 'outputs', 'data', 'optimization')

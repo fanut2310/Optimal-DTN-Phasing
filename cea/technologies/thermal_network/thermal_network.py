@@ -22,6 +22,7 @@ import cea.inputlocator
 import cea.technologies.thermal_network.substation_matrix as substation_matrix
 from cea.optimization.preprocessing.preprocessing_main import get_building_names_with_load
 from cea.technologies.thermal_network.thermal_network_loss import calc_temperature_out_per_pipe
+from .thermal_network_costs import main as calculate_thermal_network_costs
 import cea.utilities.parallel
 import cea.utilities.workerstream
 from cea.constants import HEAT_CAPACITY_OF_WATER_JPERKGK, P_WATER_KGPERM3, HOURS_IN_YEAR
@@ -557,6 +558,10 @@ def thermal_network_main(locator, thermal_network, processes=1):
             print('The following edges with corresponding minimum mass flows showed high thermal losses: \n \n')
             for key in thermal_network.problematic_edges:
                 print(key, thermal_network.problematic_edges[key])
+
+    # ─── optional CAPEX / OPEX evaluation ──────────────────────────────
+    if getattr(config.thermal_network, "calculate_costs", True):
+        calculate_thermal_network_costs(config, locator, thermal_network)
 
 
 def calculate_pressure_loss_critical_path(dP_timestep, thermal_network):
@@ -3464,8 +3469,15 @@ def main(config):
     """
     start = time.time()
     locator = cea.inputlocator.InputLocator(scenario=config.scenario)
+    network_type = config.thermal_network.network_type  # DH / DC
 
     network_model = config.thermal_network.network_model
+
+    network_info = ThermalNetwork(
+        locator,
+        "",
+        config.thermal_network
+    )
 
     # FIXME: Hardcoded to consider one network for now. Best scenario is to allow multiple network layouts and run Part 2 for each layout.
     network_names = ['']
@@ -3486,6 +3498,19 @@ def main(config):
         print('The process of thermal network design is completed - time elapsed: %.2f seconds.' % time_elapsed)
 
     #insert a cost function to call thermal_network_costs.py?
+    '''
+    try:
+        # Some users might want to skip cost calculation – make it optional
+        if getattr(config.thermal_network, "calculate_costs", True):
+            thermal_network_costs.main(config, locator, network_type)
+            print("[Thermal-Network] Cost evaluation finished.")
+    except Exception as err:
+        # Do not abort the entire simulation if the cost routine fails
+        print(f"[Thermal-Network] Cost evaluation failed: {err}")
+    '''
+    print("Starting thermal network cost calculations...")
+    calculate_thermal_network_costs(config)
+    print("Thermal network cost calculations complete.")
 
 
 if __name__ == '__main__':

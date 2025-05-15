@@ -48,6 +48,14 @@ class NetworkOptimizationFeatures(object):
     def mass_flow_rate_plant(self, locator, network_name, network_type):
         mass_flow_df = pd.read_csv((locator.get_thermal_network_layout_massflow_nodes_file(network_type, network_name)))
         mass_flow_nodes_df = pd.read_csv((locator.get_thermal_network_node_types_csv_file(network_type, network_name)))
+
+        # --- Begin modification for debugging ---
+        node_types_csv_path = locator.get_thermal_network_node_types_csv_file(network_type, network_name)
+        print(f"DEBUG: Reading node types from CSV: {node_types_csv_path}")
+        mass_flow_nodes_df = pd.read_csv(node_types_csv_path)
+        print(f"DEBUG: Columns in node types CSV: {mass_flow_nodes_df.columns.tolist()}")
+        # --- End modification for debugging ---
+
         # identify the node with the plant
         node_id = mass_flow_nodes_df.loc[mass_flow_nodes_df['Type'] == "PLANT", 'Name'].item()
         return mass_flow_df[node_id].values

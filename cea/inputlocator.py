@@ -1055,7 +1055,7 @@ class InputLocator(object):
         if os.path.exists(nodes_csv):
             import pandas as pd
             nodes_df = pd.read_csv(nodes_csv)
-            is_plant = nodes_df['Type'] == 'PLANT'
+            is_plant = nodes_df['type'] == 'PLANT'
             return nodes_df[is_plant]['name'].to_list()
         return []
 

@@ -751,17 +751,14 @@ def save_results(cluster_data, locator):
     tuple
         Paths to the saved CSV and shapefile
     """
-    # Get scenario path from locator
-    scenario_path = locator.scenario
-
-    # Define the output directory
-    output_dir = os.path.join(scenario_path, 'outputs', 'data', 'optimization', 'dtn_expansion')
-
+    # Get output directory using locator
+    output_dir = locator.get_dtn_expansion_optimization_results_folder()
+    
     # Create directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
-
-    # Define output paths
-    csv_path = os.path.join(output_dir, 'building_clusters.csv')
+    
+    # Define output paths using locator
+    csv_path = locator.get_dtn_cluster_assignment_file()
     shp_path = os.path.join(output_dir, 'building_clusters.shp')
 
     # Define core columns to keep with new order and renamed columns
@@ -1139,7 +1136,7 @@ if __name__ == "__main__":
 
     # Try to use environment variable, fall back to hardcoded path
     scenario_path = os.environ.get('CEA_SCENARIO_PATH',
-                                   r"C:\Users\changf\OneDrive - ETH Zurich\CEA_projects\base_design\01_base_design_2025")
+                                   r"C:\Users\User\OneDrive - ETH Zurich\CEA_projects\base_design\01_base_design_2025")
     config.scenario = scenario_path
 
     # Check if the 'building-clustering' section exists in the configuration

@@ -33,19 +33,18 @@ solid.
 Output files written to
 `{scenario}/outputs/data/optimization/dtn_expansion/`  ▸
 
-* `cluster_nodes.csv` → one row per node, with its cluster id and role
+* `cluster_nodes.csv`  → one row per node, with its cluster id and role
   (CONSUMER / PLANT / OTHER)
-* `cluster_edges.csv` → one row per edge, with:
+* `cluster_edges.csv`  → one row per edge, with:
     * `edge_id` (taken from `edges.shp` *Name* attribute if present, or a
       synthetic id)
-    * `cluster_src` / `cluster_dst` – cluster of each incident node
-    * `intra_cluster` (1 if src==dst)
-      └─ those edges are considered “owned” by that cluster
-    * length [m], diameter [mm], material, etc. (copied verbatim from shp)
+    * `cluster_src` / `cluster_dst` – cluster of each incident node
+    * `intra_cluster` (1 if src==dst)
+      └─ those edges are considered “owned” by that cluster
+    * length [m], diameter [mm], material, etc. (copied verbatim from shp)
 
 These two CSVs form the basis for any later CAPEX or phasing logic.
 """
-
 from __future__ import annotations
 
 ###############################################################################
@@ -93,92 +92,121 @@ def _read_shp_force_2d(path: Path) -> gpd.GeoDataFrame:
 class ClusterMapper:
     """Map nodes / edges ➜ cluster ids using Edge‑Node incidence matrix."""
 
-    def __init__(self, locator: cea.inputlocator.InputLocator, net_type:str):
+    def __init__(self, locator: cea.inputlocator.InputLocator, net_type: str):
         self.loc = locator
         self.net_type = net_type
         self._load_inputs()
         self._build_lookup()
 
-    # ------------------------------------------------------------------
     def _load_inputs(self):
-        # clusters from building_clustering
+        # 1) building cluster assignments
         path_cl = Path(self.loc.get_dtn_cluster_assignment_file())
         self.df_clusters = pd.read_csv(path_cl)
-        log().info("Building clusters loaded: %d buildings", len(self.df_clusters))
-
-        # nodes & edges shapefiles (Part‑1 output)
+        log().info("Building clusters loaded: %d rows", len(self.df_clusters))
+        # 2) Part‑1 network layout shapefiles
         nodes_shp = Path(self.loc.get_network_layout_nodes_shapefile(self.net_type))
         edges_shp = nodes_shp.with_name("edges.shp")
         self.gdf_nodes = _read_shp_force_2d(nodes_shp)
         self.gdf_edges = _read_shp_force_2d(edges_shp)
-        log().info("Network layout: %d nodes, %d edges", len(self.gdf_nodes), len(self.gdf_edges))
+        log().info("Network layout loaded: %d nodes, %d edges", len(self.gdf_nodes), len(self.gdf_edges))
+        # 3) edge–node incidence CSV
+        inc_path = Path(self.loc.scenario) / "outputs" / "data" / "thermal-network" / f"{self.net_type}__EdgeNode.csv"
+        self.df_inc = pd.read_csv(inc_path, index_col=0)
+        log().info("Edge–Node incidence matrix: %d nodes × %d edges", *self.df_inc.shape)
 
-        # Edge‑Node incidence exported by Part‑2 (CSV)
-        inc_csv = Path(self.loc.scenario)/"outputs"/"data"/"thermal-network"/f"{self.net_type}__EdgeNode.csv"
-        self.df_inc = pd.read_csv(inc_csv, index_col=0)
-        log().info("Edge–Node incidence matrix: %s × %s", *self.df_inc.shape)
-
-    # ------------------------------------------------------------------
     def _build_lookup(self):
-        # map building name ➜ cluster id
-        building2cid: Dict[str,int] = dict(self.df_clusters[["name","cluster"]].values)
-
-        # node ➜ cluster
-        cid_col = []
-        for _,row in self.gdf_nodes.iterrows():
-            if row.get("type","").upper()=="CONSUMER":
-                bld = row.get("building") or row.get("name")
-                cid = building2cid.get(str(bld), -99)
-            elif row.get("type","").upper()=="PLANT":
-                cid = 0   # existing DTN
+        # map building name -> cluster id
+        b2c = dict(self.df_clusters[["name","cluster"]].values)
+        # assign cluster to nodes
+        clusters = []
+        for _, row in self.gdf_nodes.iterrows():
+            typ = row.get("type","").upper()
+            if typ == "CONSUMER":
+                bld = row.get("building")
+                clusters.append(b2c.get(str(bld), -1))
+            elif typ == "PLANT":
+                clusters.append(0)
             else:
-                cid = -1  # undefined / street intersection etc.
-            cid_col.append(cid)
-        self.gdf_nodes["cluster"] = cid_col
-
-        # edge ➜ clusters of its two incident nodes
-        # Use incidence matrix to get node list per edge quickly
-        edge_ids = self.df_inc.columns.tolist()
-        node_index = list(self.df_inc.index)
-        src_cid = []; dst_cid = []
-        for eid in edge_ids:
+                clusters.append(-1)
+        self.gdf_nodes["cluster"] = clusters
+        # assign cluster_src/dst to edges via incidence
+        src_list, dst_list = [], []
+        for eid in self.df_inc.columns:
             vec = self.df_inc[eid]
-            nodes = [node for node,val in vec.items() if val!=0]
-            if len(nodes)!=2:
-                src_cid.append(-1); dst_cid.append(-1); continue
+            nodes = [n for n,v in vec.items() if v != 0]
+            if len(nodes) != 2:
+                src_list.append(-1); dst_list.append(-1)
+                continue
             n1,n2 = nodes
-            cid1 = int(self.gdf_nodes.loc[self.gdf_nodes["name"]==n1,"cluster"].values[0])
-            cid2 = int(self.gdf_nodes.loc[self.gdf_nodes["name"]==n2,"cluster"].values[0])
-            src_cid.append(cid1); dst_cid.append(cid2)
-        self.gdf_edges["cluster_src"] = src_cid
-        self.gdf_edges["cluster_dst"] = dst_cid
-        self.gdf_edges["intra_cluster"] = (self.gdf_edges.cluster_src == self.gdf_edges.cluster_dst).astype(int)
+            c1 = int(self.gdf_nodes.loc[self.gdf_nodes["name"]==n1, "cluster"].iloc[0])
+            c2 = int(self.gdf_nodes.loc[self.gdf_nodes["name"]==n2, "cluster"].iloc[0])
+            src_list.append(c1); dst_list.append(c2)
+        self.gdf_edges["cluster_src"] = src_list
+        self.gdf_edges["cluster_dst"] = dst_list
 
-    # ------------------------------------------------------------------
     def write_outputs(self):
         out_folder = Path(self.loc.get_dtn_expansion_optimization_results_folder())
         out_folder.mkdir(parents=True, exist_ok=True)
-        # nodes
-        nodes_out = self.gdf_nodes[["name","type","building","cluster"]]
-        nodes_out.to_csv(out_folder/"cluster_nodes.csv", index=False)
-        # edges
-        cols_basic = [c for c in ("Name","length_m","D_int_m","material","cluster_src","cluster_dst","intra_cluster") if c in self.gdf_edges.columns]
-        self.gdf_edges[cols_basic].to_csv(out_folder/"cluster_edges.csv", index=False)
-        log().info("CSV written › %s", out_folder)
 
-###############################################################################
-# 5) CLI ENTRY                                                               #
-###############################################################################
+        # --- update node shapefile with cluster and save
+        nodes_out_shp = out_folder / "nodes_clustered.shp"
+        self.gdf_nodes.to_file(nodes_out_shp)
+        log().info("Wrote clustered nodes shapefile → %s", nodes_out_shp)
+
+        # --- write cluster_nodes.csv
+        nodes_csv = out_folder / "cluster_nodes.csv"
+        self.gdf_nodes[["name", "type", "building", "cluster"]].to_csv(nodes_csv, index=False)
+        log().info("Wrote cluster_nodes.csv → %s", nodes_csv)
+
+        # --- update edge shapefile with new cluster fields and save
+        edges_out_shp = out_folder / "edges_clustered.shp"
+        self.gdf_edges.to_file(edges_out_shp)
+        log().info("Wrote clustered edges shapefile → %s", edges_out_shp)
+
+        # --- prepare cluster_edges.csv
+        df = self.gdf_edges.copy()
+        df = df.rename(columns={
+            "cluster_src": "from_cluster",
+            "cluster_dst": "to_cluster"
+        })
+        df["inter_cluster"] = df.apply(
+            lambda r: 1 if (r["from_cluster"] != r["to_cluster"] and r["from_cluster"] != -1 and r["to_cluster"] != -1) else 0,
+            axis=1
+        )
+        def pick_cluster(r):
+            if r["inter_cluster"] == 1:
+                return -1
+            if r["from_cluster"] == -1:
+                return r["to_cluster"]
+            return r["from_cluster"]
+        df["cluster"] = df.apply(pick_cluster, axis=1)
+        if "Name" in df.columns:
+            df["edge_id"] = df["Name"]
+        else:
+            df = df.reset_index().rename(columns={"index": "edge_id"})
+        cols = ["edge_id", "from_cluster", "to_cluster", "inter_cluster", "cluster"]
+        for attr in ["D_int_m", "material"]:
+            if attr in df.columns:
+                cols.append(attr)
+        edges_csv = out_folder / "cluster_edges.csv"
+        df[cols].to_csv(edges_csv, index=False)
+        log().info("Wrote cluster_edges.csv → %s", edges_csv)
+
+# ----------------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Assign network nodes/edges to building clusters")
+    p.add_argument("scenario", help="CEA scenario root folder")
+    p.add_argument("--network-type", choices=["DH","DC"], default="DH")
+    return p.parse_args()
+
 
 def main():
-    ap = argparse.ArgumentParser(description="Assign network nodes / edges to building clusters")
-    ap.add_argument("scenario", help="CEA scenario root folder")
-    ap.add_argument("--network-type", choices=["DH","DC"], default="DH")
-    args = ap.parse_args()
-
+    args = parse_args()
     cfg = cea.config.Configuration(); cfg.scenario = args.scenario
     locator = cea.inputlocator.InputLocator(cfg.scenario)
-
     mapper = ClusterMapper(locator, args.network_type)
     mapper.write_outputs()
 

@@ -3485,6 +3485,8 @@ def main(config):
         time_elapsed = time.time() - start
         print('The process of thermal network design is completed - time elapsed: %.2f seconds.' % time_elapsed)
 
+    #insert a cost function to call thermal_network_costs.py?
+
 
 if __name__ == '__main__':
     main(cea.config.Configuration())

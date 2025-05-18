@@ -480,12 +480,6 @@ class InputLocator(object):
         """
         return self._ensure_folder(self.get_optimization_network_results_folder(), "layout")
 
-    def get_optimization_network_layout_costs_file(self, network_type):
-        """scenario/outputs/data/optimization/network/layout/DC_costs.csv
-        Optimized network layout files for pipes of district heating networks
-        """
-        return os.path.join(self.get_optimization_network_layout_folder(),
-                            str(network_type) + "_costs.csv")
 
     def get_optimization_network_individual_results_file(self, network_type, individual):
         """scenario/outputs/data/optimization/network/layout/DH_T_Return.csv or DC_T_Return.csv
@@ -902,6 +896,14 @@ class InputLocator(object):
         check_cpg(shapefile_path)
         return shapefile_path
 
+    def get_networks_folder(self):
+        return self._ensure_folder(self.scenario, 'inputs', 'networks')
+
+    def get_street_network(self):
+        shapefile_path = os.path.join(self.get_networks_folder(), "streets.shp")
+        check_cpg(shapefile_path)
+        return shapefile_path
+
     def get_zone_building_names(self):
         """Return the list of buildings in the Zone"""
         if not os.path.exists(self.get_zone_geometry()):
@@ -925,6 +927,10 @@ class InputLocator(object):
     def get_building_air_conditioning(self):
         """scenario/inputs/building-properties/hvac.csv"""
         return os.path.join(self.get_building_properties_folder(), 'hvac.csv')
+
+    def get_database_supply_systems(self):
+        """scenario/inputs/building-properties/supply_systems.csv"""
+        return os.path.join(self.get_building_properties_folder(), 'supply_systems.csv')
 
     def get_building_architecture(self):
         """scenario/inputs/building-properties/envelope.csv
@@ -1005,6 +1011,16 @@ class InputLocator(object):
     # THERMAL NETWORK OUTPUTS
     def get_thermal_network_folder(self):
         return self._ensure_folder(self.scenario, 'outputs', 'data', 'thermal-network')
+
+    def get_network_layout_costs_file(self, network_type, network_name=""):
+        """scenario/outputs/data/thermal-network/DH_costs.csv or DC_costs.csv
+        Network costs files for district heating or cooling networks
+        """
+        if not network_name:
+            file_name = network_type + "_costs.csv"
+        else:
+            file_name = network_type + "_" + network_name + "_costs.csv"
+        return os.path.join(self.get_thermal_network_folder(), file_name)
 
     def get_nominal_edge_mass_flow_csv_file(self, network_type, network_name=""):
         """scenario/outputs/data/optimization/network/layout/DH_NodesData.csv or DC_NodesData.csv
@@ -1308,13 +1324,6 @@ class InputLocator(object):
             file_name = network_type + "_" + network_name + "_plant_thermal_load_kW.csv"
         return os.path.join(folder, file_name)
 
-    def get_networks_folder(self):
-        return self._ensure_folder(self.scenario, 'inputs', 'networks')
-
-    def get_street_network(self):
-        shapefile_path = os.path.join(self.get_networks_folder(), "streets.shp")
-        check_cpg(shapefile_path)
-        return shapefile_path
 
     # OUTPUTS
 
@@ -1334,7 +1343,7 @@ class InputLocator(object):
     def get_radiation_metadata(self, building):
         """scenario/outputs/data/solar-radiation/{building}_geometrgy.csv"""
         return os.path.join(self.get_solar_radiation_folder(), '%s_geometry.csv' % building)
- 
+
     def get_radiation_metadata_usr(self, building):
         base_folder = os.path.join(self.get_solar_radiation_folder(), "input_files_USR", "BuildingSensorGeometry")
         os.makedirs(base_folder, exist_ok=True)

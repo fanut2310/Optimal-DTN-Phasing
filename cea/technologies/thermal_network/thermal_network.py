@@ -558,13 +558,6 @@ def thermal_network_main(locator, thermal_network, processes=1, config=None):
             for key in thermal_network.problematic_edges:
                 print(key, thermal_network.problematic_edges[key])
 
-    # Calculate thermal network costs
-    try:
-        import cea.technologies.thermal_network.thermal_network_costs_new as thermal_network_costs_new
-        print('Starting thermal network cost calculations...')
-        thermal_network_costs_new.calculate_thermal_network_costs(thermal_network, config)
-    except Exception as e:
-        print(f'[Thermal-Network] Cost evaluation failed: {str(e)}')
 
 
 def calculate_pressure_loss_critical_path(dP_timestep, thermal_network):

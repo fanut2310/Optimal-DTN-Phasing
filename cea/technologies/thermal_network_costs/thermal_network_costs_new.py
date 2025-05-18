@@ -1,25 +1,25 @@
 """
-Thermal network costs calculation for the "Thermal Network Part 2: simulation" module.
+Thermal network costs calculation for the "Thermal Network Part 3: costs" module.
 This module calculates the costs of a thermal network based on the results of the thermal_network.py simulation.
-It is adapted from the original thermal_network_costs.py module to work with the data structures and objects
-used in thermal_network.py.
+It is adapted from the thermal_network_costs_ver2.py module to work as a standalone script.
 """
 
 import numpy as np
 import pandas as pd
 import cea.config
 import cea.inputlocator
+import time
 
 from cea.optimization.prices import Prices as Prices
 from cea.analysis.costs.equations import calc_capex_annualized
-from cea.constants import HOURS_IN_YEAR
-from cea.technologies.heat_exchangers import calc_Cinv_HEX_hisaka
+from cea.constants import HEAT_CAPACITY_OF_WATER_JPERKGK
+from cea.technologies.constants import MAX_NODE_FLOW
 import cea.technologies.pumps as pumps
 import cea.technologies.chiller_vapor_compression as VCCModel
 import cea.technologies.cooling_tower as CTModel
 from cea.utilities import epwreader
 
-__author__ = "Adapted from thermal_network_costs.py by Lennart Rogenhofer, Shanshan Hsieh"
+__author__ = "Adapted from thermal_network_costs_ver2.py"
 __copyright__ = "Copyright 2015, Architecture and Building Systems - ETH Zurich"
 __credits__ = ["Lennart Rogenhofer"]
 __license__ = "MIT"
@@ -117,7 +117,8 @@ def calc_Ctot_network_pump(network_cost_features, locator):
     deltaP_kW = deltaP_df['pressure_loss_total_kW'].sum()
 
     # Get electricity price
-    supply_systems = pd.read_csv(locator.get_database_supply_systems())
+    from cea.technologies.supply_systems_database import SupplySystemsDatabase
+    supply_systems = SupplySystemsDatabase(locator)
     prices = Prices(supply_systems)
     prices.ELEC_PRICE = np.mean(prices.ELEC_PRICE, dtype=np.float64)  # [USD/W]
 
@@ -134,21 +135,19 @@ def calc_Ctot_network_pump(network_cost_features, locator):
     return Capex_a_pump_USD, Opex_fixed_pump_USD, Opex_var
 
 
-def calc_Ctot_cooling_plants(thermal_network, locator):
+def calc_Ctot_cooling_plants(thermal_network_type, thermal_network_name, locator):
     """
     Calculate the costs of centralized cooling plants (chillers and cooling towers).
 
-    :param thermal_network: ThermalNetwork instance
+    :param thermal_network_type: type of thermal network ('DH' or 'DC')
+    :param thermal_network_name: name of the thermal network
     :param locator: InputLocator instance
     :return: fixed operational expenditure, variable operational expenditure, annualized capital expenditure for chiller,
              and annualized capital expenditure for cooling tower
     """
-    network_type = thermal_network.network_type
-    network_name = thermal_network.network_name
-
     # Read in plant heat requirement
     plant_heat_hourly_kWh = pd.read_csv(
-        locator.get_thermal_network_plant_heat_requirement_file(network_type, network_name))
+        locator.get_thermal_network_plant_heat_requirement_file(thermal_network_type, thermal_network_name))
 
     # Read in number of plants
     number_of_plants = len(plant_heat_hourly_kWh.columns)
@@ -157,13 +156,15 @@ def calc_Ctot_cooling_plants(thermal_network, locator):
     plant_heat_peak_kW_list = plant_heat_hourly_kWh.abs().max(axis=0).values  # calculate peak demand
     plant_heat_sum_kWh_list = plant_heat_hourly_kWh.abs().sum().values  # calculate aggregated demand
 
+    # Copied form thermal_network_costs.py, to be updated or justified
     Opex_var_plant = 0.0
     Opex_fixed_plant = 0.0
     Capex_a_chiller = 0.0
     Capex_a_CT = 0.0
 
     # Get electricity price
-    supply_systems = pd.read_csv(locator.get_database_supply_systems())
+    from cea.technologies.supply_systems_database import SupplySystemsDatabase
+    supply_systems = SupplySystemsDatabase(locator)
     prices = Prices(supply_systems)
     prices.ELEC_PRICE = np.mean(prices.ELEC_PRICE, dtype=np.float64)  # [USD/W]
 
@@ -208,89 +209,107 @@ def calc_Ctot_cooling_plants(thermal_network, locator):
     return Opex_fixed_plant, Opex_var_plant, Capex_a_chiller, Capex_a_CT
 
 
-def calc_Cinv_HEX(thermal_network, locator):
+def calc_Cinv_HEX_modified(thermal_network_type, thermal_network_name, locator):
     """
     Calculate the investment cost of the substation heat exchanger.
+    This is a modified version that doesn't rely on the disconnected_buildings_index attribute.
 
-    :param thermal_network: ThermalNetwork instance
+    :param thermal_network_type: type of thermal network ('DH' or 'DC')
+    :param thermal_network_name: name of the thermal network
     :param locator: InputLocator instance
     :return: annualized capital expenditure and fixed operational expenditure
     """
-    # This is a simplified version that assumes all buildings are connected
-    # and uses the maximum heat demand for HEX sizing
+    # Read in HEX cost values from database
+    HEX_prices = pd.read_csv(locator.get_db4_components_conversion_conversion_technology_csv('HEAT_EXCHANGERS'), index_col=0)
+    a = HEX_prices['a']['District substation heat exchanger']
+    b = HEX_prices['b']['District substation heat exchanger']
+    c = HEX_prices['c']['District substation heat exchanger']
+    d = HEX_prices['d']['District substation heat exchanger']
+    e = HEX_prices['e']['District substation heat exchanger']
+    Inv_IR = HEX_prices['IR_%']['District substation heat exchanger']
+    Inv_LT = HEX_prices['LT_yr']['District substation heat exchanger']
+    Inv_OM = HEX_prices['O&M_%']['District substation heat exchanger'] / 100
 
-    # Get the maximum heat demand for each building
-    if thermal_network.substations_HEX_specs is not None:
-        Capex_a_hex, Opex_fixed_hex = calc_Cinv_HEX_hisaka(thermal_network)
-    else:
-        # If HEX specs are not available, use a simplified approach
-        Capex_a_hex = 0.0
-        Opex_fixed_hex = 0.0
+    # Read in nodes list
+    all_nodes = pd.read_csv(locator.get_thermal_network_node_types_csv_file(thermal_network_type, thermal_network_name))
+    Capex_a = 0.0
+    Opex_a_fixed = 0.0
 
-        # Read in node types
-        node_types_df = pd.read_csv(
-            locator.get_thermal_network_node_types_csv_file(thermal_network.network_type, thermal_network.network_name))
+    # Get all consumer and plant nodes
+    consumer_nodes = all_nodes[all_nodes['type'] == 'CONSUMER']
+    plant_nodes = all_nodes[all_nodes['type'] == 'PLANT']
 
-        # Get buildings connected to the network
-        buildings = node_types_df.loc[node_types_df['type'] == 'CONSUMER', 'building'].unique()
+    # Combine all nodes that need HEX
+    substation_nodes = pd.concat([consumer_nodes, plant_nodes])
 
-        for building in buildings:
-            if building is not None and building != 'NONE':
-                # Read in building demand
-                building_demand = pd.read_csv(locator.get_demand_results_file(building))
+    # Calculate costs of hex at substations
+    for _, node in substation_nodes.iterrows():
+        node_id = node['name']
 
-                # Get maximum heat demand
-                if thermal_network.network_type == 'DH':
-                    max_demand_kW = building_demand['Qhs_sys_kWh'].abs().max()
-                else:  # DC
-                    max_demand_kW = building_demand['Qcs_sys_kWh'].abs().max()
+        # Read in node mass flows
+        node_flows = pd.read_csv(
+            locator.get_nominal_node_mass_flow_csv_file(thermal_network_type, thermal_network_name))
 
-                # Calculate HEX cost
-                hex_cost = 500 * max_demand_kW  # Simplified cost function
+        # Find design condition node mcp
+        if node_id in node_flows.columns:
+            node_flow = max(node_flows[node_id])
 
-                # Assume lifetime of 20 years and 5 % IR
-                Inv_IR = 5
-                Inv_LT = 20
-                Capex_a_hex += calc_capex_annualized(hex_cost, Inv_IR, Inv_LT)
-                Opex_fixed_hex += 0.05 * hex_cost  # Assume 5% of investment cost as annual O&M
+            if node_flow > 0:
+                # Split into several HEXs if flows are too high
+                if node_flow <= MAX_NODE_FLOW:
+                    mcp_sub = node_flow * HEAT_CAPACITY_OF_WATER_JPERKGK
+                    Capex_substation_hex = a + b * mcp_sub ** c + d * np.log(mcp_sub) + e * mcp_sub * np.log(mcp_sub)
+                else:
+                    # We need to split into several HEXs
+                    Capex_substation_hex = 0
+                    number_of_HEXs = int(np.ceil(node_flow / MAX_NODE_FLOW))
+                    nodeflow_nom = node_flow / number_of_HEXs
+                    mcp_sub = nodeflow_nom * HEAT_CAPACITY_OF_WATER_JPERKGK
+                    for i in range(number_of_HEXs):
+                        Capex_substation_hex = Capex_substation_hex + (a + b * mcp_sub ** c + d * np.log(mcp_sub) + e * mcp_sub * np.log(mcp_sub))
 
-    return Capex_a_hex, Opex_fixed_hex
+                Capex_a_substation_hex = calc_capex_annualized(Capex_substation_hex, Inv_IR, Inv_LT)
+                Opex_fixed_substation_hex = Capex_substation_hex * Inv_OM
+
+                # Aggregate all substation costs in a network
+                Capex_a = Capex_a + Capex_a_substation_hex
+                Opex_a_fixed = Opex_a_fixed + Opex_fixed_substation_hex
+
+    return Capex_a, Opex_a_fixed
 
 
-def calc_network_size(thermal_network, locator):
+def calc_network_size(thermal_network_type, thermal_network_name, locator):
     """
     Calculate the total network length and average pipe diameter.
 
-    :param thermal_network: ThermalNetwork instance
+    :param thermal_network_type: type of thermal network ('DH' or 'DC')
+    :param thermal_network_name: name of the thermal network
     :param locator: InputLocator instance
     :return: total network length and average pipe diameter
     """
-    network_type = thermal_network.network_type
-    network_name = thermal_network.network_name
-
     network_info = pd.read_csv(
-        locator.get_thermal_network_edge_list_file(network_type, network_name))
+        locator.get_thermal_network_edge_list_file(thermal_network_type, thermal_network_name))
     length_m = network_info['length_m'].sum()
     average_diameter_m = network_info['D_int_m'].mean()
 
     return float(length_m), float(average_diameter_m)
 
 
-def calculate_thermal_network_costs(thermal_network, config):
+def main(config):
     """
     Calculate the costs of a thermal network.
 
-    :param thermal_network: ThermalNetwork instance
     :param config: Configuration instance
     :return: None
     """
     try:
         print('Starting thermal network cost calculations...')
+        start = time.time()
 
         # Initialize key variables
-        locator = thermal_network.locator
-        network_type = thermal_network.network_type
-        network_name = thermal_network.network_name
+        locator = cea.inputlocator.InputLocator(config.scenario)
+        network_type = config.thermal_network_costs.network_type
+        network_name = config.thermal_network_costs.network_names[0] if config.thermal_network_costs.network_names else ""  # Assuming only one network for now
 
         # Create NetworkCostFeatures instance
         network_cost_features = NetworkCostFeatures(network_type, network_name, locator)
@@ -303,13 +322,14 @@ def calculate_thermal_network_costs(thermal_network, config):
         Capex_a_pump, Opex_fixed_pump, Opex_var_pump = calc_Ctot_network_pump(network_cost_features, locator)
 
         # Centralized plant
-        Opex_fixed_plant, Opex_var_plant, Capex_a_chiller, Capex_a_CT = calc_Ctot_cooling_plants(thermal_network, locator)
+        Opex_fixed_plant, Opex_var_plant, Capex_a_chiller, Capex_a_CT = calc_Ctot_cooling_plants(network_type, network_name, locator)
 
         # Heat exchangers
-        Capex_a_hex, Opex_fixed_hex = calc_Cinv_HEX(thermal_network, locator)
+        Capex_a_hex, Opex_fixed_hex = calc_Cinv_HEX_modified(network_type, network_name, locator)
 
         # Calculate electricity consumption
-        supply_systems = pd.read_csv(locator.get_database_supply_systems())
+        from cea.technologies.supply_systems_database import SupplySystemsDatabase
+        supply_systems = SupplySystemsDatabase(locator)
         prices = Prices(supply_systems)
         prices.ELEC_PRICE = np.mean(prices.ELEC_PRICE, dtype=np.float64)  # [USD/W]
         el_price_per_Wh = prices.ELEC_PRICE
@@ -321,7 +341,7 @@ def calculate_thermal_network_costs(thermal_network, config):
         Costs_total = Capex_a_total + Opex_total
 
         # Calculate network size
-        length_m, average_diameter_m = calc_network_size(thermal_network, locator)
+        length_m, average_diameter_m = calc_network_size(network_type, network_name, locator)
 
         # Calculate annual demands
         total_demand = pd.read_csv(locator.get_total_demand())
@@ -337,32 +357,37 @@ def calculate_thermal_network_costs(thermal_network, config):
 
         # Write outputs
         cost_output = {}
-        cost_output['total_annual_cost'] = round(Costs_total, 2)
-        cost_output['annual_opex'] = round(Opex_total, 2)
-        cost_output['annual_capex'] = round(Capex_a_total, 2)
-        cost_output['total_cost_per_MWh'] = round(Costs_total / annual_demand_district_MWh, 2)
-        cost_output['opex_per_MWh'] = round(Opex_total / annual_demand_district_MWh, 2)
-        cost_output['capex_per_MWh'] = round(Capex_a_total / annual_demand_district_MWh, 2)
+        cost_output['total_annual_cost_USD'] = round(Costs_total, 2)
+        cost_output['annual_opex_USD'] = round(Opex_total, 2)
+        cost_output['annual_capex_USD'] = round(Capex_a_total, 2)
+        cost_output['total_cost_per_MWh_USD'] = round(Costs_total / annual_demand_district_MWh, 2)
+        cost_output['opex_per_MWh_USD'] = round(Opex_total / annual_demand_district_MWh, 2)
+        cost_output['capex_per_MWh_USD'] = round(Capex_a_total / annual_demand_district_MWh, 2)
         cost_output['annual_demand_district_MWh'] = round(annual_demand_district_MWh, 2)
         cost_output['annual_demand_building_scale_MWh'] = round(annual_demand_building_scale_MWh, 2)
         cost_output['annual_demand_network_MWh'] = round(annual_demand_network_MWh, 2)
-        cost_output['opex_plant'] = round(Opex_fixed_plant + Opex_var_plant, 2)
-        cost_output['opex_pump'] = round(Opex_fixed_pump + Opex_var_pump, 2)
-        cost_output['opex_hex'] = round(Opex_fixed_hex, 2)
+        cost_output['opex_plant_USD'] = round(Opex_fixed_plant + Opex_var_plant, 2)
+        cost_output['opex_pump_USD'] = round(Opex_fixed_pump + Opex_var_pump, 2)
+        cost_output['opex_hex_USD'] = round(Opex_fixed_hex, 2)
         cost_output['el_network_MWh'] = round(el_MWh, 2)
-        cost_output['el_price'] = prices.ELEC_PRICE
-        cost_output['capex_network'] = round(Capex_a_netw, 2)
-        cost_output['capex_pumps'] = round(Capex_a_pump, 2)
-        cost_output['capex_hex'] = round(Capex_a_hex, 2)
-        cost_output['capex_chiller'] = round(Capex_a_chiller, 2)
-        cost_output['capex_CT'] = round(Capex_a_CT, 2)
+        cost_output['el_price_USD_per_Wh'] = prices.ELEC_PRICE
+        cost_output['capex_network_USD'] = round(Capex_a_netw, 2)
+        cost_output['capex_pumps_USD'] = round(Capex_a_pump, 2)
+        cost_output['capex_hex_USD'] = round(Capex_a_hex, 2)
+        cost_output['capex_chiller_USD'] = round(Capex_a_chiller, 2)
+        cost_output['capex_CT_USD'] = round(Capex_a_CT, 2)
         cost_output['avg_diam_m'] = average_diameter_m
         cost_output['network_length_m'] = length_m
 
         cost_output = pd.DataFrame.from_dict(cost_output, orient='index').T
-        cost_output.to_csv(locator.get_optimization_network_layout_costs_file(network_type))
+        cost_output.to_csv(locator.get_network_layout_costs_file(network_type, network_name), index=False)
 
-        print('Thermal network cost calculations completed successfully.')
+        time_elapsed = time.time() - start
+        print(f'Thermal network cost calculations completed successfully in {time_elapsed:.2f} seconds.')
 
     except Exception as e:
         print(f'[Thermal-Network] Cost evaluation failed: {str(e)}')
+
+
+if __name__ == '__main__':
+    main(cea.config.Configuration())

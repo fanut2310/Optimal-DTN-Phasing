@@ -43,7 +43,7 @@ class TestSchemas(unittest.TestCase):
         for method in extract_locator_methods(locator):
             if method not in schemas.keys():
                 missing_schema.add(method)
-        
+
         if missing_schema:
             error_msg = "Missing locator methods in schemas:\n"
             for schema in missing_schema:
@@ -89,12 +89,12 @@ class TestSchemas(unittest.TestCase):
     def test_all_schema_columns_documented(self):
         schemas = cea.schemas.schemas(plugins=[])
         missing_docs = defaultdict(list)  # Store all missing documentation details
-        
+
         for lm in schemas.keys():
             if lm in SKIP_LMS:
             # these can't be documented properly due to the file format
                 continue
-                
+
             schema = schemas[lm]["schema"]
             if schemas[lm]["file_type"] in {"xls", "xlsx"}:
                 for ws in schema.keys():
@@ -107,7 +107,7 @@ class TestSchemas(unittest.TestCase):
                             missing_docs[col_path].append("unit")
                         if ws_schema[col]["values"].strip() == "TODO":
                             missing_docs[col_path].append("values")
-                            
+
             elif schemas[lm]["file_type"] in {"shp", "dbf", "csv"}:
                 for col in schema["columns"].keys():
                     col_path = f"{lm}/{col}"
@@ -271,7 +271,6 @@ def extract_locator_methods(locator):
         "get_optimization_network_all_individuals_results_file",  # TODO: remove this when we know how
         "get_optimization_network_generation_individuals_results_file",  # TODO: remove this when we know how
         "get_optimization_network_individual_results_file",  # TODO: remove this when we know how
-        "get_optimization_network_layout_costs_file",  # TODO: remove this when we know how
         "get_timeseries_plots_file",  # TODO: remove this when we know how
         "get_database_conversion_systems_cold_thermal_storage_names",  # TODO: remove this when we know how
     }

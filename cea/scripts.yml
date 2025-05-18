@@ -21,7 +21,7 @@ Import & Export:
     label: Import from Rhino/Grasshopper
     description: |
       This Feature imports Rhino/Grasshopper-generated files into CEA.
-      
+
       Download the .gh file [here](https://www.cityenergyanalyst.com/s/to_cea_v4alpha22.gh) to import the Rhino/Grasshopper-generated package.  
       Ensure that the current Scenario is the Scenario generated using the Grasshopper components from the link.
 
@@ -59,12 +59,12 @@ Solar Radiation Analysis:
     label: Building Solar Radiation using CRAX [BETA]
     description: |
       **This is currently in active development and may not work as expected.**  
-      
+
       This feature uses Tongji University's CRAX (CityRadiation Accelerator) model to perform comprehensive analyses of urban solar radiation,
       encompassing direct, diffuse, and reflected components. 
       It employs the Polygon Clipping Shadow method combined with a "Neighbourhood Shading Building Surfaces" filtering criterion
       to fast assess building solar exposure in dense urban environments.
-      
+
       Reference: https://doi.org/10.1016/j.buildenv.2022.109937
     interfaces: [cli, dashboard]
     module: cea.resources.radiationCRAX.main
@@ -240,6 +240,26 @@ Thermal Network Design:
       - [get_demand_results_file, building_name]
       - [get_db4_components_conversion_folder]
       - [get_database_components_distribution_thermal_grid]
+      - [get_weather_file]
+
+  - name: thermal-network-costs
+    label: "Thermal Network Part 3: costs"
+    description: |
+      This Feature calculates the costs of a thermal network based on the results of the thermal network simulation.
+
+      **IMPORTANT**: This module requires results from the detailed model of Thermal Network Part 2. 
+      Please run Thermal Network Part 2 with the detailed model option before running this module.
+    interfaces: [cli, dashboard]
+    module: cea.technologies.thermal_network_costs.thermal_network_costs_new
+    parameters: ['general:scenario', 'thermal-network-costs']
+    input-files:
+      - [get_thermal_network_edge_list_file, "thermal-network-costs:network-type", "thermal-network-costs:network-names"]
+      - [get_nominal_edge_mass_flow_csv_file, "thermal-network-costs:network-type", "thermal-network-costs:network-names"]
+      - [get_network_energy_pumping_requirements_file, "thermal-network-costs:network-type", "thermal-network-costs:network-names"]
+      - [get_thermal_network_plant_heat_requirement_file, "thermal-network-costs:network-type", "thermal-network-costs:network-names"]
+      - [get_thermal_network_node_types_csv_file, "thermal-network-costs:network-type", "thermal-network-costs:network-names"]
+      - [get_nominal_node_mass_flow_csv_file, "thermal-network-costs:network-type", "thermal-network-costs:network-names"]
+      - [get_total_demand]
       - [get_weather_file]
 
 

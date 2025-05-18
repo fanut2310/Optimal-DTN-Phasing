@@ -38,7 +38,7 @@ class Thermal_Network(object):
         self.locator = locator
         self.config = config
         self.network_type = network_type
-        self.network_name = config.thermal_network.network_names
+        self.network_name = config.thermal_network_optimization.network_names
         # initialize optimization storage variables and dictionaries
         self.cost_info = ['capex', 'opex', 'total', 'el_network_MWh',
                           'opex_plant', 'opex_pump', 'opex_dis_loads', 'opex_dis_build', 'opex_hex',
@@ -63,8 +63,8 @@ class Thermal_Network(object):
         self.full_heating_systems = ['ahu', 'aru', 'shu', 'ww']
         self.full_cooling_systems = ['ahu', 'aru',
                                      'scu']  # Todo: add 'data', 're' here once the are available disconnectedly
-        self.substation_cooling_systems = config.thermal_network.substation_cooling_systems
-        self.substation_heating_systems = config.thermal_network.substation_heating_systems
+        self.substation_cooling_systems = config.thermal_network_optimization.substation_cooling_systems
+        self.substation_heating_systems = config.thermal_network_optimization.substation_heating_systems
         self.__weather_data = None
 
     @property
@@ -574,7 +574,7 @@ def main(config):
     network_info.number_of_buildings_in_district = total_demand.name.count()
 
     # write disconnected_buildings_index into network_info
-    disconnected_buildings_list = config.thermal_network.disconnected_buildings
+    disconnected_buildings_list = config.network_layout.disconnected_buildings
     disconnected_buildings_index = []
     for building in disconnected_buildings_list:
         disconnected_buildings_index.append(int(np.where(network_info.building_names == building)[0]))

@@ -48,14 +48,6 @@ class NetworkOptimizationFeatures(object):
     def mass_flow_rate_plant(self, locator, network_name, network_type):
         mass_flow_df = pd.read_csv((locator.get_thermal_network_layout_massflow_nodes_file(network_type, network_name)))
         mass_flow_nodes_df = pd.read_csv((locator.get_thermal_network_node_types_csv_file(network_type, network_name)))
-
-        # --- Begin modification for debugging ---
-        node_types_csv_path = locator.get_thermal_network_node_types_csv_file(network_type, network_name)
-        print(f"DEBUG: Reading node types from CSV: {node_types_csv_path}")
-        mass_flow_nodes_df = pd.read_csv(node_types_csv_path)
-        print(f"DEBUG: Columns in node types CSV: {mass_flow_nodes_df.columns.tolist()}")
-        # --- End modification for debugging ---
-
         # identify the node with the plant
         node_id = mass_flow_nodes_df.loc[mass_flow_nodes_df['Type'] == "PLANT", 'Name'].item()
         return mass_flow_df[node_id].values
@@ -64,7 +56,7 @@ class NetworkOptimizationFeatures(object):
     def pipe_costs(self, locator, network_name, network_type):
         edges_file = pd.read_csv(locator.get_thermal_network_edge_list_file(network_type, network_name))
         piping_cost_data = pd.read_csv(locator.get_database_components_distribution_thermal_grid('THERMAL_GRID'))
-        
+
         # FIXME: Standardize column name in files
         merge_df = edges_file.rename(columns={'Pipe_DN': 'pipe_DN'}).merge(piping_cost_data, on='pipe_DN')
         merge_df['Inv_USD2015'] = merge_df['Inv_USD2015perm'] * merge_df['length_m']

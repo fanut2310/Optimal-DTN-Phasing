@@ -52,11 +52,14 @@ from __future__ import annotations
 ###############################################################################
 import argparse
 import logging
+import time
+import itertools
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List, Set
 
 import geopandas as gpd
 import pandas as pd
+import numpy as np
 import networkx as nx
 
 import cea.config               # type: ignore
@@ -149,7 +152,20 @@ class ClusterMapper:
         out_folder.mkdir(parents=True, exist_ok=True)
 
         # --- update node shapefile with cluster and save
+        # Rearrange columns in nodes_clustered shapefiles as per requirement iii)
         nodes_out_shp = out_folder / "nodes_clustered.shp"
+        # Ensure columns are in the specified order: 'name', 'type', 'building', 'cluster'
+        node_columns = ["name", "type", "building", "cluster"]
+        # Add any other columns that might be in the dataframe
+        for col in self.gdf_nodes.columns:
+            if col not in node_columns and col != "geometry":
+                node_columns.append(col)
+        # Add geometry at the end
+        if "geometry" in self.gdf_nodes.columns:
+            node_columns.append("geometry")
+
+        # Reorder columns and save
+        self.gdf_nodes = self.gdf_nodes[node_columns]
         self.gdf_nodes.to_file(nodes_out_shp)
         log().info("Wrote clustered nodes shapefile → %s", nodes_out_shp)
 
@@ -159,35 +175,62 @@ class ClusterMapper:
         log().info("Wrote cluster_nodes.csv → %s", nodes_csv)
 
         # --- update edge shapefile with new cluster fields and save
+        # Rename columns as per requirement i)
+        self.gdf_edges = self.gdf_edges.rename(columns={
+            "cluster_src": "from_C",
+            "cluster_dst": "to_C"
+        })
+
+        # Add cluster column to edges_clustered shapefile
+        def pick_cluster(r):
+            if r["from_C"] != r["to_C"] and r["from_C"] != -1 and r["to_C"] != -1:
+                return -1  # Inter-cluster edge
+            if r["from_C"] == -1:
+                return r["to_C"]
+            return r["from_C"]
+
+        self.gdf_edges["cluster"] = self.gdf_edges.apply(pick_cluster, axis=1)
+
+        # Save the updated edges shapefile
         edges_out_shp = out_folder / "edges_clustered.shp"
         self.gdf_edges.to_file(edges_out_shp)
         log().info("Wrote clustered edges shapefile → %s", edges_out_shp)
 
-        # --- prepare cluster_edges.csv
+        # --- prepare cluster_edges.csv as per requirement ii)
         df = self.gdf_edges.copy()
-        df = df.rename(columns={
-            "cluster_src": "from_cluster",
-            "cluster_dst": "to_cluster"
-        })
-        df["inter_cluster"] = df.apply(
-            lambda r: 1 if (r["from_cluster"] != r["to_cluster"] and r["from_cluster"] != -1 and r["to_cluster"] != -1) else 0,
-            axis=1
-        )
-        def pick_cluster(r):
-            if r["inter_cluster"] == 1:
-                return -1
-            if r["from_cluster"] == -1:
-                return r["to_cluster"]
-            return r["from_cluster"]
-        df["cluster"] = df.apply(pick_cluster, axis=1)
+
+        # Ensure we have the required columns
         if "Name" in df.columns:
-            df["edge_id"] = df["Name"]
+            df["name"] = df["Name"]
+        elif "edge_id" in df.columns:
+            df["name"] = df["edge_id"]
         else:
-            df = df.reset_index().rename(columns={"index": "edge_id"})
-        cols = ["edge_id", "from_cluster", "to_cluster", "inter_cluster", "cluster"]
-        for attr in ["D_int_m", "material"]:
-            if attr in df.columns:
-                cols.append(attr)
+            df = df.reset_index()
+            df["name"] = df["index"].astype(str)
+
+        # Add length_m column if it exists with a different name
+        if "length_m" not in df.columns and "LENGTH" in df.columns:
+            df["length_m"] = df["LENGTH"]
+        elif "length_m" not in df.columns and "Length" in df.columns:
+            df["length_m"] = df["Length"]
+
+        # Add pipe_DN column if it exists with a different name
+        if "pipe_DN" not in df.columns and "D_int_m" in df.columns:
+            # Convert from meters to mm and round to nearest standard DN size
+            df["pipe_DN"] = (df["D_int_m"] * 1000).round().astype(int)
+
+        # Add type_mat column if it exists with a different name
+        if "type_mat" not in df.columns and "material" in df.columns:
+            df["type_mat"] = df["material"]
+
+        # Select and order columns as required
+        cols = ["name", "length_m", "pipe_DN", "type_mat", "from_C", "to_C", "cluster"]
+
+        # Ensure all required columns exist (create empty ones if needed)
+        for col in cols:
+            if col not in df.columns:
+                df[col] = ""
+
         edges_csv = out_folder / "cluster_edges.csv"
         df[cols].to_csv(edges_csv, index=False)
         log().info("Wrote cluster_edges.csv → %s", edges_csv)
@@ -203,12 +246,269 @@ def parse_args():
     return p.parse_args()
 
 
+def check_thermal_network_prerequisites(locator, network_type):
+    """
+    Check if the required thermal network files exist.
+
+    Parameters:
+    -----------
+    locator : InputLocator
+        CEA InputLocator object
+    network_type : str
+        'DH' for district heating or 'DC' for district cooling
+
+    Returns:
+    --------
+    bool
+        True if all prerequisites are met, False otherwise
+    """
+    # Check for Part 1 (layout) files
+    try:
+        edge_node_file = Path(locator.get_thermal_network_edge_node_matrix_file(network_type))
+        if not edge_node_file.exists():
+            log().error(f"Thermal Network Part 1 (layout) files not found. Please run Thermal Network Part 1 first.")
+            return False
+
+        # Check for Part 2 (simulation) files
+        plant_heat_file = Path(locator.get_thermal_network_plant_heat_requirement_file(network_type))
+        if not plant_heat_file.exists():
+            log().error(f"Thermal Network Part 2 (simulation) files not found. Please run Thermal Network Part 2 with detailed model first.")
+            return False
+
+        # Check for Part 3 (costs) files
+        costs_file = Path(locator.get_network_layout_costs_file(network_type))
+        if not costs_file.exists():
+            log().error(f"Thermal Network Part 3 (costs) files not found. Please run Thermal Network Part 3 first.")
+            return False
+
+        # Check for Total_demand.csv
+        total_demand_file = Path(locator.get_total_demand())
+        if not total_demand_file.exists():
+            log().error(f"Total demand file not found. Please run the demand script first.")
+            return False
+
+        return True
+    except Exception as e:
+        log().error(f"Error checking prerequisites: {str(e)}")
+        return False
+
+class PipeLayoutGenerator:
+    """Generate pipe layouts for different sets of clusters and calculate metrics."""
+
+    def __init__(self, locator: cea.inputlocator.InputLocator, network_type: str, phase: int = 1):
+        """
+        Initialize the PipeLayoutGenerator.
+
+        Parameters:
+        -----------
+        locator : InputLocator
+            CEA InputLocator object
+        network_type : str
+            'DH' for district heating or 'DC' for district cooling
+        phase : int
+            The phase number for the expansion
+        """
+        self.locator = locator
+        self.network_type = network_type
+        self.phase = phase
+        self.output_folder = Path(locator.get_dtn_expansion_optimization_results_folder()) / f"phase_{phase}"
+        self.output_folder.mkdir(parents=True, exist_ok=True)
+
+        # Load input data
+        self._load_inputs()
+
+    def _load_inputs(self):
+        """Load all necessary input data."""
+        # Load cluster assignments
+        cluster_edges_path = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "cluster_edges.csv"
+        self.cluster_edges = pd.read_csv(cluster_edges_path)
+
+        cluster_nodes_path = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "cluster_nodes.csv"
+        self.cluster_nodes = pd.read_csv(cluster_nodes_path)
+
+        # Load edge-node matrix
+        edge_node_path = Path(self.locator.get_thermal_network_edge_node_matrix_file(self.network_type))
+        self.edge_node_matrix = pd.read_csv(edge_node_path, index_col=0)
+
+        # Load total demand
+        total_demand_path = Path(self.locator.get_total_demand())
+        self.total_demand = pd.read_csv(total_demand_path)
+
+        # Get unique clusters (excluding 0 and -1)
+        self.clusters = sorted([c for c in self.cluster_edges['cluster'].unique() if c > 0])
+        log().info(f"Found {len(self.clusters)} clusters (excluding existing DTN and main roads)")
+
+    def generate_all_cluster_combinations(self):
+        """
+        Generate all possible combinations of clusters.
+
+        Returns:
+        --------
+        list
+            List of all possible cluster combinations
+        """
+        all_combinations = []
+        for r in range(1, len(self.clusters) + 1):
+            combinations = list(itertools.combinations(self.clusters, r))
+            all_combinations.extend(combinations)
+
+        log().info(f"Generated {len(all_combinations)} possible cluster combinations")
+        return all_combinations
+
+    def get_required_pipes_for_clusters(self, cluster_set):
+        """
+        Determine the minimum required pipes for a set of clusters.
+
+        Parameters:
+        -----------
+        cluster_set : tuple
+            Tuple of cluster IDs to connect
+
+        Returns:
+        --------
+        pd.DataFrame
+            DataFrame of required pipes
+        """
+        # Include cluster 0 (existing DTN) in the set
+        clusters_to_connect = set(cluster_set).union({0})
+
+        # Get edges that belong to the clusters in the set
+        cluster_edges = self.cluster_edges[self.cluster_edges['cluster'].isin(clusters_to_connect)]
+
+        # Get main road edges (-1) that connect the clusters
+        main_road_edges = self.cluster_edges[
+            (self.cluster_edges['cluster'] == -1) & 
+            (self.cluster_edges['from_C'].isin(clusters_to_connect)) & 
+            (self.cluster_edges['to_C'].isin(clusters_to_connect))
+        ]
+
+        # Combine the edges
+        required_pipes = pd.concat([cluster_edges, main_road_edges])
+
+        return required_pipes
+
+    def calculate_metrics(self, cluster_set, required_pipes):
+        """
+        Calculate metrics for a set of clusters.
+
+        Parameters:
+        -----------
+        cluster_set : tuple
+            Tuple of cluster IDs to connect
+        required_pipes : pd.DataFrame
+            DataFrame of required pipes
+
+        Returns:
+        --------
+        dict
+            Dictionary of metrics
+        """
+        # Include cluster 0 (existing DTN) in the set
+        clusters_to_connect = set(cluster_set).union({0})
+
+        # Calculate total pipe length
+        total_pipe_length = required_pipes['length_m'].sum()
+
+        # Get buildings in the clusters
+        buildings_in_clusters = self.cluster_nodes[
+            (self.cluster_nodes['cluster'].isin(clusters_to_connect)) & 
+            (self.cluster_nodes['type'] == 'CONSUMER')
+        ]['building'].tolist()
+
+        # Calculate total annual demand
+        if self.network_type == 'DH':
+            # For district heating, use Qhs_sys_MWhyr
+            total_annual_demand = self.total_demand[
+                self.total_demand['name'].isin(buildings_in_clusters)
+            ]['Qhs_sys_MWhyr'].sum()
+            demand_type = 'Qh'
+        else:
+            # For district cooling, use Qcs_sys_MWhyr
+            total_annual_demand = self.total_demand[
+                self.total_demand['name'].isin(buildings_in_clusters)
+            ]['Qcs_sys_MWhyr'].sum()
+            demand_type = 'Qc'
+
+        # Calculate linear heat density (LHD)
+        if total_pipe_length > 0:
+            linear_heat_density = total_annual_demand / total_pipe_length * 1000  # MWh/km
+        else:
+            linear_heat_density = 0
+
+        # Create metrics dictionary
+        metrics = {
+            'clusters': '+'.join(map(str, sorted(cluster_set))),
+            f'total_annual_{demand_type}_MWh': total_annual_demand,
+            'total_pipe_length_m': total_pipe_length,
+            f'linear_{demand_type}_density_MWh_per_km': linear_heat_density
+        }
+
+        return metrics
+
+    def generate_pipe_layouts(self):
+        """
+        Generate pipe layouts for all possible combinations of clusters.
+
+        Returns:
+        --------
+        pd.DataFrame
+            DataFrame with metrics for all cluster combinations
+        """
+        # Generate all possible combinations of clusters
+        all_combinations = self.generate_all_cluster_combinations()
+
+        # Calculate metrics for each combination
+        all_metrics = []
+        for i, cluster_set in enumerate(all_combinations):
+            if i % 100 == 0 and i > 0:
+                log().info(f"Processed {i}/{len(all_combinations)} cluster combinations")
+
+            # Get required pipes for this set of clusters
+            required_pipes = self.get_required_pipes_for_clusters(cluster_set)
+
+            # Calculate metrics
+            metrics = self.calculate_metrics(cluster_set, required_pipes)
+            all_metrics.append(metrics)
+
+        # Convert to DataFrame
+        metrics_df = pd.DataFrame(all_metrics)
+
+        # Save to CSV
+        output_file = self.output_folder / "clusters_metrics.csv"
+        metrics_df.to_csv(output_file, index=False)
+        log().info(f"Saved metrics for {len(all_metrics)} cluster combinations to {output_file}")
+
+        return metrics_df
+
+
 def main():
+    import time
+    start_time = time.time()
+
     args = parse_args()
     cfg = cea.config.Configuration(); cfg.scenario = args.scenario
     locator = cea.inputlocator.InputLocator(cfg.scenario)
+
+    # Check prerequisites
+    if not check_thermal_network_prerequisites(locator, args.network_type):
+        log().error("Prerequisites not met. Results for Thermal Network Part 1 (layout), Part 2 (simulation) with detailed model, and Part 3 (costs) for ALL buildings must first be obtained before running this module.")
+        return
+
+    # Perform node and edge clustering
     mapper = ClusterMapper(locator, args.network_type)
     mapper.write_outputs()
+
+    # Print completion message with computation time
+    clustering_time = time.time() - start_time
+    log().info(f"DTN nodes and edges clustering completed successfully in {clustering_time:.2f} seconds. Pipe layouts of connecting different sets of building clusters in phase [1] are being generated.")
+
+    # Generate pipe layouts for different sets of clusters
+    pipe_layout_generator = PipeLayoutGenerator(locator, args.network_type, phase=1)
+    pipe_layout_generator.generate_pipe_layouts()
+
+    # Print final completion message
+    total_time = time.time() - start_time
+    log().info(f"DTN expansion optimization completed successfully in {total_time:.2f} seconds.")
 
 if __name__ == "__main__":
     main()

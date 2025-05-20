@@ -19,9 +19,9 @@ import cea.technologies.chiller_vapor_compression as VCCModel
 import cea.technologies.cooling_tower as CTModel
 from cea.utilities import epwreader
 
-__author__ = "Adapted from thermal_network_costs_ver2.py"
-__copyright__ = "Copyright 2015, Architecture and Building Systems - ETH Zurich"
-__credits__ = ["Lennart Rogenhofer"]
+__author__ = "Fan Ut Chang"
+__copyright__ = "Copyright 2025, Architecture and Building Systems - ETH Zurich"
+__credits__ = ["Fan Ut Chang"]
 __license__ = "MIT"
 __version__ = "0.1"
 __maintainer__ = "Daren Thomas"

@@ -293,7 +293,7 @@ Energy Supply System Optimisation:
   - name: thermal-network-optimization
     label: Thermal Network Optimisation
     description: This Feature optimises network design variables (plant locations, layout,...).
-    interfaces: [cli, dashboard]
+    interfaces: [cli]
     module: cea.technologies.thermal_network.thermal_network_optimization
     parameters: ['general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free',
                  thermal-network-optimization]
@@ -334,7 +334,8 @@ Energy Supply System Optimisation:
     interfaces: [ cli, dashboard ]
     module: cea.optimization_new.DTN_expansion_optimization
     parameters: [ 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free',
-                  'thermal-network', 'network-layout', 'district-network-optimization' ]
+                  'thermal-network', 'network-layout', 'district-network-optimization',
+                  'dtn-expansion-optimization:network-type', 'dtn-expansion-optimization:chosen-clusters', 'dtn-expansion-optimization:chosen-buildings' ]
     input-files:
       - [get_street_network]
       - [get_total_demand]

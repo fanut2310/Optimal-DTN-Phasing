@@ -243,10 +243,12 @@ def parse_args():
     p = argparse.ArgumentParser(description="Assign network nodes/edges to building clusters")
     p.add_argument("scenario", help="CEA scenario root folder")
     p.add_argument("--network-type", choices=["DH","DC"], default="DH")
+    p.add_argument("--chosen-clusters", help="Comma-separated list of cluster IDs to include (e.g., '1,3,4')")
+    p.add_argument("--chosen-buildings", help="Comma-separated list of building names to include")
     return p.parse_args()
 
 
-def check_thermal_network_prerequisites(locator, network_type):
+def check_thermal_network_prerequisites(locator, network_type, bypass_check=False):
     """
     Check if the required thermal network files exist.
 
@@ -256,12 +258,18 @@ def check_thermal_network_prerequisites(locator, network_type):
         CEA InputLocator object
     network_type : str
         'DH' for district heating or 'DC' for district cooling
+    bypass_check : bool
+        If True, bypass the prerequisite check (useful for testing with a subset of buildings)
 
     Returns:
     --------
     bool
-        True if all prerequisites are met, False otherwise
+        True if all prerequisites are met or bypass_check is True, False otherwise
     """
+    if bypass_check:
+        log().warning("Bypassing thermal network prerequisites check. Make sure you have the necessary files for your chosen buildings.")
+        return True
+
     # Check for Part 1 (layout) files
     try:
         edge_node_file = Path(locator.get_thermal_network_edge_node_matrix_file(network_type))
@@ -270,7 +278,7 @@ def check_thermal_network_prerequisites(locator, network_type):
             return False
 
         # Check for Part 2 (simulation) files
-        plant_heat_file = Path(locator.get_thermal_network_plant_heat_requirement_file(network_type))
+        plant_heat_file = Path(locator.get_thermal_network_plant_heat_requirement_file(network_type, ""))
         if not plant_heat_file.exists():
             log().error(f"Thermal Network Part 2 (simulation) files not found. Please run Thermal Network Part 2 with detailed model first.")
             return False
@@ -295,7 +303,7 @@ def check_thermal_network_prerequisites(locator, network_type):
 class PipeLayoutGenerator:
     """Generate pipe layouts for different sets of clusters and calculate metrics."""
 
-    def __init__(self, locator: cea.inputlocator.InputLocator, network_type: str, phase: int = 1):
+    def __init__(self, locator: cea.inputlocator.InputLocator, network_type: str, phase: int = 1, chosen_clusters=None, chosen_buildings=None):
         """
         Initialize the PipeLayoutGenerator.
 
@@ -307,10 +315,16 @@ class PipeLayoutGenerator:
             'DH' for district heating or 'DC' for district cooling
         phase : int
             The phase number for the expansion
+        chosen_clusters : list, optional
+            List of cluster IDs to include (if None, all clusters are included)
+        chosen_buildings : list, optional
+            List of building names to include (if None, all buildings are included)
         """
         self.locator = locator
         self.network_type = network_type
         self.phase = phase
+        self.chosen_clusters = chosen_clusters
+        self.chosen_buildings = chosen_buildings
         self.output_folder = Path(locator.get_dtn_expansion_optimization_results_folder()) / f"phase_{phase}"
         self.output_folder.mkdir(parents=True, exist_ok=True)
 
@@ -334,9 +348,45 @@ class PipeLayoutGenerator:
         total_demand_path = Path(self.locator.get_total_demand())
         self.total_demand = pd.read_csv(total_demand_path)
 
+        # Filter by chosen buildings if specified
+        if self.chosen_buildings:
+            # Convert to list if it's a string
+            if isinstance(self.chosen_buildings, str):
+                self.chosen_buildings = [b.strip() for b in self.chosen_buildings.split(',') if b.strip()]
+
+            log().info(f"Filtering to include only {len(self.chosen_buildings)} chosen buildings")
+
+            # Get clusters that contain the chosen buildings
+            building_clusters = self.cluster_nodes[
+                (self.cluster_nodes['type'] == 'CONSUMER') & 
+                (self.cluster_nodes['building'].isin(self.chosen_buildings))
+            ]['cluster'].unique()
+
+            # If chosen_clusters is not specified, use the clusters from chosen buildings
+            if self.chosen_clusters is None:
+                self.chosen_clusters = sorted([c for c in building_clusters if c > 0])
+                log().info(f"Derived clusters from chosen buildings: {self.chosen_clusters}")
+
         # Get unique clusters (excluding 0 and -1)
-        self.clusters = sorted([c for c in self.cluster_edges['cluster'].unique() if c > 0])
-        log().info(f"Found {len(self.clusters)} clusters (excluding existing DTN and main roads)")
+        all_clusters = sorted([c for c in self.cluster_edges['cluster'].unique() if c > 0])
+
+        # Filter by chosen clusters if specified
+        if self.chosen_clusters:
+            # Convert to list if it's a string
+            if isinstance(self.chosen_clusters, str):
+                self.chosen_clusters = [int(c.strip()) for c in self.chosen_clusters.split(',') if c.strip()]
+
+            # Ensure all chosen clusters exist
+            valid_clusters = [c for c in self.chosen_clusters if c in all_clusters]
+            if len(valid_clusters) != len(self.chosen_clusters):
+                missing = set(self.chosen_clusters) - set(valid_clusters)
+                log().warning(f"Some chosen clusters do not exist: {missing}")
+
+            self.clusters = sorted(valid_clusters)
+            log().info(f"Using {len(self.clusters)} chosen clusters: {self.clusters}")
+        else:
+            self.clusters = all_clusters
+            log().info(f"Using all {len(self.clusters)} clusters (excluding existing DTN and main roads)")
 
     def generate_all_cluster_combinations(self):
         """
@@ -481,29 +531,79 @@ class PipeLayoutGenerator:
         return metrics_df
 
 
-def main():
+def main(config):
+    """
+    Main function for the DTN expansion optimization.
+
+    Parameters:
+    -----------
+    config : cea.config.Configuration
+        CEA configuration object
+    """
     import time
     start_time = time.time()
 
-    args = parse_args()
-    cfg = cea.config.Configuration(); cfg.scenario = args.scenario
-    locator = cea.inputlocator.InputLocator(cfg.scenario)
+    # If called from command line, parse arguments
+    args = None
+    if config is None:
+        args = parse_args()
+        config = cea.config.Configuration()
+        config.scenario = args.scenario
+
+    locator = cea.inputlocator.InputLocator(config.scenario)
+
+    # Get network type from command line or config
+    network_type = config.dtn_expansion_optimization.network_type
+    if args and args.network_type:
+        network_type = args.network_type
+
+    # Get chosen clusters and buildings from command line arguments or config
+    chosen_clusters = config.dtn_expansion_optimization.chosen_clusters
+    chosen_buildings = config.dtn_expansion_optimization.chosen_buildings
+
+    # Override with command line arguments if provided
+    if args:
+        if args.chosen_clusters:
+            chosen_clusters = args.chosen_clusters
+        if args.chosen_buildings:
+            chosen_buildings = args.chosen_buildings
+
+    # Determine if we should bypass the prerequisite check
+    bypass_check = bool(chosen_clusters or chosen_buildings)
 
     # Check prerequisites
-    if not check_thermal_network_prerequisites(locator, args.network_type):
+    if not check_thermal_network_prerequisites(locator, network_type, bypass_check):
         log().error("Prerequisites not met. Results for Thermal Network Part 1 (layout), Part 2 (simulation) with detailed model, and Part 3 (costs) for ALL buildings must first be obtained before running this module.")
         return
 
     # Perform node and edge clustering
-    mapper = ClusterMapper(locator, args.network_type)
+    mapper = ClusterMapper(locator, network_type)
     mapper.write_outputs()
 
     # Print completion message with computation time
     clustering_time = time.time() - start_time
     log().info(f"DTN nodes and edges clustering completed successfully in {clustering_time:.2f} seconds. Pipe layouts of connecting different sets of building clusters in phase [1] are being generated.")
 
+    # If chosen_clusters is provided, convert it to a list of integers
+    if chosen_clusters:
+        if isinstance(chosen_clusters, str):
+            chosen_clusters = [int(c.strip()) for c in chosen_clusters.split(',') if c.strip()]
+        log().info(f"Using chosen clusters: {chosen_clusters}")
+
+    # If chosen_buildings is provided, ensure it's a list
+    if chosen_buildings:
+        if isinstance(chosen_buildings, str):
+            chosen_buildings = [b.strip() for b in chosen_buildings.split(',') if b.strip()]
+        log().info(f"Using chosen buildings: {chosen_buildings}")
+
     # Generate pipe layouts for different sets of clusters
-    pipe_layout_generator = PipeLayoutGenerator(locator, args.network_type, phase=1)
+    pipe_layout_generator = PipeLayoutGenerator(
+        locator, 
+        network_type, 
+        phase=1,
+        chosen_clusters=chosen_clusters,
+        chosen_buildings=chosen_buildings
+    )
     pipe_layout_generator.generate_pipe_layouts()
 
     # Print final completion message
@@ -511,4 +611,4 @@ def main():
     log().info(f"DTN expansion optimization completed successfully in {total_time:.2f} seconds.")
 
 if __name__ == "__main__":
-    main()
+    main(None)

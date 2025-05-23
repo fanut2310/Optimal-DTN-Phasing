@@ -54,16 +54,24 @@ import argparse
 import logging
 import time
 import itertools
+import random
 from pathlib import Path
-from typing import Dict, Tuple, List, Set
+from typing import Dict, Tuple, List, Set, Optional, Union
 
 import geopandas as gpd
 import pandas as pd
 import numpy as np
 import networkx as nx
+from deap import base, tools, algorithms, creator
+
+# Create the Individual class
+creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+creator.create("Individual", list, fitness=creator.FitnessMax)
 
 import cea.config               # type: ignore
 import cea.inputlocator         # type: ignore
+from cea.constants import HEAT_CAPACITY_OF_WATER_JPERKGK
+from cea.analysis.costs.equations import calc_capex_annualized
 
 ###############################################################################
 # 2) LOGGING                                                                 #
@@ -300,6 +308,738 @@ def check_thermal_network_prerequisites(locator, network_type, bypass_check=Fals
         log().error(f"Error checking prerequisites: {str(e)}")
         return False
 
+class DTNExpansionOptimizer:
+    """
+    Optimize the phased expansion of district thermal networks using genetic algorithm.
+
+    This class assigns clusters to different phases to maximize overall ROI while
+    respecting budget constraints for each phase.
+    """
+
+    def __init__(self, locator: cea.inputlocator.InputLocator, network_type: str, 
+                 metrics_df: pd.DataFrame, num_phases: int = 3, 
+                 budget_per_phase: Optional[List[float]] = None, 
+                 energy_price: float = 0.1, interest_rate: float = 0.05,
+                 cost_model: str = 'detailed'):
+        """
+        Initialize the DTN expansion optimizer.
+
+        Parameters:
+        -----------
+        locator : cea.inputlocator.InputLocator
+            CEA InputLocator object
+        network_type : str
+            'DH' for district heating or 'DC' for district cooling
+        metrics_df : pd.DataFrame
+            DataFrame with metrics for all cluster combinations
+        num_phases : int
+            Number of phases for the expansion
+        budget_per_phase : list, optional
+            Budget available for each phase (in USD)
+        energy_price : float
+            Energy price for calculating revenue (USD/kWh)
+        interest_rate : float
+            Annual interest rate for NPV calculations
+        cost_model : str
+            Method for calculating pipe costs ('simplified' or 'detailed')
+        """
+        self.locator = locator
+        self.network_type = network_type
+        self.metrics_df = metrics_df
+        self.num_phases = num_phases
+        self.budget_per_phase = budget_per_phase or [float('inf')] * num_phases
+        self.energy_price = energy_price
+        self.interest_rate = interest_rate
+        self.cost_model = cost_model
+
+        # Load cost data from TN part 3 results
+        self.cost_data = self._load_cost_data()
+
+        # Load cluster data
+        self._load_cluster_data()
+
+        # Create a mapping from cluster combinations to their metrics
+        self.cluster_metrics = self._create_cluster_metrics_mapping()
+
+        # Initialize DEAP toolbox
+        self.toolbox = base.Toolbox()
+        self._setup_genetic_algorithm()
+
+    def _load_cost_data(self):
+        """Load cost data from thermal network costs results."""
+        cost_file = Path(self.locator.get_network_layout_costs_file(self.network_type))
+        if not cost_file.exists():
+            raise FileNotFoundError(f"Cost file not found: {cost_file}. Please run Thermal Network Part 3 first.")
+
+        cost_data = pd.read_csv(cost_file)
+
+        # Extract relevant cost components
+        cost_components = {
+            'capex_network_USD': cost_data['capex_network_USD'].iloc[0],
+            'capex_pumps_USD': cost_data['capex_pumps_USD'].iloc[0],
+            'capex_hex_USD': cost_data['capex_hex_USD'].iloc[0],
+            'network_length_m': cost_data['network_length_m'].iloc[0],
+        }
+
+        # Calculate cost per meter of pipe (for simplified model)
+        cost_components['cost_per_meter'] = cost_components['capex_network_USD'] / cost_components['network_length_m']
+
+        return cost_components
+
+    def _load_cluster_data(self):
+        """Load cluster data from cluster_edges.csv and cluster_nodes.csv."""
+        # Load cluster assignments
+        cluster_edges_path = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "cluster_edges.csv"
+        self.cluster_edges = pd.read_csv(cluster_edges_path)
+
+        cluster_nodes_path = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "cluster_nodes.csv"
+        self.cluster_nodes = pd.read_csv(cluster_nodes_path)
+
+        # Load total demand
+        total_demand_path = Path(self.locator.get_total_demand())
+        self.total_demand = pd.read_csv(total_demand_path)
+
+        # Get all clusters (excluding 0 and -1)
+        self.all_clusters = sorted([c for c in self.cluster_edges['cluster'].unique() if c > 0])
+
+        # Get total number of buildings
+        self.total_buildings = len(self.total_demand['name'].unique())
+
+    def _create_cluster_metrics_mapping(self):
+        """Create a mapping from cluster combinations to their metrics."""
+        cluster_metrics = {}
+        for _, row in self.metrics_df.iterrows():
+            cluster_metrics[row['clusters']] = row.to_dict()
+        return cluster_metrics
+
+    def get_required_pipes_for_clusters(self, cluster_set):
+        """
+        Determine the minimum required pipes for a set of clusters.
+
+        Parameters:
+        -----------
+        cluster_set : tuple or list
+            Tuple or list of cluster IDs to connect
+
+        Returns:
+        --------
+        pd.DataFrame
+            DataFrame of required pipes
+        """
+        # Include cluster 0 (existing DTN) in the set
+        clusters_to_connect = set(cluster_set).union({0})
+
+        # Get edges that belong to the clusters in the set
+        cluster_edges = self.cluster_edges[self.cluster_edges['cluster'].isin(clusters_to_connect)]
+
+        # Get main road edges (-1) that connect the clusters
+        main_road_edges = self.cluster_edges[
+            (self.cluster_edges['cluster'] == -1) & 
+            (self.cluster_edges['from_C'].isin(clusters_to_connect)) & 
+            (self.cluster_edges['to_C'].isin(clusters_to_connect))
+        ]
+
+        # Combine the edges
+        required_pipes = pd.concat([cluster_edges, main_road_edges])
+
+        return required_pipes
+
+    def _get_buildings_in_clusters(self, cluster_set):
+        """
+        Get all buildings in the specified clusters.
+
+        Parameters:
+        -----------
+        cluster_set : tuple or list
+            Tuple or list of cluster IDs
+
+        Returns:
+        --------
+        list
+            List of building names
+        """
+        # Include cluster 0 (existing DTN) in the set
+        clusters_to_connect = set(cluster_set).union({0})
+
+        # Get buildings in the clusters
+        buildings = self.cluster_nodes[
+            (self.cluster_nodes['cluster'].isin(clusters_to_connect)) & 
+            (self.cluster_nodes['type'] == 'CONSUMER')
+        ]['building'].tolist()
+
+        return buildings
+
+    def _get_buildings_in_specific_cluster(self, cluster_id):
+        """
+        Get buildings in a specific cluster only.
+
+        Parameters:
+        -----------
+        cluster_id : int
+            Cluster ID
+
+        Returns:
+        --------
+        list
+            List of building names in the specific cluster
+        """
+        # Get buildings in the specific cluster
+        buildings = self.cluster_nodes[
+            (self.cluster_nodes['cluster'] == cluster_id) & 
+            (self.cluster_nodes['type'] == 'CONSUMER')
+        ]['building'].tolist()
+
+        return buildings
+
+    def calculate_detailed_capex(self, cluster_set):
+        """
+        Calculate CAPEX using detailed pipe diameter information.
+
+        Parameters:
+        -----------
+        cluster_set : tuple or list
+            Tuple or list of cluster IDs
+
+        Returns:
+        --------
+        float
+            Total pipe CAPEX
+        """
+        # Get edges for this cluster set
+        required_pipes = self.get_required_pipes_for_clusters(cluster_set)
+
+        # Load pipe cost data
+        piping_cost_data = pd.read_csv(self.locator.get_database_components_distribution_thermal_grid('THERMAL_GRID'))
+
+        # Merge with cost data
+        cost_df = required_pipes.merge(piping_cost_data, on='pipe_DN')
+
+        # Calculate cost for each pipe segment
+        cost_df['pipe_cost'] = cost_df['Inv_USD2015perm'] * cost_df['length_m']
+
+        # Sum up all pipe costs
+        total_pipe_cost = cost_df['pipe_cost'].sum()
+
+        return total_pipe_cost
+
+    def calculate_simplified_capex(self, cluster_set):
+        """
+        Calculate CAPEX using simplified average cost per meter.
+
+        Parameters:
+        -----------
+        cluster_set : tuple or list
+            Tuple or list of cluster IDs
+
+        Returns:
+        --------
+        float
+            Total pipe CAPEX
+        """
+        # Get edges for this cluster set
+        required_pipes = self.get_required_pipes_for_clusters(cluster_set)
+
+        # Calculate total pipe length
+        total_pipe_length = required_pipes['length_m'].sum()
+
+        # Calculate cost using average cost per meter
+        total_pipe_cost = total_pipe_length * self.cost_data['cost_per_meter']
+
+        return total_pipe_cost
+
+    def _calculate_phase_capex(self, cluster_set):
+        """
+        Calculate total CAPEX for a phase.
+
+        Parameters:
+        -----------
+        cluster_set : tuple or list
+            Tuple or list of cluster IDs
+
+        Returns:
+        --------
+        float
+            Total CAPEX for the phase
+        """
+        # Calculate pipe CAPEX based on selected cost model
+        if self.cost_model == 'detailed':
+            pipe_capex = self.calculate_detailed_capex(cluster_set)
+        else:
+            pipe_capex = self.calculate_simplified_capex(cluster_set)
+
+        # Get buildings in the clusters
+        buildings = self._get_buildings_in_clusters(cluster_set)
+
+        # Calculate heat exchanger costs based on number of buildings
+        hex_capex = len(buildings) * (self.cost_data['capex_hex_USD'] / self.total_buildings)
+
+        # Calculate pump costs based on pipe length ratio
+        required_pipes = self.get_required_pipes_for_clusters(cluster_set)
+        pipe_length_ratio = required_pipes['length_m'].sum() / self.cost_data['network_length_m']
+        pump_capex = self.cost_data['capex_pumps_USD'] * pipe_length_ratio
+
+        # Calculate total CAPEX
+        total_capex = pipe_capex + hex_capex + pump_capex
+
+        return total_capex
+
+    def calculate_roi(self, cluster_set, phase):
+        """
+        Calculate ROI for a cluster set in a specific phase.
+
+        ROI = net annual return / CAPEX
+
+        Parameters:
+        -----------
+        cluster_set : tuple or list
+            Tuple or list of cluster IDs
+        phase : int
+            Phase number (1-based)
+
+        Returns:
+        --------
+        float
+            Return on Investment (ROI)
+        """
+        # Get metrics for this cluster set
+        key = '+'.join(map(str, sorted(cluster_set)))
+        if key not in self.cluster_metrics:
+            return -float('inf')  # Invalid cluster set
+
+        metrics = self.cluster_metrics[key]
+
+        # Calculate CAPEX
+        capex = self._calculate_phase_capex(cluster_set)
+
+        # Calculate annual revenue (energy price * annual demand)
+        if self.network_type == 'DH':
+            annual_demand_kwh = metrics['total_annual_Qh_MWh'] * 1000  # Convert MWh to kWh
+        else:
+            annual_demand_kwh = metrics['total_annual_Qc_MWh'] * 1000  # Convert MWh to kWh
+
+        annual_revenue = annual_demand_kwh * self.energy_price
+
+        # Calculate annual O&M costs (typically 2-3% of CAPEX)
+        annual_om_cost = 0.025 * capex
+
+        # Net annual return
+        net_annual_return = annual_revenue - annual_om_cost
+
+        # Calculate ROI (net annual return / CAPEX)
+        if capex > 0:
+            roi = net_annual_return / capex
+        else:
+            roi = 0
+
+        return roi
+
+    def calculate_npv(self, cluster_set, phase, years=20):
+        """
+        Calculate Net Present Value for a cluster set in a specific phase.
+
+        Parameters:
+        -----------
+        cluster_set : tuple or list
+            Tuple or list of cluster IDs
+        phase : int
+            Phase number (1-based)
+        years : int
+            Number of years for NPV calculation
+
+        Returns:
+        --------
+        float
+            Net Present Value (NPV)
+        """
+        # Get metrics for this cluster set
+        key = '+'.join(map(str, sorted(cluster_set)))
+        if key not in self.cluster_metrics:
+            return -float('inf')  # Invalid cluster set
+
+        metrics = self.cluster_metrics[key]
+
+        # Calculate CAPEX
+        capex = self._calculate_phase_capex(cluster_set)
+
+        # Calculate annual revenue and O&M costs
+        if self.network_type == 'DH':
+            annual_demand_kwh = metrics['total_annual_Qh_MWh'] * 1000  # Convert MWh to kWh
+        else:
+            annual_demand_kwh = metrics['total_annual_Qc_MWh'] * 1000  # Convert MWh to kWh
+
+        annual_revenue = annual_demand_kwh * self.energy_price
+        annual_om_cost = 0.025 * capex
+        net_annual_return = annual_revenue - annual_om_cost
+
+        # Apply discount factor based on phase
+        phase_year = phase - 1  # Phase 1 starts at year 0
+
+        # Calculate NPV
+        npv = -capex  # Initial investment (negative)
+        for year in range(years):
+            # Only start counting returns after the phase year
+            if year >= phase_year:
+                discount_factor = 1 / ((1 + self.interest_rate) ** (year + 1))
+                npv += net_annual_return * discount_factor
+
+        return npv
+
+    def _setup_genetic_algorithm(self):
+        """Set up the genetic algorithm using DEAP."""
+        # Define genome representation: each gene is a phase number (1 to num_phases)
+        # for each cluster (all clusters will be connected)
+        self.toolbox.register("attr_phase", random.randint, 1, self.num_phases)
+        self.toolbox.register("individual", tools.initRepeat, creator.Individual, 
+                             self.toolbox.attr_phase, n=len(self.all_clusters))
+        self.toolbox.register("population", tools.initRepeat, list, self.toolbox.individual)
+
+        # Register genetic operators
+        self.toolbox.register("evaluate", self._evaluate_individual)
+        self.toolbox.register("mate", tools.cxTwoPoint)
+        self.toolbox.register("mutate", tools.mutUniformInt, low=1, up=self.num_phases, indpb=0.2)
+        self.toolbox.register("select", tools.selTournament, tournsize=3)
+
+        # Register the map function (use the built-in map function)
+        self.toolbox.register("map", map)
+
+    def _evaluate_individual(self, individual):
+        """
+        Evaluate the fitness of an individual.
+
+        Parameters:
+        -----------
+        individual : list
+            List of phase assignments for each cluster
+
+        Returns:
+        --------
+        tuple
+            Fitness value (overall ROI)
+        """
+        # Convert individual to cluster-phase mapping
+        cluster_phase_map = {cluster: phase for cluster, phase in zip(self.all_clusters, individual)}
+
+        # Calculate total ROI across all phases
+        total_roi = 0
+        total_npv = 0
+
+        # Check if budget constraints are satisfied
+        phase_costs = [0] * self.num_phases
+
+        # Group clusters by phase
+        clusters_by_phase = {}
+        for cluster, phase in cluster_phase_map.items():
+            if phase > 0:  # Skip unconnected clusters (phase 0)
+                if phase not in clusters_by_phase:
+                    clusters_by_phase[phase] = []
+                clusters_by_phase[phase].append(cluster)
+
+        # Calculate ROI and costs for each phase
+        for phase, clusters in clusters_by_phase.items():
+            # Calculate CAPEX for this phase
+            capex = self._calculate_phase_capex(clusters)
+            phase_costs[phase-1] = capex
+
+            # Calculate ROI for this phase
+            roi = self.calculate_roi(tuple(clusters), phase)
+            npv = self.calculate_npv(tuple(clusters), phase)
+
+            total_roi += roi
+            total_npv += npv
+
+        # Check budget constraints
+        for phase in range(self.num_phases):
+            if phase < len(phase_costs) and phase_costs[phase] > self.budget_per_phase[phase]:
+                # Apply penalty for exceeding budget
+                total_roi = -1000
+                total_npv = -1000000
+                break
+
+        return (total_roi,)  # Return as tuple for DEAP
+
+    def optimize(self, population_size=50, num_generations=30):
+        """
+        Run the genetic algorithm to find the optimal phase assignment.
+
+        Parameters:
+        -----------
+        population_size : int
+            Size of the population
+        num_generations : int
+            Number of generations
+
+        Returns:
+        --------
+        dict
+            Dictionary with the optimal solution
+        """
+        # Create initial population
+        pop = self.toolbox.population(n=population_size)
+
+        # Evaluate the individuals with an invalid fitness
+        invalid_ind = [ind for ind in pop if not ind.fitness.valid]
+        fitnesses = self.toolbox.map(self.toolbox.evaluate, invalid_ind)
+
+        # Assign fitness values to individuals
+        for ind, fit in zip(invalid_ind, fitnesses):
+            ind.fitness.values = fit
+
+        # Track the best individual
+        hof = tools.HallOfFame(1)
+
+        # Track statistics
+        stats = tools.Statistics(lambda ind: ind.fitness.values)
+        stats.register("avg", np.mean)
+        stats.register("min", np.min)
+        stats.register("max", np.max)
+
+        # Run the genetic algorithm
+        pop, logbook = algorithms.eaSimple(pop, self.toolbox, cxpb=0.5, mutpb=0.2, 
+                                          ngen=num_generations, stats=stats, 
+                                          halloffame=hof, verbose=True)
+
+        # Get the best solution
+        best_individual = hof[0]
+
+        # Convert to cluster-phase mapping
+        solution = {
+            'cluster_phase_map': {cluster: phase for cluster, phase in 
+                                 zip(self.all_clusters, best_individual) if phase > 0},
+            'fitness': best_individual.fitness.values[0],
+            'phases': {}
+        }
+
+        # Group clusters by phase
+        for cluster, phase in solution['cluster_phase_map'].items():
+            if phase not in solution['phases']:
+                solution['phases'][phase] = []
+            solution['phases'][phase].append(cluster)
+
+        # Calculate metrics for each phase
+        for phase, clusters in solution['phases'].items():
+            solution[f'phase_{phase}_roi'] = self.calculate_roi(tuple(clusters), phase)
+            solution[f'phase_{phase}_npv'] = self.calculate_npv(tuple(clusters), phase)
+            solution[f'phase_{phase}_capex'] = self._calculate_phase_capex(clusters)
+
+        return solution
+
+    def save_results(self, solution):
+        """
+        Save optimization results to CSV.
+
+        Parameters:
+        -----------
+        solution : dict
+            Dictionary with the optimization solution
+        """
+        # Create output directory
+        output_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder())
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create a DataFrame with the results
+        results = []
+        total_capex = 0
+        total_npv = 0
+
+        # Determine the network type and demand type
+        if self.network_type == 'DH':
+            demand_type = 'Qh'
+        else:
+            demand_type = 'Qc'
+
+        # Track cumulative values
+        cumulative_clusters = {0}  # Start with cluster 0 (existing DTN)
+        cumulative_pipe_length = 0
+
+        # Get buildings in cluster 0 (existing DTN)
+        cluster0_buildings = self._get_buildings_in_specific_cluster(0)
+        cumulative_buildings = set(cluster0_buildings)
+
+        # Add a row for phase 0 (existing DTN)
+        phase0_result = {
+            'phase': 0,
+            'newly_connected_cluster(s)': '0',
+            'cumulative_cluster(s)': '0',
+            'number_of_newly_connected_buildings': len(cluster0_buildings),
+            'cumulative_number_of_buildings_connected': len(cluster0_buildings),
+            'roi [-]': 0,  # No ROI for existing DTN
+            'npv [USD]': 0,  # No NPV for existing DTN
+            'capex [USD]': 0,  # No CAPEX for existing DTN
+            'annual_revenue [USD/yr]': 0,  # No revenue for existing DTN in expansion calculation
+            'annual_om_cost [USD/yr]': 0,  # Will be calculated based on estimated CAPEX
+            f'annual_{demand_type} [MWh/yr]': 0,  # Will be calculated if data is available
+            'newly_added_pipe_length [m]': 0,  # No new pipes for existing DTN
+            'cumulative_pipe_length [m]': 0,  # Will be updated if data is available
+            f'newly_connected_linear_{demand_type}_density [MWh/km/yr]': 0,  # Will be calculated if data is available
+            f'overall_linear_{demand_type}_density [MWh/km/yr]': 0,  # Will be calculated if data is available
+            'budget [USD]': 0  # No budget for existing DTN
+        }
+
+        # Try to get metrics for cluster 0 if available
+        cluster0_key = '0'
+        if cluster0_key in self.cluster_metrics:
+            metrics = self.cluster_metrics[cluster0_key]
+            annual_demand = metrics.get(f'total_annual_{demand_type}_MWh', 0)
+            pipe_length = metrics.get('total_pipe_length_m', 0)
+
+            # Update phase 0 metrics
+            phase0_result[f'annual_{demand_type} [MWh/yr]'] = annual_demand
+            phase0_result['cumulative_pipe_length [m]'] = pipe_length
+            phase0_result[f'newly_connected_linear_{demand_type}_density [MWh/km/yr]'] = metrics.get(f'linear_{demand_type}_density_MWh_per_km', 0)
+            phase0_result[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = metrics.get(f'linear_{demand_type}_density_MWh_per_km', 0)
+
+            # Calculate annual revenue for cluster 0 (not counted in expansion ROI)
+            annual_demand_kwh = annual_demand * 1000  # Convert MWh to kWh
+            phase0_result['annual_revenue [USD/yr]'] = annual_demand_kwh * self.energy_price
+
+            # Estimate CAPEX for cluster 0 (for O&M calculation only, not counted in expansion costs)
+            estimated_capex = 0
+            if self.cost_model == 'detailed':
+                estimated_capex = self.calculate_detailed_capex((0,))
+            else:
+                estimated_capex = self.calculate_simplified_capex((0,))
+
+            # Calculate O&M costs for cluster 0
+            phase0_result['annual_om_cost [USD/yr]'] = 0.025 * estimated_capex
+
+            # Update cumulative pipe length
+            cumulative_pipe_length = pipe_length
+
+        results.append(phase0_result)
+
+        # Calculate metrics for each phase
+        for phase, clusters in sorted(solution['phases'].items()):
+            # Get metrics for this cluster set
+            key = '+'.join(map(str, sorted(clusters)))
+            metrics = self.cluster_metrics.get(key, {})
+
+            # Calculate financial metrics
+            roi = solution[f'phase_{phase}_roi']
+            npv = solution[f'phase_{phase}_npv']
+            capex = solution[f'phase_{phase}_capex']
+
+            # Calculate annual O&M costs (2.5% of CAPEX)
+            annual_om_cost = 0.025 * capex
+
+            # Calculate annual revenue
+            annual_demand_kwh = metrics.get(f'total_annual_{demand_type}_MWh', 0) * 1000  # Convert MWh to kWh
+            annual_revenue = annual_demand_kwh * self.energy_price
+
+            # Get pipe length and linear heat density
+            pipe_length = metrics.get('total_pipe_length_m', 0)
+            linear_heat_density = metrics.get(f'linear_{demand_type}_density_MWh_per_km', 0)
+
+            # Get buildings in each cluster individually
+            newly_connected_buildings = set()
+            for cluster in clusters:
+                cluster_buildings = self._get_buildings_in_specific_cluster(cluster)
+                newly_connected_buildings.update(cluster_buildings)
+
+            num_newly_connected_buildings = len(newly_connected_buildings)
+
+            # Update cumulative values
+            cumulative_clusters.update(clusters)
+            cumulative_pipe_length += pipe_length
+            cumulative_buildings.update(newly_connected_buildings)
+
+            # Calculate overall linear heat density for all connected clusters so far
+            overall_annual_demand = sum(r[f'annual_{demand_type} [MWh/yr]'] for r in results)
+            overall_annual_demand += metrics.get(f'total_annual_{demand_type}_MWh', 0)
+            overall_linear_density = overall_annual_demand / (cumulative_pipe_length / 1000) if cumulative_pipe_length > 0 else 0
+
+            # Add to totals
+            total_capex += capex
+            total_npv += npv
+
+            # Create result dictionary with units
+            # Note: All costs are in USD as per the internal calculations (e.g., Inv_USD2015perm, capex_hex_USD)
+            result = {
+                'phase': phase,
+                'newly_connected_cluster(s)': '+'.join(map(str, sorted(clusters))),
+                'cumulative_cluster(s)': '+'.join(map(str, sorted(cumulative_clusters))),
+                'number_of_newly_connected_buildings': num_newly_connected_buildings,
+                'cumulative_number_of_buildings_connected': len(cumulative_buildings),
+                'roi [-]': roi,
+                'npv [USD]': npv,
+                'capex [USD]': capex,
+                'annual_revenue [USD/yr]': annual_revenue,
+                'annual_om_cost [USD/yr]': annual_om_cost,
+                f'annual_{demand_type} [MWh/yr]': metrics.get(f'total_annual_{demand_type}_MWh', 0),
+                'newly_added_pipe_length [m]': pipe_length,
+                'cumulative_pipe_length [m]': cumulative_pipe_length,
+                f'newly_connected_linear_{demand_type}_density [MWh/km/yr]': linear_heat_density,
+                f'overall_linear_{demand_type}_density [MWh/km/yr]': overall_linear_density,
+                'budget [USD]': self.budget_per_phase[phase-1] if phase-1 < len(self.budget_per_phase) else 0
+            }
+
+            results.append(result)
+
+        # Calculate overall ROI (excluding phase 0)
+        phase_results = [result for result in results if result['phase'] != 0]
+        overall_roi = sum(result['roi [-]'] * result['capex [USD]'] for result in phase_results) / total_capex if total_capex > 0 else 0
+
+        # Create DataFrame
+        results_df = pd.DataFrame(results)
+
+        # Add overall summary row
+        summary = {
+            'phase': 'Total',
+            'newly_connected_cluster(s)': 'All',
+            'cumulative_cluster(s)': '+'.join(map(str, sorted(cumulative_clusters))),
+            'number_of_newly_connected_buildings': sum(result['number_of_newly_connected_buildings'] for result in results),
+            'cumulative_number_of_buildings_connected': len(cumulative_buildings),
+            'roi [-]': overall_roi,
+            'npv [USD]': total_npv,
+            'capex [USD]': total_capex,
+            'annual_revenue [USD/yr]': sum(result['annual_revenue [USD/yr]'] for result in results),
+            'annual_om_cost [USD/yr]': sum(result['annual_om_cost [USD/yr]'] for result in results),
+            f'annual_{demand_type} [MWh/yr]': sum(result[f'annual_{demand_type} [MWh/yr]'] for result in results),
+            'newly_added_pipe_length [m]': sum(result['newly_added_pipe_length [m]'] for result in results),
+            'cumulative_pipe_length [m]': cumulative_pipe_length,
+            f'newly_connected_linear_{demand_type}_density [MWh/km/yr]': 0,  # Average of all phases
+            f'overall_linear_{demand_type}_density [MWh/km/yr]': 0,  # Will be calculated below
+            'budget [USD]': sum(self.budget_per_phase)
+        }
+
+        # Calculate overall linear heat density
+        if summary['cumulative_pipe_length [m]'] > 0:
+            summary[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = summary[f'annual_{demand_type} [MWh/yr]'] / (summary['cumulative_pipe_length [m]'] / 1000)
+
+        # Calculate average newly connected linear heat density (weighted by pipe length)
+        total_pipe_length = sum(result['newly_added_pipe_length [m]'] for result in results if result['phase'] != 0)
+        if total_pipe_length > 0:
+            summary[f'newly_connected_linear_{demand_type}_density [MWh/km/yr]'] = sum(
+                result[f'newly_connected_linear_{demand_type}_density [MWh/km/yr]'] * result['newly_added_pipe_length [m]'] 
+                for result in results if result['phase'] != 0
+            ) / total_pipe_length
+
+        # Append summary row
+        results_df = pd.concat([results_df, pd.DataFrame([summary])], ignore_index=True)
+
+        # Add optimization settings as metadata
+        metadata = {
+            'network_type': self.network_type,
+            'num_phases': self.num_phases,
+            'cost_model': self.cost_model,
+            'energy_price [USD/kWh]': self.energy_price,
+            'interest_rate [-]': self.interest_rate,
+            'budget_per_phase [USD]': ','.join(map(str, self.budget_per_phase))
+        }
+
+        # Save metadata to a separate CSV
+        metadata_df = pd.DataFrame([metadata])
+        metadata_file = output_dir / "optimization_settings.csv"
+        metadata_df.to_csv(metadata_file, index=False)
+
+        # Save results to CSV
+        results_file = output_dir / "optimization_results.csv"
+        results_df.to_csv(results_file, index=False)
+
+        log().info(f"Optimization results saved to {results_file}")
+        log().info(f"Optimization settings saved to {metadata_file}")
+
+        return results_file
+
 class PipeLayoutGenerator:
     """Generate pipe layouts for different sets of clusters and calculate metrics."""
 
@@ -509,6 +1249,13 @@ class PipeLayoutGenerator:
 
         # Calculate metrics for each combination
         all_metrics = []
+
+        # Calculate metrics for cluster 0 alone first
+        cluster0_pipes = self.get_required_pipes_for_clusters((0,))
+        cluster0_metrics = self.calculate_metrics((0,), cluster0_pipes)
+        all_metrics.append(cluster0_metrics)
+        log().info(f"Calculated metrics for cluster 0 (existing DTN)")
+
         for i, cluster_set in enumerate(all_combinations):
             if i % 100 == 0 and i > 0:
                 log().info(f"Processed {i}/{len(all_combinations)} cluster combinations")
@@ -528,6 +1275,7 @@ class PipeLayoutGenerator:
         metrics_df.to_csv(output_file, index=False)
         log().info(f"Saved metrics for {len(all_metrics)} cluster combinations to {output_file}")
 
+        # Return the metrics DataFrame for use by the optimizer
         return metrics_df
 
 
@@ -604,10 +1352,62 @@ def main(config):
         chosen_clusters=chosen_clusters,
         chosen_buildings=chosen_buildings
     )
-    pipe_layout_generator.generate_pipe_layouts()
+    metrics_df = pipe_layout_generator.generate_pipe_layouts()
+
+    # Run optimization if requested
+    if hasattr(config.dtn_expansion_optimization, 'run_optimization') and config.dtn_expansion_optimization.run_optimization:
+        log().info("Starting DTN expansion optimization...")
+
+        # Get optimization parameters from config
+        num_phases = config.dtn_expansion_optimization.num_phases if hasattr(config.dtn_expansion_optimization, 'num_phases') else 3
+
+        # Get budget per phase from config
+        budget_per_phase = None
+        if hasattr(config.dtn_expansion_optimization, 'budget_per_phase') and config.dtn_expansion_optimization.budget_per_phase:
+            budget_str = config.dtn_expansion_optimization.budget_per_phase
+            if isinstance(budget_str, str):
+                budget_per_phase = [float(b.strip()) for b in budget_str.split(',') if b.strip()]
+
+        # Get energy price and interest rate from config
+        energy_price = config.dtn_expansion_optimization.energy_price if hasattr(config.dtn_expansion_optimization, 'energy_price') else 0.1
+        interest_rate = config.dtn_expansion_optimization.interest_rate if hasattr(config.dtn_expansion_optimization, 'interest_rate') else 0.05
+
+        # Get cost model from config
+        cost_model = config.dtn_expansion_optimization.cost_model if hasattr(config.dtn_expansion_optimization, 'cost_model') else 'detailed'
+
+        # Get population size and number of generations from config
+        population_size = config.dtn_expansion_optimization.population_size if hasattr(config.dtn_expansion_optimization, 'population_size') else 50
+        num_generations = config.dtn_expansion_optimization.num_generations if hasattr(config.dtn_expansion_optimization, 'num_generations') else 30
+
+        # Create optimizer
+        optimizer = DTNExpansionOptimizer(
+            locator=locator,
+            network_type=network_type,
+            metrics_df=metrics_df,
+            num_phases=num_phases,
+            budget_per_phase=budget_per_phase,
+            energy_price=energy_price,
+            interest_rate=interest_rate,
+            cost_model=cost_model
+        )
+
+        # Run optimization
+        solution = optimizer.optimize(
+            population_size=population_size,
+            num_generations=num_generations
+        )
+
+        # Save results
+        optimizer.save_results(solution)
+
+        log().info("DTN expansion optimization completed successfully.")
+    else:
+        log().info("Optimization not run. To run optimization, use --run_optimization true parameter.")
 
     # Print final completion message
     total_time = time.time() - start_time
+    if not (hasattr(config.dtn_expansion_optimization, 'run_optimization') and config.dtn_expansion_optimization.run_optimization):
+        log().info("Note: Optimization was not run. To run optimization, use --run_optimization true parameter.")
     log().info(f"DTN expansion optimization completed successfully in {total_time:.2f} seconds.")
 
 if __name__ == "__main__":

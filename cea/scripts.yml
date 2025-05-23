@@ -335,7 +335,10 @@ Energy Supply System Optimisation:
     module: cea.optimization_new.DTN_expansion_optimization
     parameters: [ 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free',
                   'thermal-network', 'network-layout', 'district-network-optimization',
-                  'dtn-expansion-optimization:network-type', 'dtn-expansion-optimization:chosen-clusters', 'dtn-expansion-optimization:chosen-buildings' ]
+                  'dtn-expansion-optimization:network-type', 'dtn-expansion-optimization:chosen-clusters', 'dtn-expansion-optimization:chosen-buildings',
+                  'dtn-expansion-optimization:run-optimization', 'dtn-expansion-optimization:budget-per-phase', 'dtn-expansion-optimization:cost-model',
+                  'dtn-expansion-optimization:num-phases', 'dtn-expansion-optimization:energy-price', 'dtn-expansion-optimization:interest-rate',
+                  'dtn-expansion-optimization:population-size', 'dtn-expansion-optimization:num-generations' ]
     input-files:
       - [get_street_network]
       - [get_total_demand]

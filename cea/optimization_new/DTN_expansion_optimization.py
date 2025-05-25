@@ -251,7 +251,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Assign network nodes/edges to building clusters")
     p.add_argument("scenario", help="CEA scenario root folder")
     p.add_argument("--network-type", choices=["DH","DC"], default="DH")
-    p.add_argument("--chosen-clusters", help="Comma-separated list of cluster IDs to include (e.g., '1,3,4')")
+    p.add_argument("--chosen-clusters", help="Comma-separated list of cluster IDs to include (e.g., '1,3,4') in DTN expansion optimization. Useful for testing when only Thermal Network Part 2: simulation and Part 3: costs of certain building clusters are available.")
     p.add_argument("--chosen-buildings", help="Comma-separated list of building names to include")
     return p.parse_args()
 
@@ -320,7 +320,12 @@ class DTNExpansionOptimizer:
                  metrics_df: pd.DataFrame, num_phases: int = 3, 
                  budget_per_phase: Optional[List[float]] = None, 
                  energy_price: float = 0.1, interest_rate: float = 0.05,
-                 cost_model: str = 'detailed'):
+                 cost_model: str = 'detailed', objective_function: str = 'NPV',
+                 diversity_factor: float = 0.7,
+                 temperature_difference_dh: float = 20, temperature_difference_dc: float = 10,
+                 pressure_loss_pa_per_m: float = 200, pump_operation_hours: int = 4000,
+                 pump_efficiency: float = 0.5, pump_capex_a: float = 1230, pump_capex_b: float = 0.65,
+                 cooling_cop: float = 4.0, ghg_budget_per_phase: Optional[List[float]] = None):
         """
         Initialize the DTN expansion optimizer.
 
@@ -342,6 +347,28 @@ class DTNExpansionOptimizer:
             Annual interest rate for NPV calculations
         cost_model : str
             Method for calculating pipe costs ('simplified' or 'detailed')
+        objective_function : str
+            Objective function to maximize ('NPV' or 'ROI')
+        diversity_factor : float
+            Typical diversity factor for district energy systems (used to convert annual demand to peak demand)
+        temperature_difference_dh : float
+            Temperature difference in Kelvin for district heating networks
+        temperature_difference_dc : float
+            Temperature difference in Kelvin for district cooling networks
+        pressure_loss_pa_per_m : float
+            Pressure loss in Pa/m for pipe sizing
+        pump_operation_hours : int
+            Annual operation hours for pumps
+        pump_efficiency : float
+            Pump efficiency (fraction between 0 and 1)
+        pump_capex_a : float
+            Coefficient 'a' in pump CAPEX formula: a * (pump_power / 1000) ^ b
+        pump_capex_b : float
+            Exponent 'b' in pump CAPEX formula: a * (pump_power / 1000) ^ b
+        cooling_cop : float
+            Coefficient of Performance (COP) for cooling plants
+        ghg_budget_per_phase : list, optional
+            GHG emission budgets for each phase (in tonCO2)
         """
         self.locator = locator
         self.network_type = network_type
@@ -351,6 +378,17 @@ class DTNExpansionOptimizer:
         self.energy_price = energy_price
         self.interest_rate = interest_rate
         self.cost_model = cost_model
+        self.objective_function = objective_function
+        self.diversity_factor = diversity_factor
+        self.temperature_difference_dh = temperature_difference_dh
+        self.temperature_difference_dc = temperature_difference_dc
+        self.pressure_loss_pa_per_m = pressure_loss_pa_per_m
+        self.pump_operation_hours = pump_operation_hours
+        self.pump_efficiency = pump_efficiency
+        self.pump_capex_a = pump_capex_a
+        self.pump_capex_b = pump_capex_b
+        self.cooling_cop = cooling_cop
+        self.ghg_budget_per_phase = ghg_budget_per_phase
 
         # Load cost data from TN part 3 results
         self.cost_data = self._load_cost_data()
@@ -561,6 +599,67 @@ class DTNExpansionOptimizer:
 
         return total_pipe_cost
 
+    def calculate_pump_costs(self, cluster_set):
+        """
+        Calculate pump costs using the detailed model with configurable parameters.
+
+        Parameters:
+        -----------
+        cluster_set : tuple or list
+            Tuple or list of cluster IDs
+
+        Returns:
+        --------
+        tuple
+            (pump_capex, annual_pump_electricity) - Total pump CAPEX and annual electricity consumption
+        """
+        # Get required pipes for this set of clusters
+        required_pipes = self.get_required_pipes_for_clusters(cluster_set)
+
+        # Calculate total pipe length
+        total_pipe_length = required_pipes['length_m'].sum()
+
+        # Get temperature difference based on network type
+        if self.network_type == 'DH':
+            temp_diff = self.temperature_difference_dh
+        else:
+            temp_diff = self.temperature_difference_dc
+
+        # Calculate mass flow rate (kg/s) based on thermal demand
+        key = '+'.join(map(str, sorted(cluster_set)))
+        if key in self.cluster_metrics:
+            metrics = self.cluster_metrics[key]
+            if self.network_type == 'DH':
+                annual_demand_mwh = metrics.get('total_annual_Qh_MWh', 0)
+            else:
+                annual_demand_mwh = metrics.get('total_annual_Qc_MWh', 0)
+
+            # Convert annual demand to peak demand (kW) using the diversity factor
+            peak_demand_kw = annual_demand_mwh * 1000 / 2000 / self.diversity_factor  # Assuming 2000 equivalent full load hours
+
+            # Calculate mass flow rate (kg/s)
+            mass_flow_rate = peak_demand_kw / (HEAT_CAPACITY_OF_WATER_JPERKGK * temp_diff / 1000)
+        else:
+            # Fallback if metrics not available
+            mass_flow_rate = 0
+
+        # Calculate pressure loss
+        pressure_loss = self.pressure_loss_pa_per_m * total_pipe_length
+
+        # Calculate pump power (W)
+        if mass_flow_rate > 0:
+            pump_power = mass_flow_rate * pressure_loss / (self.pump_efficiency * 1000)  # W
+        else:
+            pump_power = 0
+
+        # Calculate pump CAPEX based on pump power using configurable formula
+        pump_capex = self.pump_capex_a * (pump_power / 1000) ** self.pump_capex_b  # USD
+
+        # Calculate annual pump electricity consumption
+        annual_pump_electricity = pump_power * self.pump_operation_hours * 0.5  # Wh (50% load for operation hours)
+
+        return pump_capex, annual_pump_electricity
+
     def _calculate_phase_capex(self, cluster_set):
         """
         Calculate total CAPEX for a phase.
@@ -587,10 +686,15 @@ class DTNExpansionOptimizer:
         # Calculate heat exchanger costs based on number of buildings
         hex_capex = len(buildings) * (self.cost_data['capex_hex_USD'] / self.total_buildings)
 
-        # Calculate pump costs based on pipe length ratio
-        required_pipes = self.get_required_pipes_for_clusters(cluster_set)
-        pipe_length_ratio = required_pipes['length_m'].sum() / self.cost_data['network_length_m']
-        pump_capex = self.cost_data['capex_pumps_USD'] * pipe_length_ratio
+        # Calculate pump costs based on selected cost model
+        if self.cost_model == 'detailed':
+            # Use the detailed pump cost calculation with configurable parameters
+            pump_capex, _ = self.calculate_pump_costs(cluster_set)
+        else:
+            # Use the simplified approach based on pipe length ratio
+            required_pipes = self.get_required_pipes_for_clusters(cluster_set)
+            pipe_length_ratio = required_pipes['length_m'].sum() / self.cost_data['network_length_m']
+            pump_capex = self.cost_data['capex_pumps_USD'] * pipe_length_ratio
 
         # Calculate total CAPEX
         total_capex = pipe_capex + hex_capex + pump_capex
@@ -698,6 +802,41 @@ class DTNExpansionOptimizer:
 
         return npv
 
+    def calculate_ghg_emissions(self, cluster_set):
+        """
+        Calculate GHG emissions for a cluster set.
+
+        Parameters:
+        -----------
+        cluster_set : tuple or list
+            Tuple or list of cluster IDs
+
+        Returns:
+        --------
+        float
+            Total GHG emissions in tonCO2
+        """
+        # Get metrics for this cluster set
+        key = '+'.join(map(str, sorted(cluster_set)))
+        if key not in self.cluster_metrics:
+            return 0  # No emissions data available
+
+        metrics = self.cluster_metrics[key]
+
+        # For now, use a simplified approach based on energy demand
+        # In a real implementation, this would use actual emissions factors
+        if self.network_type == 'DH':
+            annual_demand_mwh = metrics.get('total_annual_Qh_MWh', 0)
+            emissions_factor = 0.2  # tonCO2/MWh for heating (example value)
+        else:
+            annual_demand_mwh = metrics.get('total_annual_Qc_MWh', 0)
+            emissions_factor = 0.15  # tonCO2/MWh for cooling (example value)
+
+        # Calculate emissions
+        emissions = annual_demand_mwh * emissions_factor
+
+        return emissions
+
     def _setup_genetic_algorithm(self):
         """Set up the genetic algorithm using DEAP."""
         # Define genome representation: each gene is a phase number (1 to num_phases)
@@ -728,17 +867,21 @@ class DTNExpansionOptimizer:
         Returns:
         --------
         tuple
-            Fitness value (overall ROI)
+            Fitness value (NPV or ROI based on objective function)
         """
         # Convert individual to cluster-phase mapping
         cluster_phase_map = {cluster: phase for cluster, phase in zip(self.all_clusters, individual)}
 
-        # Calculate total ROI across all phases
+        # Calculate total ROI and NPV across all phases
         total_roi = 0
         total_npv = 0
 
         # Check if budget constraints are satisfied
         phase_costs = [0] * self.num_phases
+
+        # Check if GHG budget constraints are satisfied
+        if self.ghg_budget_per_phase:
+            phase_ghg = [0] * self.num_phases
 
         # Group clusters by phase
         clusters_by_phase = {}
@@ -748,15 +891,20 @@ class DTNExpansionOptimizer:
                     clusters_by_phase[phase] = []
                 clusters_by_phase[phase].append(cluster)
 
-        # Calculate ROI and costs for each phase
+        # Calculate ROI, NPV, and costs for each phase
         for phase, clusters in clusters_by_phase.items():
             # Calculate CAPEX for this phase
             capex = self._calculate_phase_capex(clusters)
             phase_costs[phase-1] = capex
 
-            # Calculate ROI for this phase
+            # Calculate ROI and NPV for this phase
             roi = self.calculate_roi(tuple(clusters), phase)
             npv = self.calculate_npv(tuple(clusters), phase)
+
+            # Calculate GHG emissions if budget is specified
+            if self.ghg_budget_per_phase:
+                ghg_emissions = self.calculate_ghg_emissions(tuple(clusters))
+                phase_ghg[phase-1] = ghg_emissions
 
             total_roi += roi
             total_npv += npv
@@ -769,7 +917,20 @@ class DTNExpansionOptimizer:
                 total_npv = -1000000
                 break
 
-        return (total_roi,)  # Return as tuple for DEAP
+        # Check GHG budget constraints if specified
+        if self.ghg_budget_per_phase:
+            for phase in range(self.num_phases):
+                if phase < len(phase_ghg) and self.ghg_budget_per_phase[phase] > 0 and phase_ghg[phase] > self.ghg_budget_per_phase[phase]:
+                    # Apply penalty for exceeding GHG budget
+                    total_roi = -1000
+                    total_npv = -1000000
+                    break
+
+        # Return fitness based on selected objective function
+        if self.objective_function == 'ROI':
+            return (total_roi,)
+        else:  # Default to NPV
+            return (total_npv,)
 
     def optimize(self, population_size=50, num_generations=30):
         """
@@ -1076,10 +1237,24 @@ class DTNExpansionOptimizer:
             'network_type': self.network_type,
             'num_phases': self.num_phases,
             'cost_model': self.cost_model,
+            'objective_function': self.objective_function,
             'energy_price [USD/kWh]': self.energy_price,
             'interest_rate [-]': self.interest_rate,
-            'budget_per_phase [USD]': ','.join(map(str, self.budget_per_phase))
+            'budget_per_phase [USD]': ','.join(map(str, self.budget_per_phase)),
+            'diversity_factor [-]': self.diversity_factor,
+            'temperature_difference_dh [K]': self.temperature_difference_dh,
+            'temperature_difference_dc [K]': self.temperature_difference_dc,
+            'pressure_loss_pa_per_m [Pa/m]': self.pressure_loss_pa_per_m,
+            'pump_operation_hours [h]': self.pump_operation_hours,
+            'pump_efficiency [-]': self.pump_efficiency,
+            'pump_capex_a': self.pump_capex_a,
+            'pump_capex_b': self.pump_capex_b,
+            'cooling_cop [-]': self.cooling_cop
         }
+
+        # Add GHG budget if specified
+        if self.ghg_budget_per_phase:
+            metadata['ghg_budget_per_phase [tonCO2]'] = ','.join(map(str, self.ghg_budget_per_phase))
 
         # Save metadata to a separate CSV
         metadata_df = pd.DataFrame([metadata])
@@ -1360,8 +1535,8 @@ def main(config):
     if args and args.network_type:
         network_type = args.network_type
 
-    # Get chosen clusters and buildings from command line arguments or config
-    chosen_clusters = config.dtn_expansion_optimization.chosen_clusters
+    # Get testing clusters and buildings from command line arguments or config
+    chosen_clusters = config.dtn_expansion_optimization.testing_clusters
     chosen_buildings = config.dtn_expansion_optimization.chosen_buildings
 
     # Override with command line arguments if provided
@@ -1430,6 +1605,27 @@ def main(config):
         # Get cost model from config
         cost_model = config.dtn_expansion_optimization.cost_model if hasattr(config.dtn_expansion_optimization, 'cost_model') else 'detailed'
 
+        # Get objective function from config
+        objective_function = config.dtn_expansion_optimization.objective_function if hasattr(config.dtn_expansion_optimization, 'objective_function') else 'NPV'
+
+        # Get detailed cost model parameters from config
+        diversity_factor = config.dtn_expansion_optimization.diversity_factor if hasattr(config.dtn_expansion_optimization, 'diversity_factor') else 0.7
+        temperature_difference_dh = config.dtn_expansion_optimization.temperature_difference_dh if hasattr(config.dtn_expansion_optimization, 'temperature_difference_dh') else 20
+        temperature_difference_dc = config.dtn_expansion_optimization.temperature_difference_dc if hasattr(config.dtn_expansion_optimization, 'temperature_difference_dc') else 10
+        pressure_loss_pa_per_m = config.dtn_expansion_optimization.pressure_loss_pa_per_m if hasattr(config.dtn_expansion_optimization, 'pressure_loss_pa_per_m') else 200
+        pump_operation_hours = config.dtn_expansion_optimization.pump_operation_hours if hasattr(config.dtn_expansion_optimization, 'pump_operation_hours') else 4000
+        pump_efficiency = config.dtn_expansion_optimization.pump_efficiency if hasattr(config.dtn_expansion_optimization, 'pump_efficiency') else 0.5
+        pump_capex_a = config.dtn_expansion_optimization.pump_capex_a if hasattr(config.dtn_expansion_optimization, 'pump_capex_a') else 1230
+        pump_capex_b = config.dtn_expansion_optimization.pump_capex_b if hasattr(config.dtn_expansion_optimization, 'pump_capex_b') else 0.65
+        cooling_cop = config.dtn_expansion_optimization.cooling_cop if hasattr(config.dtn_expansion_optimization, 'cooling_cop') else 4.0
+
+        # Get GHG budget per phase from config
+        ghg_budget_per_phase = None
+        if hasattr(config.dtn_expansion_optimization, 'ghg_budget_per_phase') and config.dtn_expansion_optimization.ghg_budget_per_phase:
+            ghg_str = config.dtn_expansion_optimization.ghg_budget_per_phase
+            if isinstance(ghg_str, str):
+                ghg_budget_per_phase = [float(g.strip()) for g in ghg_str.split(',') if g.strip()]
+
         # Get population size and number of generations from config
         population_size = config.dtn_expansion_optimization.population_size if hasattr(config.dtn_expansion_optimization, 'population_size') else 50
         num_generations = config.dtn_expansion_optimization.num_generations if hasattr(config.dtn_expansion_optimization, 'num_generations') else 30
@@ -1443,7 +1639,18 @@ def main(config):
             budget_per_phase=budget_per_phase,
             energy_price=energy_price,
             interest_rate=interest_rate,
-            cost_model=cost_model
+            cost_model=cost_model,
+            objective_function=objective_function,
+            diversity_factor=diversity_factor,
+            temperature_difference_dh=temperature_difference_dh,
+            temperature_difference_dc=temperature_difference_dc,
+            pressure_loss_pa_per_m=pressure_loss_pa_per_m,
+            pump_operation_hours=pump_operation_hours,
+            pump_efficiency=pump_efficiency,
+            pump_capex_a=pump_capex_a,
+            pump_capex_b=pump_capex_b,
+            cooling_cop=cooling_cop,
+            ghg_budget_per_phase=ghg_budget_per_phase
         )
 
         # Run optimization

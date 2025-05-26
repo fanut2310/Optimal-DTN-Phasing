@@ -343,7 +343,7 @@ Energy Supply System Optimisation:
                   'dtn-expansion-optimization:diversity-factor', 'dtn-expansion-optimization:temperature-difference-dh', 
                   'dtn-expansion-optimization:temperature-difference-dc', 'dtn-expansion-optimization:pressure-loss-pa-per-m',
                   'dtn-expansion-optimization:pump-operation-hours', 'dtn-expansion-optimization:pump-efficiency',
-                  'dtn-expansion-optimization:pump-capex-a', 'dtn-expansion-optimization:pump-capex-b',
+                  'dtn-expansion-optimization:pump-load-factor', 'dtn-expansion-optimization:pump-capex-a', 'dtn-expansion-optimization:pump-capex-b',
                   'dtn-expansion-optimization:cooling-cop', 'dtn-expansion-optimization:ghg-budget-per-phase' ]
     input-files:
       - [get_street_network]

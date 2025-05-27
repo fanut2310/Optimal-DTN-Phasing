@@ -490,18 +490,65 @@ class DTNExpansionOptimizer:
         # Include cluster 0 (existing DTN) in the set
         clusters_to_connect = set(cluster_set).union({0})
 
+        # Ensure cluster, from_C, and to_C columns are numeric for comparison
+        try:
+            # Make a copy to avoid SettingWithCopyWarning
+            cluster_edges_df = self.cluster_edges.copy()
+            # Convert columns to numeric, errors='coerce' will convert non-numeric values to NaN
+            for col in ['cluster', 'from_C', 'to_C']:
+                if col in cluster_edges_df.columns:
+                    cluster_edges_df[col] = pd.to_numeric(cluster_edges_df[col], errors='coerce')
+                    # Fill NaN with a value that won't match our filters
+                    cluster_edges_df[col] = cluster_edges_df[col].fillna(-999)
+        except Exception as e:
+            log().warning(f"Error converting columns to numeric: {e}. Using original dataframe.")
+            cluster_edges_df = self.cluster_edges
+
         # Get edges that belong to the clusters in the set
-        cluster_edges = self.cluster_edges[self.cluster_edges['cluster'].isin(clusters_to_connect)]
+        cluster_edges = cluster_edges_df[cluster_edges_df['cluster'].isin(clusters_to_connect)]
 
         # Get main road edges (-1) that connect the clusters
-        main_road_edges = self.cluster_edges[
-            (self.cluster_edges['cluster'] == -1) & 
-            (self.cluster_edges['from_C'].isin(clusters_to_connect)) & 
-            (self.cluster_edges['to_C'].isin(clusters_to_connect))
+        main_road_edges = cluster_edges_df[
+            (cluster_edges_df['cluster'] == -1) & 
+            (cluster_edges_df['from_C'].isin(clusters_to_connect)) & 
+            (cluster_edges_df['to_C'].isin(clusters_to_connect))
         ]
 
-        # Combine the edges
-        required_pipes = pd.concat([cluster_edges, main_road_edges])
+        # Combine the edges with error handling
+        try:
+            # First, try to concatenate with default settings
+            required_pipes = pd.concat([cluster_edges, main_road_edges])
+        except Exception as e:
+            log().warning(f"Error during dataframe concatenation: {e}")
+
+            # If that fails, try with more explicit settings
+            try:
+                # Reset index to avoid index-related issues
+                cluster_edges_reset = cluster_edges.reset_index(drop=True)
+                main_road_edges_reset = main_road_edges.reset_index(drop=True)
+
+                # Try concatenation with ignore_index=True
+                required_pipes = pd.concat([cluster_edges_reset, main_road_edges_reset], ignore_index=True)
+            except Exception as e2:
+                log().error(f"Failed to concatenate dataframes even with reset_index: {e2}")
+
+                # As a last resort, if one of the dataframes is empty, return the other
+                if len(cluster_edges) == 0:
+                    required_pipes = main_road_edges
+                elif len(main_road_edges) == 0:
+                    required_pipes = cluster_edges
+                else:
+                    # If both have data but can't be concatenated, try to create a new dataframe with common columns
+                    common_columns = set(cluster_edges.columns).intersection(set(main_road_edges.columns))
+                    if common_columns:
+                        log().warning(f"Using only common columns for concatenation: {common_columns}")
+                        required_pipes = pd.concat([
+                            cluster_edges[list(common_columns)], 
+                            main_road_edges[list(common_columns)]
+                        ], ignore_index=True)
+                    else:
+                        # If no solution works, raise an error
+                        raise ValueError("Cannot concatenate dataframes - no common columns found")
 
         return required_pipes
 
@@ -569,19 +616,24 @@ class DTNExpansionOptimizer:
         # Get edges for this cluster set
         required_pipes = self.get_required_pipes_for_clusters(cluster_set)
 
-        # Load pipe cost data
-        piping_cost_data = pd.read_csv(self.locator.get_database_components_distribution_thermal_grid('THERMAL_GRID'))
+        try:
+            # Load pipe cost data
+            piping_cost_data = pd.read_csv(self.locator.get_database_components_distribution_thermal_grid('THERMAL_GRID'))
 
-        # Merge with cost data
-        cost_df = required_pipes.merge(piping_cost_data, on='pipe_DN')
+            # Merge with cost data
+            cost_df = required_pipes.merge(piping_cost_data, on='pipe_DN')
 
-        # Calculate cost for each pipe segment
-        cost_df['pipe_cost'] = cost_df['Inv_USD2015perm'] * cost_df['length_m']
+            # Calculate cost for each pipe segment
+            cost_df['pipe_cost'] = cost_df['Inv_USD2015perm'] * cost_df['length_m']
 
-        # Sum up all pipe costs
-        total_pipe_cost = cost_df['pipe_cost'].sum()
+            # Sum up all pipe costs
+            total_pipe_cost = cost_df['pipe_cost'].sum()
 
-        return total_pipe_cost
+            return total_pipe_cost
+        except Exception as e:
+            log().warning(f"Error in detailed CAPEX calculation: {e}. Falling back to simplified calculation.")
+            # Fall back to simplified calculation
+            return self.calculate_simplified_capex(cluster_set)
 
     def calculate_simplified_capex(self, cluster_set):
         """
@@ -1074,9 +1126,14 @@ class DTNExpansionOptimizer:
                     emission_factor_kgco2_per_mj = grid_factors['GHG_kgCO2MJ'].mean()
                     log().info(f"Using grid emission factor: {emission_factor_kgco2_per_mj} kgCO2/MJ")
 
-                    # If still zero, use default values
+                    # If still zero, use default values based on network type
                     if emission_factor_kgco2_per_mj == 0:
-                        return self._calculate_simplified_emissions(annual_demand_mwh, demand_type)
+                        if self.network_type == 'DH':
+                            emission_factor_kgco2_per_mj = 0.0556  # 0.2 kgCO2/kWh converted to kgCO2/MJ
+                            log().info(f"Using default DH emission factor: {emission_factor_kgco2_per_mj} kgCO2/MJ")
+                        else:
+                            emission_factor_kgco2_per_mj = 0.0417  # 0.15 kgCO2/kWh converted to kgCO2/MJ
+                            log().info(f"Using default DC emission factor: {emission_factor_kgco2_per_mj} kgCO2/MJ")
                 except Exception as ex:
                     log().warning(f"Could not read grid emission factor: {ex}. Using simplified emission factors.")
                     return self._calculate_simplified_emissions(annual_demand_mwh, demand_type)
@@ -1375,6 +1432,7 @@ class DTNExpansionOptimizer:
             from cea.technologies.supply_systems_database import SupplySystemsDatabase
             try:
                 supply_systems = SupplySystemsDatabase(self.locator)
+                from cea.optimization.prices import Prices  # Import Prices class
                 prices = Prices(supply_systems)
                 electricity_price = np.mean(prices.ELEC_PRICE, dtype=np.float64)  # [USD/W]
                 log().info(f"Using electricity price: {electricity_price} USD/W")
@@ -1448,8 +1506,8 @@ class DTNExpansionOptimizer:
         # Create DataFrame
         detailed_results_df = pd.DataFrame(detailed_results)
 
-        # Save to CSV
-        detailed_results_file = output_dir / "optimization_results_detailed.csv"
+        # Save to CSV with network-type specific filename
+        detailed_results_file = output_dir / f"dtn_expansion_opt_results_{self.network_type}_detailed.csv"
         detailed_results_df.to_csv(detailed_results_file, index=False)
 
         return detailed_results_file
@@ -1746,8 +1804,8 @@ class DTNExpansionOptimizer:
         metadata_file = output_dir / "optimization_settings.csv"
         metadata_df.to_csv(metadata_file, index=False)
 
-        # Save results to CSV
-        results_file = output_dir / "optimization_results.csv"
+        # Save results to CSV with network-type specific filename
+        results_file = output_dir / f"dtn_expansion_opt_results_{self.network_type}.csv"
         results_df.to_csv(results_file, index=False)
 
         # Save detailed results
@@ -1881,18 +1939,65 @@ class PipeLayoutGenerator:
         # Include cluster 0 (existing DTN) in the set
         clusters_to_connect = set(cluster_set).union({0})
 
+        # Ensure cluster, from_C, and to_C columns are numeric for comparison
+        try:
+            # Make a copy to avoid SettingWithCopyWarning
+            cluster_edges_df = self.cluster_edges.copy()
+            # Convert columns to numeric, errors='coerce' will convert non-numeric values to NaN
+            for col in ['cluster', 'from_C', 'to_C']:
+                if col in cluster_edges_df.columns:
+                    cluster_edges_df[col] = pd.to_numeric(cluster_edges_df[col], errors='coerce')
+                    # Fill NaN with a value that won't match our filters
+                    cluster_edges_df[col] = cluster_edges_df[col].fillna(-999)
+        except Exception as e:
+            log().warning(f"Error converting columns to numeric: {e}. Using original dataframe.")
+            cluster_edges_df = self.cluster_edges
+
         # Get edges that belong to the clusters in the set
-        cluster_edges = self.cluster_edges[self.cluster_edges['cluster'].isin(clusters_to_connect)]
+        cluster_edges = cluster_edges_df[cluster_edges_df['cluster'].isin(clusters_to_connect)]
 
         # Get main road edges (-1) that connect the clusters
-        main_road_edges = self.cluster_edges[
-            (self.cluster_edges['cluster'] == -1) & 
-            (self.cluster_edges['from_C'].isin(clusters_to_connect)) & 
-            (self.cluster_edges['to_C'].isin(clusters_to_connect))
+        main_road_edges = cluster_edges_df[
+            (cluster_edges_df['cluster'] == -1) & 
+            (cluster_edges_df['from_C'].isin(clusters_to_connect)) & 
+            (cluster_edges_df['to_C'].isin(clusters_to_connect))
         ]
 
-        # Combine the edges
-        required_pipes = pd.concat([cluster_edges, main_road_edges])
+        # Combine the edges with error handling
+        try:
+            # First, try to concatenate with default settings
+            required_pipes = pd.concat([cluster_edges, main_road_edges])
+        except Exception as e:
+            log().warning(f"Error during dataframe concatenation: {e}")
+
+            # If that fails, try with more explicit settings
+            try:
+                # Reset index to avoid index-related issues
+                cluster_edges_reset = cluster_edges.reset_index(drop=True)
+                main_road_edges_reset = main_road_edges.reset_index(drop=True)
+
+                # Try concatenation with ignore_index=True
+                required_pipes = pd.concat([cluster_edges_reset, main_road_edges_reset], ignore_index=True)
+            except Exception as e2:
+                log().error(f"Failed to concatenate dataframes even with reset_index: {e2}")
+
+                # As a last resort, if one of the dataframes is empty, return the other
+                if len(cluster_edges) == 0:
+                    required_pipes = main_road_edges
+                elif len(main_road_edges) == 0:
+                    required_pipes = cluster_edges
+                else:
+                    # If both have data but can't be concatenated, try to create a new dataframe with common columns
+                    common_columns = set(cluster_edges.columns).intersection(set(main_road_edges.columns))
+                    if common_columns:
+                        log().warning(f"Using only common columns for concatenation: {common_columns}")
+                        required_pipes = pd.concat([
+                            cluster_edges[list(common_columns)], 
+                            main_road_edges[list(common_columns)]
+                        ], ignore_index=True)
+                    else:
+                        # If no solution works, raise an error
+                        raise ValueError("Cannot concatenate dataframes - no common columns found")
 
         return required_pipes
 

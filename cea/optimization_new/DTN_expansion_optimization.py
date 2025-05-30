@@ -324,7 +324,7 @@ class DTNExpansionOptimizer:
     def __init__(self, locator: cea.inputlocator.InputLocator, network_type: str, 
                  metrics_df: pd.DataFrame, num_phases: int = 3, 
                  budget_per_phase: Optional[List[float]] = None, 
-                 energy_price: float = 0.1, interest_rate: float = 0.05,
+                 interest_rate: float = 0.05,
                  cost_model: str = 'detailed', objective_function: str = 'NPV',
                  diversity_factor: float = 0.7,
                  temperature_difference_dh: float = 20, temperature_difference_dc: float = 10,
@@ -347,8 +347,8 @@ class DTNExpansionOptimizer:
             Number of phases for the expansion
         budget_per_phase : list, optional
             Budget available for each phase (in USD)
-        energy_price : float
-            Energy price for calculating revenue (USD/kWh)
+        Note: Energy price is now automatically read from FEEDSTOCKS.xlsx
+            (NATURALGAS for DH, GRID for DC)
         interest_rate : float
             Annual interest rate for NPV calculations
         cost_model : str
@@ -383,7 +383,7 @@ class DTNExpansionOptimizer:
         self.metrics_df = metrics_df
         self.num_phases = num_phases
         self.budget_per_phase = budget_per_phase or [float('inf')] * num_phases
-        self.energy_price = energy_price
+        self.energy_price = self._get_energy_price()
         self.interest_rate = interest_rate
         self.cost_model = cost_model
         self.objective_function = objective_function
@@ -411,6 +411,53 @@ class DTNExpansionOptimizer:
         # Initialize DEAP toolbox
         self.toolbox = base.Toolbox()
         self._setup_genetic_algorithm()
+
+    def _get_energy_price(self):
+        """
+        Read energy price from FEEDSTOCKS.xlsx based on network type.
+
+        For DH: Uses the buy price from appropriate heating feedstock (default: NATURALGAS)
+        For DC: Uses the buy price from GRID (electricity for cooling)
+
+        Returns:
+        --------
+        float
+            Energy price in USD/kWh
+        """
+        try:
+            # Determine which feedstock to use based on network type
+            if self.network_type == 'DH':
+                # For district heating, try to use NATURALGAS first
+                feedstock_name = 'NATURALGAS'
+            else:
+                # For district cooling, use GRID (electricity)
+                feedstock_name = 'GRID'
+
+            # Try to load the feedstock data
+            feedstock_file = self.locator.get_db4_components_feedstocks_feedstocks_csv(feedstocks=feedstock_name)
+            log().info(f"Reading energy price from {feedstock_file}")
+
+            feedstock_data = pd.read_csv(feedstock_file)
+
+            # Get the buy price column (Opex_var_buy_USD2015kWh)
+            if 'Opex_var_buy_USD2015kWh' in feedstock_data.columns:
+                # Calculate average price across all hours
+                energy_price = feedstock_data['Opex_var_buy_USD2015kWh'].mean()
+                log().info(f"Using energy price from {feedstock_name}: {energy_price:.4f} USD/kWh")
+                return energy_price
+            else:
+                log().warning(f"Column 'Opex_var_buy_USD2015kWh' not found in {feedstock_name} data. Using default value.")
+        except Exception as e:
+            log().warning(f"Could not read energy price from feedstock data: {e}")
+
+        # Fallback to default values
+        if self.network_type == 'DH':
+            default_price = 0.08  # Default price for heating (USD/kWh)
+        else:
+            default_price = 0.12  # Default price for cooling (USD/kWh)
+
+        log().warning(f"Using default energy price for {self.network_type}: {default_price} USD/kWh")
+        return default_price
 
     def _load_cost_data(self):
         """Load cost data from thermal network costs results."""
@@ -1028,7 +1075,7 @@ class DTNExpansionOptimizer:
         """
         # Get metrics for this cluster set
         key = '+'.join(map(str, sorted(cluster_set)))
-        log().info(f"Calculating GHG emissions for cluster set: {key}")
+        log().debug(f"Calculating GHG emissions for cluster set: {key}")
 
         if key not in self.cluster_metrics:
             log().warning(f"No metrics found for cluster set: {key}")
@@ -1038,7 +1085,7 @@ class DTNExpansionOptimizer:
 
         # Get buildings in the clusters
         buildings = self._get_buildings_in_clusters(cluster_set)
-        log().info(f"Found {len(buildings)} buildings in cluster set {key}")
+        log().debug(f"Found {len(buildings)} buildings in cluster set {key}")
 
         if not buildings:
             log().warning(f"No buildings found in cluster set: {key}")
@@ -1052,17 +1099,17 @@ class DTNExpansionOptimizer:
             annual_demand_mwh = metrics.get('total_annual_Qc_MWh', 0)
             demand_type = 'cooling'
 
-        log().info(f"Annual {demand_type} demand for cluster set {key}: {annual_demand_mwh} MWh")
+        log().debug(f"Annual {demand_type} demand for cluster set {key}: {annual_demand_mwh} MWh")
 
         # Read emission factors from the database
         try:
             # Get the appropriate emission factors based on network type
             if self.network_type == 'DH':
                 factors = pd.read_csv(self.locator.get_database_assemblies_supply_heating())
-                log().info(f"Loaded {len(factors)} heating supply factors")
+                log().debug(f"Loaded {len(factors)} heating supply factors")
             else:
                 factors = pd.read_csv(self.locator.get_database_assemblies_supply_cooling())
-                log().info(f"Loaded {len(factors)} cooling supply factors")
+                log().debug(f"Loaded {len(factors)} cooling supply factors")
 
             # Get the feedstock emission factors
             factors_resources = {}
@@ -1070,11 +1117,11 @@ class DTNExpansionOptimizer:
             try:
                 from cea.datamanagement.format_helper.cea4_verify_db import get_csv_filenames
                 list_feedstocks = get_csv_filenames(self.locator.get_db4_components_feedstocks_library_folder())
-                log().info(f"Found {len(list_feedstocks)} feedstock types")
+                log().debug(f"Found {len(list_feedstocks)} feedstock types")
 
                 for feedstock in list_feedstocks:
                     feedstock_file = self.locator.get_db4_components_feedstocks_feedstocks_csv(feedstocks=feedstock)
-                    log().info(f"Loading feedstock data from: {feedstock_file}")
+                    log().debug(f"Loading feedstock data from: {feedstock_file}")
                     factors_resources[feedstock] = pd.read_csv(feedstock_file)
             except Exception as ex:
                 log().warning(f"Could not access feedstock database: {ex}. Using simplified emission factors.")
@@ -1083,7 +1130,7 @@ class DTNExpansionOptimizer:
             # Get the mean of all values for each feedstock
             factors_resources_simple = [(name, values['GHG_kgCO2MJ'].mean()) for name, values in factors_resources.items()
                                         if name != 'ENERGY_CARRIERS']
-            log().info(f"Processed {len(factors_resources_simple)} feedstock emission factors")
+            log().debug(f"Processed {len(factors_resources_simple)} feedstock emission factors")
 
             factors_resources_simple = pd.concat([pd.DataFrame(factors_resources_simple, columns=['code', 'GHG_kgCO2MJ']),
                                                 pd.DataFrame([{'code': 'NONE'}])],  # append NONE choice with zero values
@@ -1094,7 +1141,7 @@ class DTNExpansionOptimizer:
                 # For district heating, use district heating factors
                 emission_factors = factors.merge(factors_resources_simple, left_on='feedstock', right_on='code')[
                     ['code_x', 'feedstock', 'GHG_kgCO2MJ']]
-                log().info(f"Merged heating factors with feedstock factors, result has {len(emission_factors)} rows")
+                log().debug(f"Merged heating factors with feedstock factors, result has {len(emission_factors)} rows")
 
                 if len(emission_factors) > 0:
                     # Use the district heating emission factor (assuming first row is for district heating)
@@ -1107,7 +1154,7 @@ class DTNExpansionOptimizer:
                 # For district cooling, use district cooling factors
                 emission_factors = factors.merge(factors_resources_simple, left_on='feedstock', right_on='code')[
                     ['code_x', 'feedstock', 'GHG_kgCO2MJ']]
-                log().info(f"Merged cooling factors with feedstock factors, result has {len(emission_factors)} rows")
+                log().debug(f"Merged cooling factors with feedstock factors, result has {len(emission_factors)} rows")
 
                 if len(emission_factors) > 0:
                     # Use the district cooling emission factor (assuming first row is for district cooling)
@@ -1141,12 +1188,12 @@ class DTNExpansionOptimizer:
             # Convert emission factor from kgCO2/MJ to kgCO2/kWh
             # 1 kWh = 3.6 MJ, so multiply by 3.6
             emission_factor_kgco2_per_kwh = emission_factor_kgco2_per_mj * 3.6
-            log().info(f"Converted emission factor: {emission_factor_kgco2_per_kwh} kgCO2/kWh")
+            log().debug(f"Converted emission factor: {emission_factor_kgco2_per_kwh} kgCO2/kWh")
 
             # Calculate emissions directly in kgCO2 using kWh
             annual_demand_kwh = annual_demand_mwh * 1000  # Convert MWh to kWh
             emissions_kgco2 = annual_demand_kwh * emission_factor_kgco2_per_kwh
-            log().info(f"Calculated emissions: {emissions_kgco2} kgCO2")
+            log().debug(f"Calculated emissions: {emissions_kgco2} kgCO2")
 
             # Convert to tonCO2
             emissions_tonco2 = emissions_kgco2 / 1000
@@ -2192,8 +2239,7 @@ def main(config):
             if isinstance(budget_str, str):
                 budget_per_phase = [float(b.strip()) for b in budget_str.split(',') if b.strip()]
 
-        # Get energy price and interest rate from config
-        energy_price = config.dtn_expansion_optimization.energy_price if hasattr(config.dtn_expansion_optimization, 'energy_price') else 0.1
+        # Get interest rate from config
         interest_rate = config.dtn_expansion_optimization.interest_rate if hasattr(config.dtn_expansion_optimization, 'interest_rate') else 0.05
 
         # Get cost model from config
@@ -2232,7 +2278,6 @@ def main(config):
             metrics_df=metrics_df,
             num_phases=num_phases,
             budget_per_phase=budget_per_phase,
-            energy_price=energy_price,
             interest_rate=interest_rate,
             cost_model=cost_model,
             objective_function=objective_function,

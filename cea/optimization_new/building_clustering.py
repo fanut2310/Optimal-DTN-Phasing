@@ -1135,6 +1135,18 @@ def main(config):
         show_interactive_plot=show_interactive_plot
     )
 
+    # Perform node and edge clustering after building clustering is complete
+    import time
+    start_time = time.time()
+
+    # Create ClusterMapper instance and write outputs
+    mapper = ClusterMapper(locator, network_type)
+    mapper.write_outputs()
+
+    # Print completion message with computation time
+    clustering_time = time.time() - start_time
+    log().info(f"DTN nodes and edges clustering completed successfully in {clustering_time:.2f} seconds.")
+
 
 
 

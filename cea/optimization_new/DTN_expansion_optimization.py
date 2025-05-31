@@ -100,148 +100,8 @@ def _read_shp_force_2d(path: Path) -> gpd.GeoDataFrame:
 # 4) CORE SCRIPT                                                             #
 ###############################################################################
 
-class ClusterMapper:
-    """Map nodes / edges ➜ cluster ids using Edge‑Node incidence matrix."""
+# ClusterMapper class has been moved to building_clustering.py
 
-    def __init__(self, locator: cea.inputlocator.InputLocator, net_type: str):
-        self.loc = locator
-        self.net_type = net_type
-        self._load_inputs()
-        self._build_lookup()
-
-    def _load_inputs(self):
-        # 1) building cluster assignments
-        path_cl = Path(self.loc.get_dtn_cluster_assignment_file())
-        self.df_clusters = pd.read_csv(path_cl)
-        log().info("Building clusters loaded: %d rows", len(self.df_clusters))
-        # 2) Part‑1 network layout shapefiles
-        nodes_shp = Path(self.loc.get_network_layout_nodes_shapefile(self.net_type))
-        edges_shp = nodes_shp.with_name("edges.shp")
-        self.gdf_nodes = _read_shp_force_2d(nodes_shp)
-        self.gdf_edges = _read_shp_force_2d(edges_shp)
-        log().info("Network layout loaded: %d nodes, %d edges", len(self.gdf_nodes), len(self.gdf_edges))
-        # 3) edge–node incidence CSV
-        inc_path = Path(self.loc.scenario) / "outputs" / "data" / "thermal-network" / f"{self.net_type}__EdgeNode.csv"
-        self.df_inc = pd.read_csv(inc_path, index_col=0)
-        log().info("Edge–Node incidence matrix: %d nodes × %d edges", *self.df_inc.shape)
-
-    def _build_lookup(self):
-        # map building name -> cluster id
-        b2c = dict(self.df_clusters[["name","cluster"]].values)
-        # assign cluster to nodes
-        clusters = []
-        for _, row in self.gdf_nodes.iterrows():
-            typ = row.get("type","").upper()
-            if typ == "CONSUMER":
-                bld = row.get("building")
-                clusters.append(b2c.get(str(bld), -1))
-            elif typ == "PLANT":
-                clusters.append(0)
-            else:
-                clusters.append(-1)
-        self.gdf_nodes["cluster"] = clusters
-        # assign cluster_src/dst to edges via incidence
-        src_list, dst_list = [], []
-        for eid in self.df_inc.columns:
-            vec = self.df_inc[eid]
-            nodes = [n for n,v in vec.items() if v != 0]
-            if len(nodes) != 2:
-                src_list.append(-1); dst_list.append(-1)
-                continue
-            n1,n2 = nodes
-            c1 = int(self.gdf_nodes.loc[self.gdf_nodes["name"]==n1, "cluster"].iloc[0])
-            c2 = int(self.gdf_nodes.loc[self.gdf_nodes["name"]==n2, "cluster"].iloc[0])
-            src_list.append(c1); dst_list.append(c2)
-        self.gdf_edges["cluster_src"] = src_list
-        self.gdf_edges["cluster_dst"] = dst_list
-
-    def write_outputs(self):
-        out_folder = Path(self.loc.get_dtn_expansion_optimization_results_folder())
-        out_folder.mkdir(parents=True, exist_ok=True)
-
-        # --- update node shapefile with cluster and save
-        # Rearrange columns in nodes_clustered shapefiles as per requirement iii)
-        nodes_out_shp = out_folder / "nodes_clustered.shp"
-        # Ensure columns are in the specified order: 'name', 'type', 'building', 'cluster'
-        node_columns = ["name", "type", "building", "cluster"]
-        # Add any other columns that might be in the dataframe
-        for col in self.gdf_nodes.columns:
-            if col not in node_columns and col != "geometry":
-                node_columns.append(col)
-        # Add geometry at the end
-        if "geometry" in self.gdf_nodes.columns:
-            node_columns.append("geometry")
-
-        # Reorder columns and save
-        self.gdf_nodes = self.gdf_nodes[node_columns]
-        self.gdf_nodes.to_file(nodes_out_shp)
-        log().info("Wrote clustered nodes shapefile → %s", nodes_out_shp)
-
-        # --- write cluster_nodes.csv
-        nodes_csv = out_folder / "cluster_nodes.csv"
-        self.gdf_nodes[["name", "type", "building", "cluster"]].to_csv(nodes_csv, index=False)
-        log().info("Wrote cluster_nodes.csv → %s", nodes_csv)
-
-        # --- update edge shapefile with new cluster fields and save
-        # Rename columns as per requirement i)
-        self.gdf_edges = self.gdf_edges.rename(columns={
-            "cluster_src": "from_C",
-            "cluster_dst": "to_C"
-        })
-
-        # Add cluster column to edges_clustered shapefile
-        def pick_cluster(r):
-            if r["from_C"] != r["to_C"] and r["from_C"] != -1 and r["to_C"] != -1:
-                return -1  # Inter-cluster edge
-            if r["from_C"] == -1:
-                return r["to_C"]
-            return r["from_C"]
-
-        self.gdf_edges["cluster"] = self.gdf_edges.apply(pick_cluster, axis=1)
-
-        # Save the updated edges shapefile
-        edges_out_shp = out_folder / "edges_clustered.shp"
-        self.gdf_edges.to_file(edges_out_shp)
-        log().info("Wrote clustered edges shapefile → %s", edges_out_shp)
-
-        # --- prepare cluster_edges.csv as per requirement ii)
-        df = self.gdf_edges.copy()
-
-        # Ensure we have the required columns
-        if "Name" in df.columns:
-            df["name"] = df["Name"]
-        elif "edge_id" in df.columns:
-            df["name"] = df["edge_id"]
-        else:
-            df = df.reset_index()
-            df["name"] = df["index"].astype(str)
-
-        # Add length_m column if it exists with a different name
-        if "length_m" not in df.columns and "LENGTH" in df.columns:
-            df["length_m"] = df["LENGTH"]
-        elif "length_m" not in df.columns and "Length" in df.columns:
-            df["length_m"] = df["Length"]
-
-        # Add pipe_DN column if it exists with a different name
-        if "pipe_DN" not in df.columns and "D_int_m" in df.columns:
-            # Convert from meters to mm and round to nearest standard DN size
-            df["pipe_DN"] = (df["D_int_m"] * 1000).round().astype(int)
-
-        # Add type_mat column if it exists with a different name
-        if "type_mat" not in df.columns and "material" in df.columns:
-            df["type_mat"] = df["material"]
-
-        # Select and order columns as required
-        cols = ["name", "length_m", "pipe_DN", "type_mat", "from_C", "to_C", "cluster"]
-
-        # Ensure all required columns exist (create empty ones if needed)
-        for col in cols:
-            if col not in df.columns:
-                df[col] = ""
-
-        edges_csv = out_folder / "cluster_edges.csv"
-        df[cols].to_csv(edges_csv, index=False)
-        log().info("Wrote cluster_edges.csv → %s", edges_csv)
 
 # ----------------------------------------------------------------------------
 # CLI
@@ -2195,13 +2055,11 @@ def main(config):
         log().error("Prerequisites not met. Results for Thermal Network Part 1 (layout), Part 2 (simulation) with detailed model, and Part 3 (costs) for ALL buildings must first be obtained before running this module.")
         return
 
-    # Perform node and edge clustering
-    mapper = ClusterMapper(locator, network_type)
-    mapper.write_outputs()
+    # Note: Node and edge clustering is now performed in building_clustering.py
+    # We assume it has already been run before this script
 
-    # Print completion message with computation time
-    clustering_time = time.time() - start_time
-    log().info(f"DTN nodes and edges clustering completed successfully in {clustering_time:.2f} seconds. Pipe layouts of connecting different sets of building clusters in phase [1] are being generated.")
+    # Print completion message
+    log().info(f"Starting DTN expansion optimization. Pipe layouts of connecting different sets of building clusters in phase [1] are being generated.")
 
     # If chosen_clusters is provided, convert it to a list of integers
     if chosen_clusters:

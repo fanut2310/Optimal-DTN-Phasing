@@ -183,8 +183,11 @@ class DTNExpansionOptimizer:
 
     def __init__(self, locator: cea.inputlocator.InputLocator, network_type: str, 
                  metrics_df: pd.DataFrame, num_phases: int = 3, 
-                 budget_per_phase: Optional[List[float]] = None, 
+                 budget_per_phase: Optional[List[float]] = None,
+                 phase_durations: Optional[List[int]] = None,
                  interest_rate: float = 0.05,
+                 infrastructure_lifetime: int = 25,
+                 npv_duration: int = 20,
                  cost_model: str = 'detailed', objective_function: str = 'NPV',
                  diversity_factor: float = 0.7,
                  temperature_difference_dh: float = 20, temperature_difference_dc: float = 10,
@@ -207,10 +210,16 @@ class DTNExpansionOptimizer:
             Number of phases for the expansion
         budget_per_phase : list, optional
             Budget available for each phase (in USD)
+        phase_durations : list, optional
+            Duration of each phase in years (e.g., [5, 8, 10]). Default is 5 years per phase.
         Note: Energy price is now automatically read from FEEDSTOCKS.xlsx
             (NATURALGAS for DH, GRID for DC)
         interest_rate : float
             Annual interest rate for NPV calculations
+        infrastructure_lifetime : int
+            Infrastructure lifetime in years for annualized capital expenditure calculations
+        npv_duration : int
+            Number of years for Net Present Value (NPV) calculations
         cost_model : str
             Method for calculating pipe costs ('simplified' or 'detailed')
         objective_function : str
@@ -243,8 +252,11 @@ class DTNExpansionOptimizer:
         self.metrics_df = metrics_df
         self.num_phases = num_phases
         self.budget_per_phase = budget_per_phase or [float('inf')] * num_phases
+        self.phase_durations = phase_durations or [5] * num_phases  # Default to 5 years per phase
         self.energy_price = self._get_energy_price()
         self.interest_rate = interest_rate
+        self.infrastructure_lifetime = infrastructure_lifetime
+        self.npv_duration = npv_duration
         self.cost_model = cost_model
         self.objective_function = objective_function
         self.diversity_factor = diversity_factor
@@ -868,7 +880,7 @@ class DTNExpansionOptimizer:
 
         return roi
 
-    def calculate_npv(self, cluster_set, phase, years=20):
+    def calculate_npv(self, cluster_set, phase, years=None):
         """
         Calculate Net Present Value for a cluster set in a specific phase.
 
@@ -878,14 +890,17 @@ class DTNExpansionOptimizer:
             Tuple or list of cluster IDs
         phase : int
             Phase number (1-based)
-        years : int
-            Number of years for NPV calculation
+        years : int, optional
+            Number of years for NPV calculation. If None, uses self.npv_duration.
 
         Returns:
         --------
         float
             Net Present Value (NPV)
         """
+        # Use the npv_duration instance variable if years is not provided
+        if years is None:
+            years = self.npv_duration
         # Get metrics for this cluster set
         key = '+'.join(map(str, sorted(cluster_set)))
         if key not in self.cluster_metrics:
@@ -906,14 +921,20 @@ class DTNExpansionOptimizer:
         annual_om_cost = 0.025 * capex
         net_annual_return = annual_revenue - annual_om_cost
 
-        # Apply discount factor based on phase
-        phase_year = phase - 1  # Phase 1 starts at year 0
+        # Calculate the start year for this phase based on the durations of previous phases
+        phase_start_year = 0
+        for p in range(1, phase):
+            if p <= len(self.phase_durations):
+                phase_start_year += self.phase_durations[p-1]
+            else:
+                # If phase duration is not specified, use default of 5 years
+                phase_start_year += 5
 
         # Calculate NPV
         npv = -capex  # Initial investment (negative)
         for year in range(years):
-            # Only start counting returns after the phase year
-            if year >= phase_year:
+            # Only start counting returns after the phase start year
+            if year >= phase_start_year:
                 discount_factor = 1 / ((1 + self.interest_rate) ** (year + 1))
                 npv += net_annual_return * discount_factor
 
@@ -1319,11 +1340,11 @@ class DTNExpansionOptimizer:
                 cooling_plant_capex = 0
                 cooling_plant_electricity = 0
 
-            # Calculate annualized costs (assuming 25 year lifetime and 5% interest rate)
-            pipe_annual_capex = calc_capex_annualized(pipe_capex, 5, 25)
-            hex_annual_capex = calc_capex_annualized(hex_capex, 5, 25)
-            pump_annual_capex = calc_capex_annualized(pump_capex, 5, 25)
-            cooling_plant_annual_capex = calc_capex_annualized(cooling_plant_capex, 5, 25)
+            # Calculate annualized costs using infrastructure lifetime and interest rate
+            pipe_annual_capex = calc_capex_annualized(pipe_capex, self.interest_rate * 100, self.infrastructure_lifetime)
+            hex_annual_capex = calc_capex_annualized(hex_capex, self.interest_rate * 100, self.infrastructure_lifetime)
+            pump_annual_capex = calc_capex_annualized(pump_capex, self.interest_rate * 100, self.infrastructure_lifetime)
+            cooling_plant_annual_capex = calc_capex_annualized(cooling_plant_capex, self.interest_rate * 100, self.infrastructure_lifetime)
 
             # Calculate O&M costs
             # Fixed O&M costs (infrastructure components like pipes and HEX use 1.5% of CAPEX)
@@ -1689,6 +1710,7 @@ class DTNExpansionOptimizer:
             'objective_function': self.objective_function,
             'energy_price [USD/kWh]': self.energy_price,
             'interest_rate [-]': self.interest_rate,
+            'phase_durations [years]': ','.join(map(str, self.phase_durations)),
             'budget_per_phase [USD]': ','.join(map(str, self.budget_per_phase)),
             'diversity_factor [-]': self.diversity_factor,
             'temperature_difference_dh [K]': self.temperature_difference_dh,
@@ -2097,8 +2119,21 @@ def main(config):
             if isinstance(budget_str, str):
                 budget_per_phase = [float(b.strip()) for b in budget_str.split(',') if b.strip()]
 
+        # Get phase durations from config
+        phase_durations = None
+        if hasattr(config.dtn_expansion_optimization, 'phase_durations') and config.dtn_expansion_optimization.phase_durations:
+            durations_str = config.dtn_expansion_optimization.phase_durations
+            if isinstance(durations_str, str):
+                phase_durations = [int(d.strip()) for d in durations_str.split(',') if d.strip()]
+
         # Get interest rate from config
         interest_rate = config.dtn_expansion_optimization.interest_rate if hasattr(config.dtn_expansion_optimization, 'interest_rate') else 0.05
+
+        # Get infrastructure lifetime from config
+        infrastructure_lifetime = config.dtn_expansion_optimization.infrastructure_lifetime if hasattr(config.dtn_expansion_optimization, 'infrastructure_lifetime') else 25
+
+        # Get NPV duration from config
+        npv_duration = config.dtn_expansion_optimization.npv_duration if hasattr(config.dtn_expansion_optimization, 'npv_duration') else 20
 
         # Get cost model from config
         cost_model = config.dtn_expansion_optimization.cost_model if hasattr(config.dtn_expansion_optimization, 'cost_model') else 'detailed'
@@ -2136,7 +2171,10 @@ def main(config):
             metrics_df=metrics_df,
             num_phases=num_phases,
             budget_per_phase=budget_per_phase,
+            phase_durations=phase_durations,
             interest_rate=interest_rate,
+            infrastructure_lifetime=infrastructure_lifetime,
+            npv_duration=npv_duration,
             cost_model=cost_model,
             objective_function=objective_function,
             diversity_factor=diversity_factor,

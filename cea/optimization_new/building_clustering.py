@@ -1305,7 +1305,7 @@ class ClusterMapper:
             df["length_m"] = df["Length"]
 
         # Select and order columns for CSV
-        edge_columns = ["name", "from_C", "to_C", "intra_cluster", "cluster", "length_m", "diameter", "material"]
+        edge_columns = ["name", "from_C", "to_C", "intra_cluster", "cluster", "length_m", "pipe_DN", "type_mat"]
 
         # Only include columns that exist in the dataframe
         edge_columns = [col for col in edge_columns if col in df.columns]

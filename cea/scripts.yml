@@ -335,8 +335,9 @@ Energy Supply System Optimisation:
     module: cea.optimization_new.DTN_expansion_optimization
     parameters: [ 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free',
                   'dtn-expansion-optimization:network-type', 'dtn-expansion-optimization:testing-clusters', 'dtn-expansion-optimization:chosen-buildings',
-                  'dtn-expansion-optimization:run-optimization', 'dtn-expansion-optimization:budget-per-phase', 'dtn-expansion-optimization:cost-model',
-                  'dtn-expansion-optimization:num-phases', 'dtn-expansion-optimization:interest-rate',
+                  'dtn-expansion-optimization:run-optimization', 'dtn-expansion-optimization:capex-budget-per-phase', 
+                  'dtn-expansion-optimization:total-expenditure-budget-per-phase', 'dtn-expansion-optimization:cost-model',
+                  'dtn-expansion-optimization:num-phases', 'dtn-expansion-optimization:phase-durations', 'dtn-expansion-optimization:interest-rate',
                   'dtn-expansion-optimization:population-size', 'dtn-expansion-optimization:num-generations',
                   'dtn-expansion-optimization:objective-function', 'dtn-expansion-optimization:roi-phase-weights',
                   'dtn-expansion-optimization:diversity-factor', 'dtn-expansion-optimization:temperature-difference-dh', 

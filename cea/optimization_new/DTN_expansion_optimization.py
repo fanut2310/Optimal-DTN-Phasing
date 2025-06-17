@@ -183,13 +183,15 @@ class DTNExpansionOptimizer:
 
     def __init__(self, locator: cea.inputlocator.InputLocator, network_type: str, 
                  metrics_df: pd.DataFrame, num_phases: int = 3, 
-                 budget_per_phase: Optional[List[float]] = None, 
+                 phase_durations: Optional[List[int]] = None,
+                 capex_budget_per_phase: Optional[List[float]] = None, 
+                 total_expenditure_budget_per_phase: Optional[List[float]] = None,
                  interest_rate: float = 0.05,
                  cost_model: str = 'detailed', objective_function: str = 'NPV',
                  diversity_factor: float = 0.7,
                  temperature_difference_dh: float = 20, temperature_difference_dc: float = 10,
                  pressure_loss_pa_per_m: float = 200, pump_operation_hours: int = 4000,
-                 pump_efficiency: float = 0.5, pump_load_factor: float = 0.5,
+                 pump_efficiency: float = 0.8, pump_load_factor: float = 0.5,
                  pump_capex_a: float = 1230, pump_capex_b: float = 0.65,
                  cooling_cop: float = 4.0, ghg_budget_per_phase: Optional[List[float]] = None):
         """
@@ -205,8 +207,12 @@ class DTNExpansionOptimizer:
             DataFrame with metrics for all cluster combinations
         num_phases : int
             Number of phases for the expansion
-        budget_per_phase : list, optional
-            Budget available for each phase (in USD)
+        phase_durations : list, optional
+            Duration in years for each phase (e.g., [3,3,3]). Must match the number of phases.
+        capex_budget_per_phase : list, optional
+            CAPEX budget available for each phase (in USD). Only considers capital expenditure.
+        total_expenditure_budget_per_phase : list, optional
+            Total expenditure budget (CAPEX + OPEX) for each phase (in USD). Considers both capital and operational expenditures.
         Note: Energy price is now automatically read from FEEDSTOCKS.xlsx
             (NATURALGAS for DH, GRID for DC)
         interest_rate : float
@@ -242,7 +248,16 @@ class DTNExpansionOptimizer:
         self.network_type = network_type
         self.metrics_df = metrics_df
         self.num_phases = num_phases
-        self.budget_per_phase = budget_per_phase or [float('inf')] * num_phases
+
+        # Set default phase durations if not provided
+        self.phase_durations = phase_durations or [3] * num_phases
+
+        # Validate that the length of phase_durations matches num_phases
+        if len(self.phase_durations) != self.num_phases:
+            raise ValueError(f"Length of phase_durations ({len(self.phase_durations)}) must match num_phases ({self.num_phases})")
+
+        self.capex_budget_per_phase = capex_budget_per_phase or [float('inf')] * num_phases
+        self.total_expenditure_budget_per_phase = total_expenditure_budget_per_phase or [float('inf')] * num_phases
         self.energy_price = self._get_energy_price()
         self.interest_rate = interest_rate
         self.cost_model = cost_model
@@ -818,6 +833,55 @@ class DTNExpansionOptimizer:
 
         return total_capex
 
+    def _calculate_phase_total_expenditure(self, cluster_set, phase):
+        """
+        Calculate total expenditure (CAPEX + OPEX) for a phase.
+
+        Parameters:
+        -----------
+        cluster_set : tuple or list
+            Tuple or list of cluster IDs
+        phase : int
+            Phase number (1-based)
+
+        Returns:
+        --------
+        float
+            Total expenditure for the phase (CAPEX + OPEX across all years)
+        """
+        # Calculate CAPEX
+        capex = self._calculate_phase_capex(cluster_set)
+
+        # Get metrics for this cluster set
+        key = '+'.join(map(str, sorted(cluster_set)))
+        if key not in self.cluster_metrics:
+            return capex  # If no metrics, return just CAPEX
+
+        metrics = self.cluster_metrics[key]
+
+        # Calculate annual revenue (energy price * annual demand)
+        if self.network_type == 'DH':
+            annual_demand_kwh = metrics['total_annual_Qh_MWh'] * 1000  # Convert MWh to kWh
+        else:
+            annual_demand_kwh = metrics['total_annual_Qc_MWh'] * 1000  # Convert MWh to kWh
+
+        # Calculate annual O&M costs (typically 2-3% of CAPEX)
+        annual_om_cost = 0.025 * capex
+
+        # Get the duration of this phase
+        phase_duration = self.phase_durations[phase-1]
+
+        # Calculate present value of OPEX for all years in the phase
+        opex_present_value = 0
+        for year in range(phase_duration):
+            discount_factor = 1 / ((1 + self.interest_rate) ** (year + 1))
+            opex_present_value += annual_om_cost * discount_factor
+
+        # Total expenditure is CAPEX (happens once) plus OPEX (recurring) in present value
+        total_expenditure = capex + opex_present_value
+
+        return total_expenditure
+
     def calculate_roi(self, cluster_set, phase):
         """
         Calculate ROI for a cluster set in a specific phase.
@@ -906,16 +970,30 @@ class DTNExpansionOptimizer:
         annual_om_cost = 0.025 * capex
         net_annual_return = annual_revenue - annual_om_cost
 
-        # Apply discount factor based on phase
-        phase_year = phase - 1  # Phase 1 starts at year 0
+        # Calculate the year when this phase starts
+        phase_start_year = 0
+        for p in range(1, phase):
+            phase_start_year += self.phase_durations[p-1]
 
         # Calculate NPV
-        npv = -capex  # Initial investment (negative)
+        npv = -capex  # Initial investment (negative) at the start of the phase
+
         for year in range(years):
-            # Only start counting returns after the phase year
-            if year >= phase_year:
-                discount_factor = 1 / ((1 + self.interest_rate) ** (year + 1))
-                npv += net_annual_return * discount_factor
+            # Only count returns for years after the phase starts
+            if year >= phase_start_year:
+                # Determine which phase this year belongs to
+                current_phase = 1
+                year_in_phases = year
+                while current_phase <= self.num_phases:
+                    if year_in_phases < self.phase_durations[current_phase-1]:
+                        break
+                    year_in_phases -= self.phase_durations[current_phase-1]
+                    current_phase += 1
+
+                # Only count returns if we're in or after the current phase
+                if current_phase >= phase:
+                    discount_factor = 1 / ((1 + self.interest_rate) ** (year + 1))
+                    npv += net_annual_return * discount_factor
 
         return npv
 
@@ -1132,7 +1210,8 @@ class DTNExpansionOptimizer:
         total_npv = 0
 
         # Check if budget constraints are satisfied
-        phase_costs = [0] * self.num_phases
+        phase_capex = [0] * self.num_phases
+        phase_total_expenditure = [0] * self.num_phases
 
         # Check if GHG budget constraints are satisfied
         if self.ghg_budget_per_phase:
@@ -1150,7 +1229,11 @@ class DTNExpansionOptimizer:
         for phase, clusters in clusters_by_phase.items():
             # Calculate CAPEX for this phase
             capex = self._calculate_phase_capex(clusters)
-            phase_costs[phase-1] = capex
+            phase_capex[phase-1] = capex
+
+            # Calculate total expenditure for this phase
+            total_expenditure = self._calculate_phase_total_expenditure(clusters, phase)
+            phase_total_expenditure[phase-1] = total_expenditure
 
             # Calculate ROI and NPV for this phase
             roi = self.calculate_roi(tuple(clusters), phase)
@@ -1164,10 +1247,18 @@ class DTNExpansionOptimizer:
             total_roi += roi
             total_npv += npv
 
-        # Check budget constraints
+        # Check CAPEX budget constraints
         for phase in range(self.num_phases):
-            if phase < len(phase_costs) and phase_costs[phase] > self.budget_per_phase[phase]:
-                # Apply penalty for exceeding budget
+            if phase < len(phase_capex) and phase_capex[phase] > self.capex_budget_per_phase[phase]:
+                # Apply penalty for exceeding CAPEX budget
+                total_roi = -1000
+                total_npv = -1000000
+                break
+
+        # Check total expenditure budget constraints
+        for phase in range(self.num_phases):
+            if phase < len(phase_total_expenditure) and phase_total_expenditure[phase] > self.total_expenditure_budget_per_phase[phase]:
+                # Apply penalty for exceeding total expenditure budget
                 total_roi = -1000
                 total_npv = -1000000
                 break
@@ -1582,7 +1673,8 @@ class DTNExpansionOptimizer:
             # Note: All costs are in USD as per the internal calculations (e.g., Inv_USD2015perm, capex_hex_USD)
             result = {
                 'phase': phase,
-                'budget [USD]': self.budget_per_phase[phase-1] if phase-1 < len(self.budget_per_phase) else 0,
+                'capex_budget [USD]': self.capex_budget_per_phase[phase-1] if phase-1 < len(self.capex_budget_per_phase) else 0,
+                'total_expenditure_budget [USD]': self.total_expenditure_budget_per_phase[phase-1] if phase-1 < len(self.total_expenditure_budget_per_phase) else 0,
                 'ghg_cap [t CO2eq/yr]': self.ghg_budget_per_phase[phase-1] if self.ghg_budget_per_phase and phase-1 < len(self.ghg_budget_per_phase) else 'no_limit',
                 'newly_connected_cluster(s)': '+'.join(map(str, sorted(clusters))),
                 'cumulative_cluster(s)': '+'.join(map(str, sorted(cumulative_clusters))),
@@ -1624,7 +1716,8 @@ class DTNExpansionOptimizer:
         # Add overall summary row
         summary = {
             'phase': 'Total',
-            'budget [USD]': sum(self.budget_per_phase),
+            'capex_budget [USD]': sum(self.capex_budget_per_phase),
+            'total_expenditure_budget [USD]': sum(self.total_expenditure_budget_per_phase),
             'ghg_cap [t CO2eq/yr]': 'no_limit' if not self.ghg_budget_per_phase else sum(self.ghg_budget_per_phase),
             'newly_connected_cluster(s)': '+'.join(map(str, sorted([cluster for phase_result in results if phase_result['phase'] != 0 for cluster in map(int, phase_result['newly_connected_cluster(s)'].split('+'))]))),
             'number_of_newly_connected_buildings': sum(result['number_of_newly_connected_buildings'] for result in results if result['phase'] != 0),
@@ -1689,7 +1782,8 @@ class DTNExpansionOptimizer:
             'objective_function': self.objective_function,
             'energy_price [USD/kWh]': self.energy_price,
             'interest_rate [-]': self.interest_rate,
-            'budget_per_phase [USD]': ','.join(map(str, self.budget_per_phase)),
+            'capex_budget_per_phase [USD]': ','.join(map(str, self.capex_budget_per_phase)),
+            'total_expenditure_budget_per_phase [USD]': ','.join(map(str, self.total_expenditure_budget_per_phase)),
             'diversity_factor [-]': self.diversity_factor,
             'temperature_difference_dh [K]': self.temperature_difference_dh,
             'temperature_difference_dc [K]': self.temperature_difference_dc,
@@ -2090,12 +2184,31 @@ def main(config):
         # Get optimization parameters from config
         num_phases = config.dtn_expansion_optimization.num_phases if hasattr(config.dtn_expansion_optimization, 'num_phases') else 3
 
-        # Get budget per phase from config
-        budget_per_phase = None
-        if hasattr(config.dtn_expansion_optimization, 'budget_per_phase') and config.dtn_expansion_optimization.budget_per_phase:
+        # Get CAPEX budget per phase from config
+        capex_budget_per_phase = None
+        if hasattr(config.dtn_expansion_optimization, 'capex_budget_per_phase') and config.dtn_expansion_optimization.capex_budget_per_phase:
+            budget_str = config.dtn_expansion_optimization.capex_budget_per_phase
+            if isinstance(budget_str, str):
+                capex_budget_per_phase = [float(b.strip()) for b in budget_str.split(',') if b.strip()]
+        # For backward compatibility
+        elif hasattr(config.dtn_expansion_optimization, 'budget_per_phase') and config.dtn_expansion_optimization.budget_per_phase:
             budget_str = config.dtn_expansion_optimization.budget_per_phase
             if isinstance(budget_str, str):
-                budget_per_phase = [float(b.strip()) for b in budget_str.split(',') if b.strip()]
+                capex_budget_per_phase = [float(b.strip()) for b in budget_str.split(',') if b.strip()]
+
+        # Get total expenditure budget per phase from config
+        total_expenditure_budget_per_phase = None
+        if hasattr(config.dtn_expansion_optimization, 'total_expenditure_budget_per_phase') and config.dtn_expansion_optimization.total_expenditure_budget_per_phase:
+            budget_str = config.dtn_expansion_optimization.total_expenditure_budget_per_phase
+            if isinstance(budget_str, str):
+                total_expenditure_budget_per_phase = [float(b.strip()) for b in budget_str.split(',') if b.strip()]
+
+        # Get phase durations from config
+        phase_durations = None
+        if hasattr(config.dtn_expansion_optimization, 'phase_durations') and config.dtn_expansion_optimization.phase_durations:
+            phase_durations_str = config.dtn_expansion_optimization.phase_durations
+            if isinstance(phase_durations_str, str):
+                phase_durations = [int(d.strip()) for d in phase_durations_str.split(',') if d.strip()]
 
         # Get interest rate from config
         interest_rate = config.dtn_expansion_optimization.interest_rate if hasattr(config.dtn_expansion_optimization, 'interest_rate') else 0.05
@@ -2135,7 +2248,9 @@ def main(config):
             network_type=network_type,
             metrics_df=metrics_df,
             num_phases=num_phases,
-            budget_per_phase=budget_per_phase,
+            phase_durations=phase_durations,
+            capex_budget_per_phase=capex_budget_per_phase,
+            total_expenditure_budget_per_phase=total_expenditure_budget_per_phase,
             interest_rate=interest_rate,
             cost_model=cost_model,
             objective_function=objective_function,

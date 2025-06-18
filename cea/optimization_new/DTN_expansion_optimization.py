@@ -1493,7 +1493,8 @@ class DTNExpansionOptimizer:
                 'new_cluster(s)_cooling_plant_electricity [kWh/yr]': cooling_plant_electricity,
 
                 # Other metrics
-                f'new_cluster(s)_annual_{demand_type} [MWh/yr]': result[f'new_cluster(s)_annual_{demand_type} [MWh/yr]'],
+                # Get annual demand directly from cluster metrics
+                f'new_cluster(s)_annual_{demand_type} [MWh/yr]': self.cluster_metrics.get('+'.join(map(str, sorted(clusters))), {}).get(f'total_annual_{demand_type}_MWh', 0),
                 'new_cluster(s)_pipe_length [m]': result['new_cluster(s)_pipe_length [m]'],
                 f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]': result[f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]'],
                 'new_cluster(s)_ghg_emission [t CO2eq/yr]': result['new_cluster(s)_ghg_emission [t CO2eq/yr]']
@@ -1545,30 +1546,33 @@ class DTNExpansionOptimizer:
         # Add a row for phase 0 (existing DTN)
         phase0_result = {
             'phase': 0,
-            'budget [USD]': 0,  # No budget for existing DTN
-            'ghg_cap [t CO2eq/yr]': 'no_limit',  # No GHG cap for existing DTN
+            'year': 'Year 0',  # Year 0 for existing DTN
             'newly_connected_cluster(s)': '0',
             'cumulative_cluster(s)': '0',
             'number_of_newly_connected_buildings': len(cluster0_buildings),
             'cumulative_number_of_buildings_connected': len(cluster0_buildings),
+            'capex_budget_per_phase [USD]': '-',  # No budget for existing DTN
+            'new_cluster(s)_capex [USD]': 0,  # No CAPEX for existing DTN
+            'cumulative_capex_budget [USD]': '-',  # No cumulative budget for existing DTN
+            'cumulative_capex [USD]': 0,  # No cumulative CAPEX for existing DTN
+            'total_expenditure_budget_per_phase [USD]': '-',  # No total expenditure budget for existing DTN
+            'new_cluster(s)_total_expenditure [USD]': 0,  # Will be calculated if data is available
+            'cumulative_total_expenditure [USD]': 0,  # Will be calculated if data is available
+            'new_cluster(s)_revenue [USD]': 0,  # No revenue for existing DTN
+            'cumulative_revenue [USD]': 0,  # No cumulative revenue for phase 0
+            'new_cluster(s)_om_cost [USD]': 0,  # No OM costs for existing DTN
+            'cumulative_om_cost [USD]': 0,  # No cumulative OM costs for phase 0
+            'ghg_cap [t CO2eq/yr]': 'no_limit',  # No GHG cap for existing DTN
+            'new_cluster(s)_ghg_emission [t CO2eq/yr]': 0,  # Will be calculated if data is available
+            'overall_ghg_emission [t CO2eq/yr]': 0,  # Will be calculated if data is available
             'new_cluster(s)_roi [-]': 0,  # No ROI for existing DTN
             'overall_roi [-]': 0,  # No overall ROI for phase 0
             'new_cluster(s)_npv [USD]': 0,  # No NPV for existing DTN
             'overall_npv [USD]': 0,  # No overall NPV for phase 0
-            'new_cluster(s)_capex [USD]': 0,  # No CAPEX for existing DTN
-            'overall_capex [USD]': 0,  # No overall CAPEX for phase 0
-            'new_cluster(s)_annual_revenue [USD/yr]': 0,  # No revenue for existing DTN in expansion calculation
-            'overall_annual_revenue [USD/yr]': 0,  # No overall revenue for phase 0
-            'new_cluster(s)_annual_om_cost [USD/yr]': 0,  # Will be calculated based on estimated CAPEX
-            'overall_annual_om_cost [USD/yr]': 0,  # No overall O&M cost for phase 0
-            f'new_cluster(s)_annual_{demand_type} [MWh/yr]': 0,  # Will be calculated if data is available
-            f'overall_annual_{demand_type} [MWh/yr]': 0,  # No overall annual demand for phase 0
             'new_cluster(s)_pipe_length [m]': 0,  # No new pipes for existing DTN
             'cumulative_pipe_length [m]': 0,  # Will be updated if data is available
             f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]': 0,  # Will be calculated if data is available
-            f'overall_linear_{demand_type}_density [MWh/km/yr]': 0,  # Will be calculated if data is available
-            'new_cluster(s)_ghg_emission [t CO2eq/yr]': 0,  # Will be calculated if data is available
-            'overall_ghg_emission [t CO2eq/yr]': 0  # Will be calculated if data is available
+            f'overall_linear_{demand_type}_density [MWh/km/yr]': 0  # Will be calculated if data is available
         }
 
         # Try to get metrics for cluster 0 if available
@@ -1579,27 +1583,16 @@ class DTNExpansionOptimizer:
             pipe_length = metrics.get('total_pipe_length_m', 0)
 
             # Update phase 0 metrics
-            phase0_result[f'new_cluster(s)_annual_{demand_type} [MWh/yr]'] = annual_demand
-            phase0_result[f'overall_annual_{demand_type} [MWh/yr]'] = annual_demand
             phase0_result['cumulative_pipe_length [m]'] = pipe_length
             phase0_result[f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]'] = metrics.get(f'linear_{demand_type}_density_MWh_per_km', 0)
             phase0_result[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = metrics.get(f'linear_{demand_type}_density_MWh_per_km', 0)
 
-            # Calculate annual revenue for cluster 0 (not counted in expansion ROI)
-            annual_demand_kwh = annual_demand * 1000  # Convert MWh to kWh
-            phase0_result['new_cluster(s)_annual_revenue [USD/yr]'] = annual_demand_kwh * self.energy_price
-            phase0_result['overall_annual_revenue [USD/yr]'] = annual_demand_kwh * self.energy_price
-
-            # Estimate CAPEX for cluster 0 (for O&M calculation only, not counted in expansion costs)
+            # Estimate CAPEX for cluster 0 (not counted in expansion costs)
             estimated_capex = 0
             if self.cost_model == 'detailed':
                 estimated_capex = self.calculate_detailed_capex((0,))
             else:
                 estimated_capex = self.calculate_simplified_capex((0,))
-
-            # Calculate O&M costs for cluster 0
-            phase0_result['new_cluster(s)_annual_om_cost [USD/yr]'] = 0.025 * estimated_capex
-            phase0_result['overall_annual_om_cost [USD/yr]'] = 0.025 * estimated_capex
 
             # Update cumulative pipe length
             cumulative_pipe_length = pipe_length
@@ -1646,8 +1639,16 @@ class DTNExpansionOptimizer:
             cumulative_buildings.update(newly_connected_buildings)
 
             # Calculate overall linear heat density for all connected clusters so far
-            overall_annual_demand = sum(r[f'new_cluster(s)_annual_{demand_type} [MWh/yr]'] for r in results)
-            overall_annual_demand += metrics.get(f'total_annual_{demand_type}_MWh', 0)
+            # Calculate total annual demand for all clusters in the cumulative set
+            overall_annual_demand = 0
+            for cluster in cumulative_clusters:
+                cluster_key = str(cluster)
+                if cluster_key in self.cluster_metrics:
+                    overall_annual_demand += self.cluster_metrics[cluster_key].get(f'total_annual_{demand_type}_MWh', 0)
+                elif '+' in cluster_key:
+                    # Skip combined cluster keys as they're already counted individually
+                    pass
+
             overall_linear_density = overall_annual_demand / (cumulative_pipe_length / 1000) if cumulative_pipe_length > 0 else 0
 
             # Add to totals
@@ -1658,9 +1659,6 @@ class DTNExpansionOptimizer:
             # Sum up values from all previous phases including current phase
             overall_capex = sum(r.get('new_cluster(s)_capex [USD]', 0) for r in results) + capex
             overall_npv = sum(r.get('new_cluster(s)_npv [USD]', 0) for r in results) + npv
-            overall_annual_revenue = sum(r.get('new_cluster(s)_annual_revenue [USD/yr]', 0) for r in results) + annual_revenue
-            overall_annual_om_cost = sum(r.get('new_cluster(s)_annual_om_cost [USD/yr]', 0) for r in results) + annual_om_cost
-            overall_annual_demand = sum(r.get(f'new_cluster(s)_annual_{demand_type} [MWh/yr]', 0) for r in results) + metrics.get(f'total_annual_{demand_type}_MWh', 0)
 
             # Calculate overall ROI (weighted by CAPEX)
             if overall_capex > 0:
@@ -1669,35 +1667,70 @@ class DTNExpansionOptimizer:
             else:
                 overall_roi = 0
 
+            # Calculate year range for this phase
+            year_start = 1
+            for p in range(1, phase):
+                year_start += self.phase_durations[p-1]
+            year_end = year_start + self.phase_durations[phase-1] - 1
+            # Format year range to avoid Excel interpreting it as a date
+            year_range = f"Year {year_start}-{year_end}"
+
+            # Calculate cumulative budget and capex
+            cumulative_capex_budget = sum(self.capex_budget_per_phase[:phase])
+            cumulative_capex = sum(r.get('new_cluster(s)_capex [USD]', 0) for r in results) + capex
+
+            # Calculate total expenditure for this phase
+            total_expenditure = self._calculate_phase_total_expenditure(clusters, phase)
+
+            # Calculate total revenue and OM costs for this phase
+            phase_duration = self.phase_durations[phase-1]
+            total_revenue = 0
+            total_om_cost = 0
+
+            # Calculate present value of revenue and OM costs for all years in the phase
+            for year in range(phase_duration):
+                discount_factor = 1 / ((1 + self.interest_rate) ** (year + 1))
+                total_revenue += annual_revenue * discount_factor
+                total_om_cost += annual_om_cost * discount_factor
+
+            # Calculate cumulative total expenditure
+            cumulative_total_expenditure = sum(r.get('new_cluster(s)_total_expenditure [USD]', 0) for r in results) + total_expenditure
+
+            # Calculate cumulative revenue and OM costs
+            cumulative_revenue = sum(r.get('new_cluster(s)_revenue [USD]', 0) for r in results) + total_revenue
+            cumulative_om_cost = sum(r.get('new_cluster(s)_om_cost [USD]', 0) for r in results) + total_om_cost
+
             # Create result dictionary with units
             # Note: All costs are in USD as per the internal calculations (e.g., Inv_USD2015perm, capex_hex_USD)
             result = {
                 'phase': phase,
-                'capex_budget [USD]': self.capex_budget_per_phase[phase-1] if phase-1 < len(self.capex_budget_per_phase) else 0,
-                'total_expenditure_budget [USD]': self.total_expenditure_budget_per_phase[phase-1] if phase-1 < len(self.total_expenditure_budget_per_phase) else 0,
-                'ghg_cap [t CO2eq/yr]': self.ghg_budget_per_phase[phase-1] if self.ghg_budget_per_phase and phase-1 < len(self.ghg_budget_per_phase) else 'no_limit',
+                'year': year_range,
                 'newly_connected_cluster(s)': '+'.join(map(str, sorted(clusters))),
                 'cumulative_cluster(s)': '+'.join(map(str, sorted(cumulative_clusters))),
                 'number_of_newly_connected_buildings': num_newly_connected_buildings,
                 'cumulative_number_of_buildings_connected': len(cumulative_buildings),
+                'capex_budget_per_phase [USD]': self.capex_budget_per_phase[phase-1] if phase-1 < len(self.capex_budget_per_phase) else 0,
+                'new_cluster(s)_capex [USD]': capex,
+                'cumulative_capex_budget [USD]': cumulative_capex_budget,
+                'cumulative_capex [USD]': cumulative_capex,
+                'total_expenditure_budget_per_phase [USD]': self.total_expenditure_budget_per_phase[phase-1] if phase-1 < len(self.total_expenditure_budget_per_phase) else 0,
+                'new_cluster(s)_total_expenditure [USD]': total_expenditure,
+                'cumulative_total_expenditure [USD]': cumulative_total_expenditure,
+                'new_cluster(s)_revenue [USD]': total_revenue,
+                'cumulative_revenue [USD]': cumulative_revenue,
+                'new_cluster(s)_om_cost [USD]': total_om_cost,
+                'cumulative_om_cost [USD]': cumulative_om_cost,
+                'ghg_cap [t CO2eq/yr]': self.ghg_budget_per_phase[phase-1] if self.ghg_budget_per_phase and phase-1 < len(self.ghg_budget_per_phase) else 'no_limit',
+                'new_cluster(s)_ghg_emission [t CO2eq/yr]': self.calculate_ghg_emissions(tuple(clusters)),
+                'overall_ghg_emission [t CO2eq/yr]': sum(r.get('new_cluster(s)_ghg_emission [t CO2eq/yr]', 0) for r in results) + self.calculate_ghg_emissions(tuple(clusters)),
                 'new_cluster(s)_roi [-]': roi,
                 'overall_roi [-]': overall_roi,
                 'new_cluster(s)_npv [USD]': npv,
                 'overall_npv [USD]': overall_npv,
-                'new_cluster(s)_capex [USD]': capex,
-                'overall_capex [USD]': overall_capex,
-                'new_cluster(s)_annual_revenue [USD/yr]': annual_revenue,
-                'overall_annual_revenue [USD/yr]': overall_annual_revenue,
-                'new_cluster(s)_annual_om_cost [USD/yr]': annual_om_cost,
-                'overall_annual_om_cost [USD/yr]': overall_annual_om_cost,
-                f'new_cluster(s)_annual_{demand_type} [MWh/yr]': metrics.get(f'total_annual_{demand_type}_MWh', 0),
-                f'overall_annual_{demand_type} [MWh/yr]': overall_annual_demand,
                 'new_cluster(s)_pipe_length [m]': pipe_length,
                 'cumulative_pipe_length [m]': cumulative_pipe_length,
                 f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]': linear_heat_density,
-                f'overall_linear_{demand_type}_density [MWh/km/yr]': overall_linear_density,
-                'new_cluster(s)_ghg_emission [t CO2eq/yr]': self.calculate_ghg_emissions(tuple(clusters)),
-                'overall_ghg_emission [t CO2eq/yr]': sum(r.get('new_cluster(s)_ghg_emission [t CO2eq/yr]', 0) for r in results) + self.calculate_ghg_emissions(tuple(clusters))
+                f'overall_linear_{demand_type}_density [MWh/km/yr]': overall_linear_density
             }
 
             results.append(result)
@@ -1713,23 +1746,32 @@ class DTNExpansionOptimizer:
         # Create DataFrame
         results_df = pd.DataFrame(results)
 
+        # Calculate total years
+        total_years = sum(self.phase_durations)
+
         # Add overall summary row
         summary = {
             'phase': 'Total',
-            'capex_budget [USD]': sum(self.capex_budget_per_phase),
-            'total_expenditure_budget [USD]': sum(self.total_expenditure_budget_per_phase),
-            'ghg_cap [t CO2eq/yr]': 'no_limit' if not self.ghg_budget_per_phase else sum(self.ghg_budget_per_phase),
+            'year': f"Year 1-{total_years}",
             'newly_connected_cluster(s)': '+'.join(map(str, sorted([cluster for phase_result in results if phase_result['phase'] != 0 for cluster in map(int, phase_result['newly_connected_cluster(s)'].split('+'))]))),
             'number_of_newly_connected_buildings': sum(result['number_of_newly_connected_buildings'] for result in results if result['phase'] != 0),
+            'capex_budget_per_phase [USD]': sum(self.capex_budget_per_phase),
+            'new_cluster(s)_capex [USD]': sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0),
+            'cumulative_capex_budget [USD]': sum(self.capex_budget_per_phase),
+            'cumulative_capex [USD]': sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0),
+            'total_expenditure_budget_per_phase [USD]': sum(self.total_expenditure_budget_per_phase),
+            'new_cluster(s)_total_expenditure [USD]': sum(result.get('new_cluster(s)_total_expenditure [USD]', 0) for result in results if result['phase'] != 0),
+            'cumulative_total_expenditure [USD]': sum(result.get('new_cluster(s)_total_expenditure [USD]', 0) for result in results if result['phase'] != 0),
+            'new_cluster(s)_revenue [USD]': sum(result.get('new_cluster(s)_revenue [USD]', 0) for result in results if result['phase'] != 0),
+            'cumulative_revenue [USD]': sum(result.get('new_cluster(s)_revenue [USD]', 0) for result in results if result['phase'] != 0),
+            'new_cluster(s)_om_cost [USD]': sum(result.get('new_cluster(s)_om_cost [USD]', 0) for result in results if result['phase'] != 0),
+            'cumulative_om_cost [USD]': sum(result.get('new_cluster(s)_om_cost [USD]', 0) for result in results if result['phase'] != 0),
+            'ghg_cap [t CO2eq/yr]': 'no_limit' if not self.ghg_budget_per_phase else sum(self.ghg_budget_per_phase),
+            'new_cluster(s)_ghg_emission [t CO2eq/yr]': sum(result['new_cluster(s)_ghg_emission [t CO2eq/yr]'] for result in results if result['phase'] != 0),
             'new_cluster(s)_roi [-]': sum(result['new_cluster(s)_roi [-]'] * result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) / sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) if sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) > 0 else 0,
             'new_cluster(s)_npv [USD]': sum(result['new_cluster(s)_npv [USD]'] for result in results if result['phase'] != 0),
-            'new_cluster(s)_capex [USD]': sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0),
-            'new_cluster(s)_annual_revenue [USD/yr]': sum(result['new_cluster(s)_annual_revenue [USD/yr]'] for result in results if result['phase'] != 0),
-            'new_cluster(s)_annual_om_cost [USD/yr]': sum(result['new_cluster(s)_annual_om_cost [USD/yr]'] for result in results if result['phase'] != 0),
-            f'new_cluster(s)_annual_{demand_type} [MWh/yr]': sum(result[f'new_cluster(s)_annual_{demand_type} [MWh/yr]'] for result in results if result['phase'] != 0),
             'new_cluster(s)_pipe_length [m]': sum(result.get('new_cluster(s)_pipe_length [m]', result.get('newly_added_pipe_length [m]', 0)) for result in results if result['phase'] != 0),
-            f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]': 0,  # Will be calculated below
-            'new_cluster(s)_ghg_emission [t CO2eq/yr]': sum(result['new_cluster(s)_ghg_emission [t CO2eq/yr]'] for result in results if result['phase'] != 0)
+            f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]': 0  # Will be calculated below
         }
 
         # For columns with "overall" or "cumulative" in their name, use the values from the last phase row
@@ -1738,12 +1780,10 @@ class DTNExpansionOptimizer:
             # Add overall and cumulative values from the last phase
             summary['cumulative_cluster(s)'] = last_phase_result['cumulative_cluster(s)']
             summary['cumulative_number_of_buildings_connected'] = last_phase_result['cumulative_number_of_buildings_connected']
+            summary['cumulative_capex [USD]'] = last_phase_result['cumulative_capex [USD]']
+            summary['cumulative_total_expenditure [USD]'] = last_phase_result['cumulative_total_expenditure [USD]']
             summary['overall_roi [-]'] = final_overall_roi  # Already set to last phase value
             summary['overall_npv [USD]'] = last_phase_result['overall_npv [USD]']
-            summary['overall_capex [USD]'] = last_phase_result['overall_capex [USD]']
-            summary['overall_annual_revenue [USD/yr]'] = last_phase_result['overall_annual_revenue [USD/yr]']
-            summary['overall_annual_om_cost [USD/yr]'] = last_phase_result['overall_annual_om_cost [USD/yr]']
-            summary[f'overall_annual_{demand_type} [MWh/yr]'] = last_phase_result[f'overall_annual_{demand_type} [MWh/yr]']
             summary['cumulative_pipe_length [m]'] = last_phase_result['cumulative_pipe_length [m]']
             summary[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = last_phase_result[f'overall_linear_{demand_type}_density [MWh/km/yr]']
             summary['overall_ghg_emission [t CO2eq/yr]'] = last_phase_result['overall_ghg_emission [t CO2eq/yr]']
@@ -1751,12 +1791,10 @@ class DTNExpansionOptimizer:
             # If there are no non-zero phases, use the calculated values
             summary['cumulative_cluster(s)'] = '+'.join(map(str, sorted(cumulative_clusters)))
             summary['cumulative_number_of_buildings_connected'] = len(cumulative_buildings)
+            summary['cumulative_capex [USD]'] = 0
+            summary['cumulative_total_expenditure [USD]'] = 0
             summary['overall_roi [-]'] = 0
             summary['overall_npv [USD]'] = 0
-            summary['overall_capex [USD]'] = 0
-            summary['overall_annual_revenue [USD/yr]'] = 0
-            summary['overall_annual_om_cost [USD/yr]'] = 0
-            summary[f'overall_annual_{demand_type} [MWh/yr]'] = 0
             summary['cumulative_pipe_length [m]'] = cumulative_pipe_length
             summary[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = 0
             summary['overall_ghg_emission [t CO2eq/yr]'] = 0
@@ -1778,6 +1816,7 @@ class DTNExpansionOptimizer:
         metadata = {
             'network_type': self.network_type,
             'num_phases': self.num_phases,
+            'phase_durations [years]': ','.join(map(str, self.phase_durations)),
             'cost_model': self.cost_model,
             'objective_function': self.objective_function,
             'energy_price [USD/kWh]': self.energy_price,

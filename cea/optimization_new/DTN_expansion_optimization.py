@@ -1495,8 +1495,11 @@ class DTNExpansionOptimizer:
                 # Other metrics
                 # Get annual demand directly from cluster metrics
                 f'new_cluster(s)_annual_{demand_type} [MWh/yr]': self.cluster_metrics.get('+'.join(map(str, sorted(clusters))), {}).get(f'total_annual_{demand_type}_MWh', 0),
+                f'cumulative_annual_{demand_type} [MWh/yr]': result[f'cumulative_annual_{demand_type} [MWh/yr]'],
                 'new_cluster(s)_pipe_length [m]': result['new_cluster(s)_pipe_length [m]'],
+                'cumulative_pipe_length [m]': result['cumulative_pipe_length [m]'],
                 f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]': result[f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]'],
+                f'overall_linear_{demand_type}_density [MWh/km/yr]': result[f'overall_linear_{demand_type}_density [MWh/km/yr]'],
                 'new_cluster(s)_ghg_emission [t CO2eq/yr]': result['new_cluster(s)_ghg_emission [t CO2eq/yr]']
             }
 
@@ -1571,6 +1574,8 @@ class DTNExpansionOptimizer:
             'overall_npv [USD]': 0,  # No overall NPV for phase 0
             'new_cluster(s)_pipe_length [m]': 0,  # No new pipes for existing DTN
             'cumulative_pipe_length [m]': 0,  # Will be updated if data is available
+            f'new_cluster(s)_annual_{demand_type} [MWh/yr]': 0,  # Will be updated if data is available
+            f'cumulative_annual_{demand_type} [MWh/yr]': 0,  # Will be updated if data is available
             f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]': 0,  # Will be calculated if data is available
             f'overall_linear_{demand_type}_density [MWh/km/yr]': 0  # Will be calculated if data is available
         }
@@ -1583,9 +1588,20 @@ class DTNExpansionOptimizer:
             pipe_length = metrics.get('total_pipe_length_m', 0)
 
             # Update phase 0 metrics
-            phase0_result['cumulative_pipe_length [m]'] = pipe_length
+            # Get required pipes for cluster 0 using the same method as for other phases
+            required_pipes = self.get_required_pipes_for_clusters((0,))
+            pipe_length_recalculated = required_pipes['length_m'].sum()
+
+            phase0_result['new_cluster(s)_pipe_length [m]'] = pipe_length_recalculated
+            phase0_result['cumulative_pipe_length [m]'] = pipe_length_recalculated
+            phase0_result[f'new_cluster(s)_annual_{demand_type} [MWh/yr]'] = annual_demand
+            phase0_result[f'cumulative_annual_{demand_type} [MWh/yr]'] = annual_demand
             phase0_result[f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]'] = metrics.get(f'linear_{demand_type}_density_MWh_per_km', 0)
-            phase0_result[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = metrics.get(f'linear_{demand_type}_density_MWh_per_km', 0)
+            # Recalculate overall linear heat density for consistency
+            if pipe_length_recalculated > 0:
+                phase0_result[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = annual_demand / (pipe_length_recalculated / 1000)
+            else:
+                phase0_result[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = metrics.get(f'linear_{demand_type}_density_MWh_per_km', 0)
 
             # Estimate CAPEX for cluster 0 (not counted in expansion costs)
             estimated_capex = 0
@@ -1595,7 +1611,7 @@ class DTNExpansionOptimizer:
                 estimated_capex = self.calculate_simplified_capex((0,))
 
             # Update cumulative pipe length
-            cumulative_pipe_length = pipe_length
+            cumulative_pipe_length = pipe_length_recalculated
 
             # Calculate GHG emissions for cluster 0
             phase0_result['new_cluster(s)_ghg_emission [t CO2eq/yr]'] = self.calculate_ghg_emissions((0,))
@@ -1635,21 +1651,22 @@ class DTNExpansionOptimizer:
 
             # Update cumulative values
             cumulative_clusters.update(clusters)
-            cumulative_pipe_length += pipe_length
             cumulative_buildings.update(newly_connected_buildings)
 
-            # Calculate overall linear heat density for all connected clusters so far
-            # Calculate total annual demand for all clusters in the cumulative set
-            overall_annual_demand = 0
-            for cluster in cumulative_clusters:
-                cluster_key = str(cluster)
-                if cluster_key in self.cluster_metrics:
-                    overall_annual_demand += self.cluster_metrics[cluster_key].get(f'total_annual_{demand_type}_MWh', 0)
-                elif '+' in cluster_key:
-                    # Skip combined cluster keys as they're already counted individually
-                    pass
+            # Calculate cumulative annual heat demand by summing new_cluster(s)_annual_{demand_type} values
+            # Include phase 0 and all previous phases
+            cumulative_annual_demand = sum(r.get(f'new_cluster(s)_annual_{demand_type} [MWh/yr]', 0) for r in results)
+            # Add current phase
+            cumulative_annual_demand += metrics.get(f'total_annual_{demand_type}_MWh', 0)
 
-            overall_linear_density = overall_annual_demand / (cumulative_pipe_length / 1000) if cumulative_pipe_length > 0 else 0
+            # Calculate cumulative pipe length by summing new_cluster(s)_pipe_length values
+            # Include phase 0 and all previous phases
+            cumulative_pipe_length = sum(r.get('new_cluster(s)_pipe_length [m]', 0) for r in results)
+            # Add current phase
+            cumulative_pipe_length += pipe_length
+
+            # Calculate overall linear heat density
+            overall_linear_density = cumulative_annual_demand / (cumulative_pipe_length / 1000) if cumulative_pipe_length > 0 else 0
 
             # Add to totals
             total_capex += capex
@@ -1729,6 +1746,8 @@ class DTNExpansionOptimizer:
                 'overall_npv [USD]': overall_npv,
                 'new_cluster(s)_pipe_length [m]': pipe_length,
                 'cumulative_pipe_length [m]': cumulative_pipe_length,
+                f'new_cluster(s)_annual_{demand_type} [MWh/yr]': metrics.get(f'total_annual_{demand_type}_MWh', 0),
+                f'cumulative_annual_{demand_type} [MWh/yr]': cumulative_annual_demand,
                 f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]': linear_heat_density,
                 f'overall_linear_{demand_type}_density [MWh/km/yr]': overall_linear_density
             }
@@ -1771,6 +1790,8 @@ class DTNExpansionOptimizer:
             'new_cluster(s)_roi [-]': sum(result['new_cluster(s)_roi [-]'] * result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) / sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) if sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) > 0 else 0,
             'new_cluster(s)_npv [USD]': sum(result['new_cluster(s)_npv [USD]'] for result in results if result['phase'] != 0),
             'new_cluster(s)_pipe_length [m]': sum(result.get('new_cluster(s)_pipe_length [m]', result.get('newly_added_pipe_length [m]', 0)) for result in results if result['phase'] != 0),
+            f'new_cluster(s)_annual_{demand_type} [MWh/yr]': sum(result.get(f'new_cluster(s)_annual_{demand_type} [MWh/yr]', 0) for result in results if result['phase'] != 0),
+            f'cumulative_annual_{demand_type} [MWh/yr]': 0,  # Will be updated from the last phase
             f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]': 0  # Will be calculated below
         }
 
@@ -1785,6 +1806,7 @@ class DTNExpansionOptimizer:
             summary['overall_roi [-]'] = final_overall_roi  # Already set to last phase value
             summary['overall_npv [USD]'] = last_phase_result['overall_npv [USD]']
             summary['cumulative_pipe_length [m]'] = last_phase_result['cumulative_pipe_length [m]']
+            summary[f'cumulative_annual_{demand_type} [MWh/yr]'] = last_phase_result[f'cumulative_annual_{demand_type} [MWh/yr]']
             summary[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = last_phase_result[f'overall_linear_{demand_type}_density [MWh/km/yr]']
             summary['overall_ghg_emission [t CO2eq/yr]'] = last_phase_result['overall_ghg_emission [t CO2eq/yr]']
         else:
@@ -1796,6 +1818,7 @@ class DTNExpansionOptimizer:
             summary['overall_roi [-]'] = 0
             summary['overall_npv [USD]'] = 0
             summary['cumulative_pipe_length [m]'] = cumulative_pipe_length
+            summary[f'cumulative_annual_{demand_type} [MWh/yr]'] = phase0_result.get(f'cumulative_annual_{demand_type} [MWh/yr]', 0)
             summary[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = 0
             summary['overall_ghg_emission [t CO2eq/yr]'] = 0
 

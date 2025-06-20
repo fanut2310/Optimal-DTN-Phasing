@@ -1,0 +1,6 @@
+get_lca_embodied,path:outputs/data/emissions/Total_LCA_embodied.csv
+Variable,Description
+GFA_m2,Gross floor area
+GHG_sys_embodied_kgCO2m2,Embodied emissions per conditioned floor area due to building construction and decommissioning
+GHG_sys_embodied_tonCO2,Embodied emissions due to building construction and decommissioning
+name,Unique building ID. It must start with a letter.

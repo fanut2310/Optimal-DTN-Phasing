@@ -1,0 +1,6 @@
+get_lca_mobility,path:outputs/data/emissions/Total_LCA_mobility.csv
+Variable,Description
+GFA_m2,Gross floor area
+GHG_sys_mobility_kgCO2m2,Operational emissions per unit of conditioned floor area due to mobility
+GHG_sys_mobility_tonCO2,Operational emissions due to mobility
+name,Unique building ID. It must start with a letter.

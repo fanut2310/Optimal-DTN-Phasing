@@ -1,0 +1,74 @@
+get_lca_operation,path:outputs/data/emissions/Total_LCA_operation.csv
+Variable,Description
+COAL_hs_ghg_kgm2,Operational emissions per unit of conditioned floor area of the coal powererd heating system
+COAL_hs_ghg_ton,Operational emissions of the coal powered heating system
+COAL_hs_nre_pen_GJ,Operational primary energy demand (non-renewable) for coal powered heating system
+COAL_hs_nre_pen_MJm2,Operational primary energy demand per unit of conditioned floor area (non-renewable) of the coal powered heating system
+COAL_ww_ghg_kgm2,Operational emissions per unit of conditioned floor area of the coal powered domestic hot water system
+COAL_ww_ghg_ton,Operational emissions of the coal powered domestic hot water system
+COAL_ww_nre_pen_GJ,Operational primary energy demand (non-renewable) for coal powered domestic hot water system
+COAL_ww_nre_pen_MJm2,Operational primary energy demand per unit of conditioned floor area (non-renewable) of the coal powered domestic hot water system
+DC_cdata_ghg_kgm2,Operational emissions per unit of conditioned floor area of the district cooling for the data center
+DC_cdata_ghg_ton,Operational emissions of the district cooling for the data center
+DC_cdata_nre_pen_GJ,Operational primary energy demand (non-renewable) for district cooling system for cool room refrigeration
+DC_cdata_nre_pen_MJm2,Operational primary energy demand per unit of conditioned floor area (non-renewable) for district cooling for cool room refrigeration
+DC_cre_ghg_kgm2,Operational emissions per unit of conditioned floor area for district cooling system for cool room refrigeration
+DC_cre_ghg_ton,Operational emissions for district cooling system for cool room refrigeration
+DC_cre_nre_pen_GJ,Operational primary energy demand (non-renewable) for district cooling system for cool room refrigeration
+DC_cre_nre_pen_MJm2,Operational primary energy demand per unit of conditioned floor area (non-renewable) for cool room refrigeration
+DC_cs_ghg_kgm2,Operational emissions per unit of conditioned floor area of the district cooling
+DC_cs_ghg_ton,Operational emissions of the district cooling
+DC_cs_nre_pen_GJ,Operational primary energy demand (non-renewable) for district cooling system
+DC_cs_nre_pen_MJm2,Operational primary energy demand per unit of conditioned floor area (non-renewable) of the district cooling
+DH_hs_ghg_kgm2,Operational emissions per unit of conditioned floor area of the district heating system
+DH_hs_ghg_ton,Operational emissions of the district heating system
+DH_hs_nre_pen_GJ,Operational primary energy demand (non-renewable) for district heating system
+DH_hs_nre_pen_MJm2,Operational primary energy demand per unit of conditioned floor area (non-renewable) of the district heating system
+DH_ww_ghg_kgm2,Operational emissions per unit of conditioned floor area of the district heating domestic hot water system
+DH_ww_ghg_ton,Operational emissions of the district heating powered domestic hot water system
+DH_ww_nre_pen_GJ,Operational primary energy demand (non-renewable) for district heating powered domestic hot water system
+DH_ww_nre_pen_MJm2,Operational primary energy demand per unit of conditioned floor area (non-renewable) of the district heating domestic hot water system
+GFA_m2,Gross floor area
+GHG_sys_kgCO2m2,Total operational emissions per unit of conditioned floor area
+GHG_sys_tonCO2,Total operational emissions
+GRID_ghg_kgm2,Operational emissions per unit of conditioned floor area from grid electricity
+GRID_ghg_ton,Operational emissions of the electrictiy from the grid
+GRID_nre_pen_GJ,Operational primary energy demand (non-renewable) from the grid
+GRID_nre_pen_MJm2,Operational primary energy demand per unit of conditioned floor area (non-renewable) from grid electricity
+Name,Unique building ID. It must start with a letter.
+NG_hs_ghg_kgm2,Operational emissions per unit of conditioned floor area of the natural gas powered heating system
+NG_hs_ghg_ton,Operational emissions of the natural gas powered heating system
+NG_hs_nre_pen_GJ,Operational primary energy demand (non-renewable) for natural gas powered heating system
+NG_hs_nre_pen_MJm2,Operational primary energy demand per unit of conditioned floor area (non-renewable) of the natural gas powered heating system
+NG_ww_ghg_kgm2,Operational emissions per unit of conditioned floor area of the gas powered domestic hot water system
+NG_ww_ghg_ton,Operational emissions of the solar powered domestic hot water system
+NG_ww_nre_pen_GJ,Operational primary energy demand (non-renewable) for natural gas powered domestic hot water system
+NG_ww_nre_pen_MJm2,Operational primary energy demand per unit of conditioned floor area (non-renewable) of the natural gas powered domestic hot water system
+OIL_hs_ghg_kgm2,Operational emissions per unit of conditioned floor area of the oil powered heating system
+OIL_hs_ghg_ton,Operational emissions of the oil powered heating system
+OIL_hs_nre_pen_GJ,Operational primary energy demand (non-renewable) for oil powered heating system
+OIL_hs_nre_pen_MJm2,Operational primary energy demand per unit of conditioned floor area (non-renewable) of the oil powered heating system
+OIL_ww_ghg_kgm2,Operational emissions per unit of conditioned floor area of the oil powered domestic hot water system
+OIL_ww_ghg_ton,Operational emissions of the oil powered domestic hot water system
+OIL_ww_nre_pen_GJ,Operational primary energy demand (non-renewable) for oil powered domestic hot water system
+OIL_ww_nre_pen_MJm2,Operational primary energy demand per unit of conditioned floor area (non-renewable) of the oil powered domestic hot water system
+PV_ghg_kgm2,Operational emissions per unit of conditioned floor area for PV-System
+PV_ghg_ton,Operational emissions of the PV-System
+PV_nre_pen_GJ,Operational primary energy demand (non-renewable) for PV-System
+PV_nre_pen_MJm2,Operational primary energy demand per unit of conditioned floor area (non-renewable) for PV System
+SOLAR_hs_ghg_kgm2,Operational emissions per unit of conditioned floor area of the solar powered heating system
+SOLAR_hs_ghg_ton,Operational emissions of the solar powered heating system
+SOLAR_hs_nre_pen_GJ,Operational primary energy demand (non-renewable) of the solar powered heating system
+SOLAR_hs_nre_pen_MJm2,Operational primary energy demand per unit of conditioned floor area (non-renewable) of the solar powered heating system
+SOLAR_ww_ghg_kgm2,Operational emissions per unit of conditioned floor area of the solar powered domestic hot water system
+SOLAR_ww_ghg_ton,Operational emissions of the solar powered domestic hot water system
+SOLAR_ww_nre_pen_GJ,Operational primary energy demand (non-renewable) for solar powered domestic hot water system
+SOLAR_ww_nre_pen_MJm2,Operational primary energy demand per unit of conditioned floor area (non-renewable) of the solar poweed domestic hot water system
+WOOD_hs_ghg_kgm2,Operational emissions per unit of conditioned floor area of the wood powered heating system
+WOOD_hs_ghg_ton,Operational emissions of the wood powered heating system
+WOOD_hs_nre_pen_GJ,Operational primary energy demand (non-renewable) for wood powered heating system
+WOOD_hs_nre_pen_MJm2,Operational primary energy demand per unit of conditioned floor area (non-renewable) of the wood powered heating system
+WOOD_ww_ghg_kgm2,Operational emissions per unit of conditioned floor area of the wood powered domestic hot water system
+WOOD_ww_ghg_ton,Operational emissions of the wood powered domestic hot water system
+WOOD_ww_nre_pen_GJ,Operational primary energy demand (non-renewable) for wood powered domestic hot water system
+WOOD_ww_nre_pen_MJm2,Operational primary energy demand per unit of conditioned floor area (non-renewable) of the wood powered domestic hot water system

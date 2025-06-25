@@ -283,6 +283,9 @@ class DTNExpansionOptimizer:
         # Create a mapping from cluster combinations to their metrics
         self.cluster_metrics = self._create_cluster_metrics_mapping()
 
+        # Create a cache for emissions results
+        self.emissions_cache = {}
+
         # Initialize DEAP toolbox
         self.toolbox = base.Toolbox()
         self._setup_genetic_algorithm()
@@ -997,9 +1000,136 @@ class DTNExpansionOptimizer:
 
         return npv
 
+    def calculate_emissions_for_genome(self, cluster_phase_map):
+        """
+        Calculate emissions for a specific genome by temporarily modifying supply systems
+        and running the LCA operation module.
+
+        Parameters:
+        -----------
+        cluster_phase_map : dict
+            Dictionary mapping cluster IDs to phases
+
+        Returns:
+        --------
+        dict
+            Dictionary with emissions per phase
+        """
+        import os
+        import shutil
+
+        # Initialize results dictionary - only track operation emissions
+        phase_emissions = {phase: {'operation': 0} 
+                          for phase in range(1, self.num_phases + 1)}
+
+        # Get original supply file
+        supply_file = self.locator.get_building_supply()
+        original_supply_df = pd.read_csv(supply_file)
+
+        # Make a copy for modifications
+        modified_supply_df = original_supply_df.copy()
+
+        # Get district supply systems from cluster 0 buildings
+        cluster0_buildings = self._get_buildings_in_specific_cluster(0)
+        if not cluster0_buildings:
+            log().warning("No buildings found in cluster 0 (existing DTN)")
+            return phase_emissions
+
+        # Get supply systems used by cluster 0 (existing DTN)
+        district_supply_systems = original_supply_df[original_supply_df['name'].isin(cluster0_buildings)]
+
+        # Extract district supply types
+        district_heating_system = district_supply_systems['supply_type_hs'].iloc[0]
+        district_cooling_system = district_supply_systems['supply_type_cs'].iloc[0]
+        district_dhw_system = district_supply_systems['supply_type_dhw'].iloc[0]
+
+        # Verify these are DISTRICT scale systems
+        heating_df = pd.read_csv(self.locator.get_database_assemblies_supply_heating())
+        cooling_df = pd.read_csv(self.locator.get_database_assemblies_supply_cooling())
+        dhw_df = pd.read_csv(self.locator.get_database_assemblies_supply_hot_water())
+
+        # Check if district systems are actually DISTRICT scale
+        is_district_heating = heating_df[heating_df['code'] == district_heating_system]['scale'].iloc[0] == 'DISTRICT'
+        is_district_cooling = cooling_df[cooling_df['code'] == district_cooling_system]['scale'].iloc[0] == 'DISTRICT'
+        is_district_dhw = dhw_df[dhw_df['code'] == district_dhw_system]['scale'].iloc[0] == 'DISTRICT'
+
+        if not (is_district_heating and is_district_cooling and is_district_dhw):
+            log().warning("Cluster 0 buildings are not using DISTRICT scale supply systems")
+
+        # Process each phase
+        connected_clusters_by_phase = {}
+        for phase in range(1, self.num_phases + 1):
+            # Get clusters connected in this phase
+            newly_connected_clusters = [cluster for cluster, p in cluster_phase_map.items() if p == phase]
+            connected_clusters_by_phase[phase] = newly_connected_clusters
+
+            # Get buildings in these clusters
+            newly_connected_buildings = []
+            for cluster in newly_connected_clusters:
+                buildings = self._get_buildings_in_specific_cluster(cluster)
+                newly_connected_buildings.extend(buildings)
+
+            # Update supply systems for newly connected buildings
+            for building in newly_connected_buildings:
+                building_idx = modified_supply_df[modified_supply_df['name'] == building].index
+                if len(building_idx) > 0:
+                    modified_supply_df.loc[building_idx, 'supply_type_hs'] = district_heating_system
+                    modified_supply_df.loc[building_idx, 'supply_type_cs'] = district_cooling_system
+                    modified_supply_df.loc[building_idx, 'supply_type_dhw'] = district_dhw_system
+
+        # Save modified supply file to a temporary location
+        temp_supply_file = os.path.join(self.locator.get_temporary_folder(), 'temp_supply.csv')
+        modified_supply_df.to_csv(temp_supply_file, index=False)
+
+        # Create a backup of the original file
+        backup_supply_file = os.path.join(self.locator.get_temporary_folder(), 'backup_supply.csv')
+        original_supply_df.to_csv(backup_supply_file, index=False)
+
+        try:
+            # Replace the original file with the modified one
+            shutil.copy(temp_supply_file, supply_file)
+
+            # Run LCA operation module
+            from cea.analysis.lca.operation import lca_operation
+            lca_operation(self.locator)
+
+            # Load LCA results
+            lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
+
+            # Load embodied emissions if available
+            try:
+                lca_embodied_results = pd.read_csv(self.locator.get_lca_embodied())
+                has_embodied = True
+            except:
+                has_embodied = False
+                log().warning("Embodied emissions results not found. Only operational emissions will be considered.")
+
+            # Calculate emissions for each phase
+            for phase in range(1, self.num_phases + 1):
+                # Get all buildings connected up to this phase
+                all_connected_buildings = cluster0_buildings.copy()  # Start with cluster 0
+                for p in range(1, phase + 1):
+                    for cluster in connected_clusters_by_phase.get(p, []):
+                        all_connected_buildings.extend(self._get_buildings_in_specific_cluster(cluster))
+
+                # Calculate operational emissions for connected buildings
+                connected_operation = lca_operation_results[lca_operation_results['name'].isin(all_connected_buildings)]
+                phase_emissions[phase]['operation'] = connected_operation['GHG_sys_tonCO2'].sum()
+
+        finally:
+            # Restore the original supply file
+            shutil.copy(backup_supply_file, supply_file)
+
+        return phase_emissions
+
+    def _cache_emissions_for_individual(self, individual, emissions):
+        """Store emissions results for an individual in the cache"""
+        self.emissions_cache[individual] = emissions
+
     def calculate_ghg_emissions(self, cluster_set):
         """
-        Calculate GHG emissions for a cluster set using a detailed approach based on the CEA emissions module.
+        Calculate GHG emissions for a cluster set.
+        This method is kept for backward compatibility but now uses the new approach.
 
         Parameters:
         -----------
@@ -1011,164 +1141,14 @@ class DTNExpansionOptimizer:
         float
             Total GHG emissions in tonCO2
         """
-        # Get metrics for this cluster set
-        key = '+'.join(map(str, sorted(cluster_set)))
-        log().debug(f"Calculating GHG emissions for cluster set: {key}")
+        # Create a simple cluster-phase mapping where all clusters in the set are in phase 1
+        cluster_phase_map = {cluster: 1 for cluster in cluster_set}
 
-        if key not in self.cluster_metrics:
-            log().warning(f"No metrics found for cluster set: {key}")
-            return 0  # No emissions data available
+        # Calculate emissions using the new approach
+        emissions = self.calculate_emissions_for_genome(cluster_phase_map)
 
-        metrics = self.cluster_metrics[key]
-
-        # Get buildings in the clusters
-        buildings = self._get_buildings_in_clusters(cluster_set)
-        log().debug(f"Found {len(buildings)} buildings in cluster set {key}")
-
-        if not buildings:
-            log().warning(f"No buildings found in cluster set: {key}")
-            return 0  # No buildings, no emissions
-
-        # Get the energy demand for the cluster set
-        if self.network_type == 'DH':
-            annual_demand_mwh = metrics.get('total_annual_Qh_MWh', 0)
-            demand_type = 'heating'
-        else:
-            annual_demand_mwh = metrics.get('total_annual_Qc_MWh', 0)
-            demand_type = 'cooling'
-
-        log().debug(f"Annual {demand_type} demand for cluster set {key}: {annual_demand_mwh} MWh")
-
-        # Read emission factors from the database
-        try:
-            # Get the appropriate emission factors based on network type
-            if self.network_type == 'DH':
-                factors = pd.read_csv(self.locator.get_database_assemblies_supply_heating())
-                log().debug(f"Loaded {len(factors)} heating supply factors")
-            else:
-                factors = pd.read_csv(self.locator.get_database_assemblies_supply_cooling())
-                log().debug(f"Loaded {len(factors)} cooling supply factors")
-
-            # Get the feedstock emission factors
-            factors_resources = {}
-            list_feedstocks = []
-            try:
-                from cea.datamanagement.format_helper.cea4_verify_db import get_csv_filenames
-                list_feedstocks = get_csv_filenames(self.locator.get_db4_components_feedstocks_library_folder())
-                log().debug(f"Found {len(list_feedstocks)} feedstock types")
-
-                for feedstock in list_feedstocks:
-                    feedstock_file = self.locator.get_db4_components_feedstocks_feedstocks_csv(feedstocks=feedstock)
-                    log().debug(f"Loading feedstock data from: {feedstock_file}")
-                    factors_resources[feedstock] = pd.read_csv(feedstock_file)
-            except Exception as ex:
-                log().warning(f"Could not access feedstock database: {ex}. Using simplified emission factors.")
-                return self._calculate_simplified_emissions(annual_demand_mwh, demand_type)
-
-            # Get the mean of all values for each feedstock
-            factors_resources_simple = [(name, values['GHG_kgCO2MJ'].mean()) for name, values in factors_resources.items()
-                                        if name != 'ENERGY_CARRIERS']
-            log().debug(f"Processed {len(factors_resources_simple)} feedstock emission factors")
-
-            factors_resources_simple = pd.concat([pd.DataFrame(factors_resources_simple, columns=['code', 'GHG_kgCO2MJ']),
-                                                pd.DataFrame([{'code': 'NONE'}])],  # append NONE choice with zero values
-                                                ignore_index=True).fillna(0)
-
-            # Merge with the supply system factors
-            if self.network_type == 'DH':
-                # For district heating, use district heating factors
-                emission_factors = factors.merge(factors_resources_simple, left_on='feedstock', right_on='code')[
-                    ['code_x', 'feedstock', 'GHG_kgCO2MJ']]
-                log().debug(f"Merged heating factors with feedstock factors, result has {len(emission_factors)} rows")
-
-                if len(emission_factors) > 0:
-                    # Use the district heating emission factor (assuming first row is for district heating)
-                    emission_factor_kgco2_per_mj = emission_factors['GHG_kgCO2MJ'].iloc[0]
-                    log().info(f"Using emission factor for DH: {emission_factor_kgco2_per_mj} kgCO2/MJ")
-                else:
-                    log().warning("No emission factors found after merging heating factors with feedstock factors")
-                    return self._calculate_simplified_emissions(annual_demand_mwh, demand_type)
-            else:
-                # For district cooling, use district cooling factors
-                emission_factors = factors.merge(factors_resources_simple, left_on='feedstock', right_on='code')[
-                    ['code_x', 'feedstock', 'GHG_kgCO2MJ']]
-                log().debug(f"Merged cooling factors with feedstock factors, result has {len(emission_factors)} rows")
-
-                if len(emission_factors) > 0:
-                    # Use the district cooling emission factor (assuming first row is for district cooling)
-                    emission_factor_kgco2_per_mj = emission_factors['GHG_kgCO2MJ'].iloc[0]
-                    log().info(f"Using emission factor for DC: {emission_factor_kgco2_per_mj} kgCO2/MJ")
-                else:
-                    log().warning("No emission factors found after merging cooling factors with feedstock factors")
-                    return self._calculate_simplified_emissions(annual_demand_mwh, demand_type)
-
-            # Check if emission factor is zero, if so try to read directly from GRID.csv
-            if emission_factor_kgco2_per_mj == 0:
-                try:
-                    # Try to read emission factor directly from GRID.csv
-                    grid_file = self.locator.get_db4_components_feedstocks_feedstocks_csv(feedstocks='GRID')
-                    grid_factors = pd.read_csv(grid_file)
-                    emission_factor_kgco2_per_mj = grid_factors['GHG_kgCO2MJ'].mean()
-                    log().info(f"Using grid emission factor: {emission_factor_kgco2_per_mj} kgCO2/MJ")
-
-                    # If still zero, use default values based on network type
-                    if emission_factor_kgco2_per_mj == 0:
-                        if self.network_type == 'DH':
-                            emission_factor_kgco2_per_mj = 0.0556  # 0.2 kgCO2/kWh converted to kgCO2/MJ
-                            log().info(f"Using default DH emission factor: {emission_factor_kgco2_per_mj} kgCO2/MJ")
-                        else:
-                            emission_factor_kgco2_per_mj = 0.0417  # 0.15 kgCO2/kWh converted to kgCO2/MJ
-                            log().info(f"Using default DC emission factor: {emission_factor_kgco2_per_mj} kgCO2/MJ")
-                except Exception as ex:
-                    log().warning(f"Could not read grid emission factor: {ex}. Using simplified emission factors.")
-                    return self._calculate_simplified_emissions(annual_demand_mwh, demand_type)
-
-            # Convert emission factor from kgCO2/MJ to kgCO2/kWh
-            # 1 kWh = 3.6 MJ, so multiply by 3.6
-            emission_factor_kgco2_per_kwh = emission_factor_kgco2_per_mj * 3.6
-            log().debug(f"Converted emission factor: {emission_factor_kgco2_per_kwh} kgCO2/kWh")
-
-            # Calculate emissions directly in kgCO2 using kWh
-            annual_demand_kwh = annual_demand_mwh * 1000  # Convert MWh to kWh
-            emissions_kgco2 = annual_demand_kwh * emission_factor_kgco2_per_kwh
-            log().debug(f"Calculated emissions: {emissions_kgco2} kgCO2")
-
-            # Convert to tonCO2
-            emissions_tonco2 = emissions_kgco2 / 1000
-            log().info(f"Final emissions for cluster set {key}: {emissions_tonco2} tonCO2")
-
-            return emissions_tonco2
-
-        except Exception as ex:
-            log().warning(f"Error calculating detailed emissions: {ex}. Using simplified emission factors.")
-            return self._calculate_simplified_emissions(annual_demand_mwh, demand_type)
-
-    def _calculate_simplified_emissions(self, annual_demand_mwh, demand_type):
-        """
-        Calculate emissions using a simplified approach based on energy demand.
-
-        Parameters:
-        -----------
-        annual_demand_mwh : float
-            Annual energy demand in MWh
-        demand_type : str
-            Type of demand ('heating' or 'cooling')
-
-        Returns:
-        --------
-        float
-            Total GHG emissions in tonCO2
-        """
-        # Use simplified emission factors
-        if demand_type == 'heating':
-            emissions_factor = 0.2  # tonCO2/MWh for heating (example value)
-        else:
-            emissions_factor = 0.15  # tonCO2/MWh for cooling (example value)
-
-        # Calculate emissions
-        emissions = annual_demand_mwh * emissions_factor
-
-        return emissions
+        # Return the operational emissions for phase 1
+        return emissions[1]['operation']
 
     def _setup_genetic_algorithm(self):
         """Set up the genetic algorithm using DEAP."""
@@ -1190,7 +1170,7 @@ class DTNExpansionOptimizer:
 
     def _evaluate_individual(self, individual):
         """
-        Evaluate the fitness of an individual.
+        Evaluate the fitness of an individual using the new emissions calculation approach.
 
         Parameters:
         -----------
@@ -1213,9 +1193,17 @@ class DTNExpansionOptimizer:
         phase_capex = [0] * self.num_phases
         phase_total_expenditure = [0] * self.num_phases
 
-        # Check if GHG budget constraints are satisfied
-        if self.ghg_budget_per_phase:
-            phase_ghg = [0] * self.num_phases
+        # Calculate emissions using the new approach
+        ind_tuple = tuple(individual)
+        if ind_tuple in self.emissions_cache:
+            # Use cached emissions results if available
+            phase_emissions = self.emissions_cache[ind_tuple]
+            log().debug(f"Using cached emissions for individual {ind_tuple}")
+        else:
+            # Calculate emissions and cache the results
+            phase_emissions = self.calculate_emissions_for_genome(cluster_phase_map)
+            self._cache_emissions_for_individual(ind_tuple, phase_emissions)
+            log().debug(f"Calculated and cached emissions for individual {ind_tuple}")
 
         # Group clusters by phase
         clusters_by_phase = {}
@@ -1239,17 +1227,12 @@ class DTNExpansionOptimizer:
             roi = self.calculate_roi(tuple(clusters), phase)
             npv = self.calculate_npv(tuple(clusters), phase)
 
-            # Calculate GHG emissions if budget is specified
-            if self.ghg_budget_per_phase:
-                ghg_emissions = self.calculate_ghg_emissions(tuple(clusters))
-                phase_ghg[phase-1] = ghg_emissions
-
             total_roi += roi
             total_npv += npv
 
         # Check CAPEX budget constraints
         for phase in range(self.num_phases):
-            if phase < len(phase_capex) and phase_capex[phase] > self.capex_budget_per_phase[phase]:
+            if phase < len(phase_capex) and self.capex_budget_per_phase and phase_capex[phase] > self.capex_budget_per_phase[phase]:
                 # Apply penalty for exceeding CAPEX budget
                 total_roi = -1000
                 total_npv = -1000000
@@ -1257,7 +1240,7 @@ class DTNExpansionOptimizer:
 
         # Check total expenditure budget constraints
         for phase in range(self.num_phases):
-            if phase < len(phase_total_expenditure) and phase_total_expenditure[phase] > self.total_expenditure_budget_per_phase[phase]:
+            if phase < len(phase_total_expenditure) and self.total_expenditure_budget_per_phase and phase_total_expenditure[phase] > self.total_expenditure_budget_per_phase[phase]:
                 # Apply penalty for exceeding total expenditure budget
                 total_roi = -1000
                 total_npv = -1000000
@@ -1266,17 +1249,48 @@ class DTNExpansionOptimizer:
         # Check GHG budget constraints if specified
         if self.ghg_budget_per_phase:
             for phase in range(self.num_phases):
-                if phase < len(phase_ghg) and self.ghg_budget_per_phase[phase] > 0 and phase_ghg[phase] > self.ghg_budget_per_phase[phase]:
-                    # Apply penalty for exceeding GHG budget
-                    total_roi = -1000
-                    total_npv = -1000000
-                    break
+                if phase < self.num_phases and self.ghg_budget_per_phase[phase] > 0:
+                    phase_ghg = phase_emissions[phase+1]['operation']  # +1 because phases are 1-indexed in the results
+                    if phase_ghg > self.ghg_budget_per_phase[phase]:
+                        # Apply penalty for exceeding GHG budget
+                        total_roi = -1000
+                        total_npv = -1000000
+                        break
 
         # Return fitness based on selected objective function
         if self.objective_function == 'ROI':
             return (total_roi,)
         else:  # Default to NPV
             return (total_npv,)
+
+    def _verify_cluster0_supply_systems(self):
+        """Verify that buildings in cluster 0 have DISTRICT scale supply systems"""
+        cluster0_buildings = self._get_buildings_in_specific_cluster(0)
+        if not cluster0_buildings:
+            log().warning("No buildings found in cluster 0 (existing DTN)")
+            return
+
+        # Get supply systems
+        supply_df = pd.read_csv(self.locator.get_building_supply())
+        cluster0_supply = supply_df[supply_df['name'].isin(cluster0_buildings)]
+
+        # Get supply system definitions
+        heating_df = pd.read_csv(self.locator.get_database_assemblies_supply_heating())
+        cooling_df = pd.read_csv(self.locator.get_database_assemblies_supply_cooling())
+        dhw_df = pd.read_csv(self.locator.get_database_assemblies_supply_hot_water())
+
+        # Check if all systems are DISTRICT scale
+        for _, row in cluster0_supply.iterrows():
+            hs_code = row['supply_type_hs']
+            cs_code = row['supply_type_cs']
+            dhw_code = row['supply_type_dhw']
+
+            hs_scale = heating_df[heating_df['code'] == hs_code]['scale'].iloc[0] if len(heating_df[heating_df['code'] == hs_code]) > 0 else 'UNKNOWN'
+            cs_scale = cooling_df[cooling_df['code'] == cs_code]['scale'].iloc[0] if len(cooling_df[cooling_df['code'] == cs_code]) > 0 else 'UNKNOWN'
+            dhw_scale = dhw_df[dhw_df['code'] == dhw_code]['scale'].iloc[0] if len(dhw_df[dhw_df['code'] == dhw_code]) > 0 else 'UNKNOWN'
+
+            if hs_scale != 'DISTRICT' or cs_scale != 'DISTRICT' or dhw_scale != 'DISTRICT':
+                log().warning(f"Building {row['name']} in cluster 0 does not use DISTRICT scale systems: HS={hs_scale}, CS={cs_scale}, DHW={dhw_scale}")
 
     def optimize(self, population_size=50, num_generations=30):
         """
@@ -1294,6 +1308,9 @@ class DTNExpansionOptimizer:
         dict
             Dictionary with the optimal solution
         """
+        # Verify cluster 0 buildings have district supply systems
+        self._verify_cluster0_supply_systems()
+
         # Create initial population
         pop = self.toolbox.population(n=population_size)
 
@@ -1499,9 +1516,21 @@ class DTNExpansionOptimizer:
                 'new_cluster(s)_pipe_length [m]': result['new_cluster(s)_pipe_length [m]'],
                 'cumulative_pipe_length [m]': result['cumulative_pipe_length [m]'],
                 f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]': result[f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]'],
-                f'overall_linear_{demand_type}_density [MWh/km/yr]': result[f'overall_linear_{demand_type}_density [MWh/km/yr]'],
-                'new_cluster(s)_ghg_emission [t CO2eq/yr]': result['new_cluster(s)_ghg_emission [t CO2eq/yr]']
+                f'overall_linear_{demand_type}_density [MWh/km/yr]': result[f'overall_linear_{demand_type}_density [MWh/km/yr]']
             }
+
+            # Add emissions data from the best individual
+            if 'individual' in result:
+                ind_tuple = tuple(result['individual'])
+                if ind_tuple in self.emissions_cache:
+                    emissions = self.emissions_cache[ind_tuple]
+                    # Add emissions data for this phase - only operational emissions
+                    detailed_result['phase_operation_emissions_tonCO2'] = emissions[phase]['operation']
+
+                    # Add cumulative emissions data (sum of all phases up to this one)
+                    cumulative_operation = sum(emissions[p]['operation'] for p in range(1, phase + 1))
+                    detailed_result['cumulative_operation_emissions_tonCO2'] = cumulative_operation
+                    detailed_result['district_operation_emission_tonCO2'] = cumulative_operation
 
             detailed_results.append(detailed_result)
 
@@ -1565,9 +1594,8 @@ class DTNExpansionOptimizer:
             'cumulative_revenue [USD]': 0,  # No cumulative revenue for phase 0
             'new_cluster(s)_om_cost [USD]': 0,  # No OM costs for existing DTN
             'cumulative_om_cost [USD]': 0,  # No cumulative OM costs for phase 0
-            'ghg_cap [t CO2eq/yr]': 'no_limit',  # No GHG cap for existing DTN
-            'new_cluster(s)_ghg_emission [t CO2eq/yr]': 0,  # Will be calculated if data is available
-            'overall_ghg_emission [t CO2eq/yr]': 0,  # Will be calculated if data is available
+            'ghg_cap [t CO2eq/yr]': '-',  # No GHG cap for existing DTN
+            'district_operation_emission [t CO2eq/yr]': self.calculate_ghg_emissions((0,)),
             'new_cluster(s)_roi [-]': 0,  # No ROI for existing DTN
             'overall_roi [-]': 0,  # No overall ROI for phase 0
             'new_cluster(s)_npv [USD]': 0,  # No NPV for existing DTN
@@ -1612,10 +1640,6 @@ class DTNExpansionOptimizer:
 
             # Update cumulative pipe length
             cumulative_pipe_length = pipe_length_recalculated
-
-            # Calculate GHG emissions for cluster 0
-            phase0_result['new_cluster(s)_ghg_emission [t CO2eq/yr]'] = self.calculate_ghg_emissions((0,))
-            phase0_result['overall_ghg_emission [t CO2eq/yr]'] = phase0_result['new_cluster(s)_ghg_emission [t CO2eq/yr]']
 
         results.append(phase0_result)
 
@@ -1738,8 +1762,7 @@ class DTNExpansionOptimizer:
                 'new_cluster(s)_om_cost [USD]': total_om_cost,
                 'cumulative_om_cost [USD]': cumulative_om_cost,
                 'ghg_cap [t CO2eq/yr]': self.ghg_budget_per_phase[phase-1] if self.ghg_budget_per_phase and phase-1 < len(self.ghg_budget_per_phase) else 'no_limit',
-                'new_cluster(s)_ghg_emission [t CO2eq/yr]': self.calculate_ghg_emissions(tuple(clusters)),
-                'overall_ghg_emission [t CO2eq/yr]': sum(r.get('new_cluster(s)_ghg_emission [t CO2eq/yr]', 0) for r in results) + self.calculate_ghg_emissions(tuple(clusters)),
+                'district_operation_emission [t CO2eq/yr]': sum(r.get('district_operation_emission [t CO2eq/yr]', 0) for r in results if r['phase'] == 0) + self.calculate_ghg_emissions(tuple(clusters)),
                 'new_cluster(s)_roi [-]': roi,
                 'overall_roi [-]': overall_roi,
                 'new_cluster(s)_npv [USD]': npv,
@@ -1785,8 +1808,8 @@ class DTNExpansionOptimizer:
             'cumulative_revenue [USD]': sum(result.get('new_cluster(s)_revenue [USD]', 0) for result in results if result['phase'] != 0),
             'new_cluster(s)_om_cost [USD]': sum(result.get('new_cluster(s)_om_cost [USD]', 0) for result in results if result['phase'] != 0),
             'cumulative_om_cost [USD]': sum(result.get('new_cluster(s)_om_cost [USD]', 0) for result in results if result['phase'] != 0),
-            'ghg_cap [t CO2eq/yr]': 'no_limit' if not self.ghg_budget_per_phase else sum(self.ghg_budget_per_phase),
-            'new_cluster(s)_ghg_emission [t CO2eq/yr]': sum(result['new_cluster(s)_ghg_emission [t CO2eq/yr]'] for result in results if result['phase'] != 0),
+            'ghg_cap [t CO2eq/yr]': self.ghg_budget_per_phase[-1] if self.ghg_budget_per_phase else '-',
+            'district_operation_emission [t CO2eq/yr]': last_phase_result['district_operation_emission [t CO2eq/yr]'] if results and any(r['phase'] != 0 for r in results) else 0,
             'new_cluster(s)_roi [-]': sum(result['new_cluster(s)_roi [-]'] * result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) / sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) if sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) > 0 else 0,
             'new_cluster(s)_npv [USD]': sum(result['new_cluster(s)_npv [USD]'] for result in results if result['phase'] != 0),
             'new_cluster(s)_pipe_length [m]': sum(result.get('new_cluster(s)_pipe_length [m]', result.get('newly_added_pipe_length [m]', 0)) for result in results if result['phase'] != 0),
@@ -1808,7 +1831,6 @@ class DTNExpansionOptimizer:
             summary['cumulative_pipe_length [m]'] = last_phase_result['cumulative_pipe_length [m]']
             summary[f'cumulative_annual_{demand_type} [MWh/yr]'] = last_phase_result[f'cumulative_annual_{demand_type} [MWh/yr]']
             summary[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = last_phase_result[f'overall_linear_{demand_type}_density [MWh/km/yr]']
-            summary['overall_ghg_emission [t CO2eq/yr]'] = last_phase_result['overall_ghg_emission [t CO2eq/yr]']
         else:
             # If there are no non-zero phases, use the calculated values
             summary['cumulative_cluster(s)'] = '+'.join(map(str, sorted(cumulative_clusters)))
@@ -1820,7 +1842,7 @@ class DTNExpansionOptimizer:
             summary['cumulative_pipe_length [m]'] = cumulative_pipe_length
             summary[f'cumulative_annual_{demand_type} [MWh/yr]'] = phase0_result.get(f'cumulative_annual_{demand_type} [MWh/yr]', 0)
             summary[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = 0
-            summary['overall_ghg_emission [t CO2eq/yr]'] = 0
+            summary['district_operation_emission [t CO2eq/yr]'] = 0
 
         # Calculate average newly connected linear heat density (weighted by pipe length) only if not already set
         if summary[f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]'] == 0:

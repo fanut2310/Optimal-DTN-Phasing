@@ -65,8 +65,19 @@ import networkx as nx
 from deap import base, tools, algorithms, creator
 
 # Setup function for the creator based on optimization mode
-def setup_creator(multi_objective=False, objective_function='NPV'):
-    """Set up the creator based on optimization mode"""
+def setup_creator(multi_objective=False, objective_function='NPV', multi_objective_functions=None):
+    """
+    Set up the creator based on optimization mode and selected objectives
+
+    Parameters:
+    -----------
+    multi_objective : bool
+        Whether to use multi-objective optimization
+    objective_function : str
+        The objective function to use for single-objective optimization ('NPV' or 'ROI')
+    multi_objective_functions : list
+        List of objectives to use for multi-objective optimization
+    """
     # Clear any existing creator classes to avoid conflicts
     if hasattr(creator, "FitnessMax") or hasattr(creator, "FitnessMulti"):
         del creator.FitnessMax
@@ -76,8 +87,25 @@ def setup_creator(multi_objective=False, objective_function='NPV'):
         del creator.Individual
 
     if multi_objective:
-        # For multi-objective: maximize NPV/ROI, minimize emissions
-        creator.create("FitnessMulti", base.Fitness, weights=(1.0, -1.0))
+        # Set up weights for multi-objective optimization
+        weights = []
+
+        # If no objectives specified, use default (NPV/ROI and emissions)
+        if not multi_objective_functions or len(multi_objective_functions) == 0:
+            multi_objective_functions = ['NPV', 'emissions']
+
+        # Limit to 3 objectives maximum
+        multi_objective_functions = multi_objective_functions[:3]
+
+        # Set weights based on objectives (maximize NPV/ROI, minimize emissions and total_capex)
+        for obj in multi_objective_functions:
+            if obj in ['NPV', 'ROI']:
+                weights.append(1.0)  # Maximize NPV/ROI
+            elif obj in ['emissions', 'total_capex']:
+                weights.append(-1.0)  # Minimize emissions and total_capex
+
+        # Create fitness class with appropriate weights
+        creator.create("FitnessMulti", base.Fitness, weights=tuple(weights))
         creator.create("Individual", list, fitness=creator.FitnessMulti)
     else:
         # For single-objective: maximize NPV/ROI only
@@ -213,7 +241,7 @@ class DTNExpansionOptimizer:
                  pump_efficiency: float = 0.8, pump_load_factor: float = 0.5,
                  pump_capex_a: float = 1230, pump_capex_b: float = 0.65,
                  cooling_cop: float = 4.0, ghg_budget_per_phase: Optional[List[float]] = None,
-                 multi_objective_mode: bool = False):
+                 multi_objective_mode: bool = False, multi_objective_functions: Optional[List[str]] = None):
         """
         Initialize the DTN expansion optimizer.
 
@@ -264,7 +292,9 @@ class DTNExpansionOptimizer:
         ghg_budget_per_phase : list, optional
             GHG emission budgets for each phase (in tonCO2)
         multi_objective_mode : bool, optional
-            If True, uses multi-objective optimization with NPV/ROI and emissions as objectives
+            If True, uses multi-objective optimization with selected objectives
+        multi_objective_functions : list, optional
+            List of objectives to use for multi-objective optimization. Options are 'NPV', 'ROI', 'emissions', and 'total_capex'
         """
         self.locator = locator
         self.network_type = network_type
@@ -296,9 +326,10 @@ class DTNExpansionOptimizer:
         self.cooling_cop = cooling_cop
         self.ghg_budget_per_phase = ghg_budget_per_phase
         self.multi_objective_mode = multi_objective_mode
+        self.multi_objective_functions = multi_objective_functions
 
-        # Set up the creator based on optimization mode
-        setup_creator(multi_objective_mode, objective_function)
+        # Set up the creator based on optimization mode and selected objectives
+        setup_creator(multi_objective_mode, objective_function, multi_objective_functions)
 
         # Load cost data from TN part 3 results
         self.cost_data = self._load_cost_data()
@@ -1301,13 +1332,34 @@ class DTNExpansionOptimizer:
                         final_phase_emissions = 1000000  # Also penalize emissions objective in multi-objective mode
                         break
 
+        # Calculate total CAPEX across all phases
+        total_capex = sum(phase_capex)
+
         # Return fitness based on optimization mode
         if self.multi_objective_mode:
-            # Return both objectives: NPV/ROI and emissions (to minimize)
-            if self.objective_function == 'ROI':
-                return (total_roi, final_phase_emissions)
-            else:  # Default to NPV
-                return (total_npv, final_phase_emissions)
+            # Return selected objectives
+            fitness_values = []
+
+            # If no objectives specified, use default (NPV/ROI and emissions)
+            objectives = self.multi_objective_functions
+            if not objectives or len(objectives) == 0:
+                objectives = ['NPV', 'emissions']
+
+            # Limit to 3 objectives maximum
+            objectives = objectives[:3]
+
+            # Add fitness values based on selected objectives
+            for obj in objectives:
+                if obj == 'NPV':
+                    fitness_values.append(total_npv)
+                elif obj == 'ROI':
+                    fitness_values.append(total_roi)
+                elif obj == 'emissions':
+                    fitness_values.append(final_phase_emissions)
+                elif obj == 'total_capex':
+                    fitness_values.append(total_capex)
+
+            return tuple(fitness_values)
         else:
             # Return single objective
             if self.objective_function == 'ROI':
@@ -1378,8 +1430,18 @@ class DTNExpansionOptimizer:
         if self.multi_objective_mode:
             # For multi-objective optimization, use NSGA-III
 
+            # Determine number of objectives
+            num_objectives = len(self.multi_objective_functions) if self.multi_objective_functions else 2
+            num_objectives = min(num_objectives, 3)  # Limit to 3 objectives maximum
+
             # Reference point for NSGA-III (automatically determined)
-            ref_points = tools.uniform_reference_points(2, p=12)  # 2 objectives
+            # Use different p values based on number of objectives to get reasonable number of reference points
+            if num_objectives == 2:
+                ref_points = tools.uniform_reference_points(num_objectives, p=12)
+            elif num_objectives == 3:
+                ref_points = tools.uniform_reference_points(num_objectives, p=6)
+            else:
+                ref_points = tools.uniform_reference_points(num_objectives, p=4)
 
             # Create the NSGA-III selection operator
             self.toolbox.register("select", tools.selNSGA3, ref_points=ref_points)
@@ -1401,10 +1463,20 @@ class DTNExpansionOptimizer:
                 solution = {
                     'cluster_phase_map': {cluster: phase for cluster, phase in 
                                          zip(self.all_clusters, ind) if phase > 0},
-                    'fitness_npv_roi': ind.fitness.values[0],
-                    'fitness_emissions': ind.fitness.values[1],
                     'phases': {}
                 }
+
+                # Add fitness values based on selected objectives
+                objectives = self.multi_objective_functions
+                if not objectives or len(objectives) == 0:
+                    objectives = ['NPV', 'emissions']
+
+                # Limit to 3 objectives maximum
+                objectives = objectives[:3]
+
+                # Add fitness values to solution
+                for i, obj in enumerate(objectives):
+                    solution[f'fitness_{obj}'] = ind.fitness.values[i]
 
                 # Group clusters by phase
                 for cluster, phase in solution['cluster_phase_map'].items():
@@ -1739,12 +1811,22 @@ class DTNExpansionOptimizer:
             # Create a summary dataframe for the Pareto front (keep this for backward compatibility)
             pareto_summary = []
 
+            # Determine objectives
+            objectives = self.multi_objective_functions
+            if not objectives or len(objectives) == 0:
+                objectives = ['NPV', 'emissions']
+
+            # Limit to 3 objectives maximum
+            objectives = objectives[:3]
+
             for i, sol in enumerate(solution):
                 row = {
                     'solution_id': i,
-                    'objective_npv_roi': sol['fitness_npv_roi'],
-                    'objective_emissions': sol['fitness_emissions'],
                 }
+
+                # Add objective values
+                for obj in objectives:
+                    row[f'objective_{obj}'] = sol.get(f'fitness_{obj}', 0)
 
                 # Add phase information
                 for phase in range(1, self.num_phases + 1):
@@ -1777,9 +1859,11 @@ class DTNExpansionOptimizer:
                 # Add a header row identifying the solution
                 header_row = {
                     'phase': f'Solution {i}',
-                    'objective_npv_roi': sol['fitness_npv_roi'],
-                    'objective_emissions': sol['fitness_emissions'],
                 }
+
+                # Add objective values
+                for obj in objectives:
+                    header_row[f'objective_{obj}'] = sol.get(f'fitness_{obj}', 0)
                 combined_results.append(header_row)
 
                 # Get detailed results for this solution
@@ -2599,6 +2683,11 @@ def main(config):
         # Get multi-objective mode from config
         multi_objective_mode = config.dtn_expansion_optimization.multi_objective_mode if hasattr(config.dtn_expansion_optimization, 'multi_objective_mode') else False
 
+        # Get multi-objective functions from config
+        multi_objective_functions = None
+        if hasattr(config.dtn_expansion_optimization, 'multi_objective_functions') and config.dtn_expansion_optimization.multi_objective_functions:
+            multi_objective_functions = config.dtn_expansion_optimization.multi_objective_functions
+
         # Get population size and number of generations from config
         population_size = config.dtn_expansion_optimization.population_size if hasattr(config.dtn_expansion_optimization, 'population_size') else 50
         num_generations = config.dtn_expansion_optimization.num_generations if hasattr(config.dtn_expansion_optimization, 'num_generations') else 30
@@ -2626,7 +2715,8 @@ def main(config):
             pump_capex_b=pump_capex_b,
             cooling_cop=cooling_cop,
             ghg_budget_per_phase=ghg_budget_per_phase,
-            multi_objective_mode=multi_objective_mode
+            multi_objective_mode=multi_objective_mode,
+            multi_objective_functions=multi_objective_functions
         )
 
         # Run optimization

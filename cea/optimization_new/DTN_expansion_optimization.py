@@ -1038,8 +1038,8 @@ class DTNExpansionOptimizer:
 
         Returns:
         --------
-        dict
-            Dictionary with emissions per phase
+        tuple
+            (dict, bool) - Dictionary with emissions per phase and a flag indicating if cluster 0 has non-DISTRICT scale systems
         """
         import os
         import shutil
@@ -1059,7 +1059,7 @@ class DTNExpansionOptimizer:
         cluster0_buildings = self._get_buildings_in_specific_cluster(0)
         if not cluster0_buildings:
             log().warning("No buildings found in cluster 0 (existing DTN)")
-            return phase_emissions
+            return phase_emissions, False
 
         # Get supply systems used by cluster 0 (existing DTN)
         district_supply_systems = original_supply_df[original_supply_df['name'].isin(cluster0_buildings)]
@@ -1079,8 +1079,12 @@ class DTNExpansionOptimizer:
         is_district_cooling = cooling_df[cooling_df['code'] == district_cooling_system]['scale'].iloc[0] == 'DISTRICT'
         is_district_dhw = dhw_df[dhw_df['code'] == district_dhw_system]['scale'].iloc[0] == 'DISTRICT'
 
-        if not (is_district_heating and is_district_cooling and is_district_dhw):
-            log().warning("Cluster 0 buildings are not using DISTRICT scale supply systems")
+        has_non_district_scale = not (is_district_heating and is_district_cooling and is_district_dhw)
+        if has_non_district_scale:
+            log().warning("Cluster 0 buildings are not using DISTRICT scale supply systems. This will result in penalties for the optimization results.")
+
+            # Continue with the calculation using the existing systems, even if they're not DISTRICT scale
+            # The penalty will be applied in the _evaluate_individual method
 
         # Process each phase
         connected_clusters_by_phase = {}
@@ -1146,11 +1150,11 @@ class DTNExpansionOptimizer:
             # Restore the original supply file
             shutil.copy(backup_supply_file, supply_file)
 
-        return phase_emissions
+        return phase_emissions, has_non_district_scale
 
-    def _cache_emissions_for_individual(self, individual, emissions):
-        """Store emissions results for an individual in the cache"""
-        self.emissions_cache[individual] = emissions
+    def _cache_emissions_for_individual(self, individual, emissions, has_non_district_scale):
+        """Store emissions results and non-district scale flag for an individual in the cache"""
+        self.emissions_cache[individual] = (emissions, has_non_district_scale)
 
     def calculate_ghg_emissions(self, cluster_set):
         """
@@ -1171,7 +1175,7 @@ class DTNExpansionOptimizer:
         cluster_phase_map = {cluster: 1 for cluster in cluster_set}
 
         # Calculate emissions using the new approach
-        emissions = self.calculate_emissions_for_genome(cluster_phase_map)
+        emissions, _ = self.calculate_emissions_for_genome(cluster_phase_map)
 
         # Return the operational emissions for phase 1
         return emissions[1]['operation']
@@ -1223,16 +1227,23 @@ class DTNExpansionOptimizer:
         ind_tuple = tuple(individual)
         if ind_tuple in self.emissions_cache:
             # Use cached emissions results if available
-            phase_emissions = self.emissions_cache[ind_tuple]
+            phase_emissions, has_non_district_scale = self.emissions_cache[ind_tuple]
             log().debug(f"Using cached emissions for individual {ind_tuple}")
         else:
             # Calculate emissions and cache the results
-            phase_emissions = self.calculate_emissions_for_genome(cluster_phase_map)
-            self._cache_emissions_for_individual(ind_tuple, phase_emissions)
+            phase_emissions, has_non_district_scale = self.calculate_emissions_for_genome(cluster_phase_map)
+            self._cache_emissions_for_individual(ind_tuple, phase_emissions, has_non_district_scale)
             log().debug(f"Calculated and cached emissions for individual {ind_tuple}")
 
         # Extract final phase emissions (last phase)
         final_phase_emissions = phase_emissions[self.num_phases]['operation'] if self.num_phases in phase_emissions else 0
+
+        # Apply penalty if cluster 0 has non-DISTRICT scale systems
+        if has_non_district_scale:
+            log().debug(f"Applying penalty for non-DISTRICT scale systems in cluster 0 for individual {ind_tuple}")
+            total_roi = -1000
+            total_npv = -1000000
+            final_phase_emissions = 1000000  # Also penalize emissions objective in multi-objective mode
 
         # Group clusters by phase
         clusters_by_phase = {}
@@ -1263,6 +1274,7 @@ class DTNExpansionOptimizer:
         for phase in range(self.num_phases):
             if phase < len(phase_capex) and self.capex_budget_per_phase and phase_capex[phase] > self.capex_budget_per_phase[phase]:
                 # Apply penalty for exceeding CAPEX budget
+                log().warning(f"Individual {ind_tuple} exceeds CAPEX budget in phase {phase+1}: {phase_capex[phase]} > {self.capex_budget_per_phase[phase]}")
                 total_roi = -1000
                 total_npv = -1000000
                 break
@@ -1271,6 +1283,7 @@ class DTNExpansionOptimizer:
         for phase in range(self.num_phases):
             if phase < len(phase_total_expenditure) and self.total_expenditure_budget_per_phase and phase_total_expenditure[phase] > self.total_expenditure_budget_per_phase[phase]:
                 # Apply penalty for exceeding total expenditure budget
+                log().warning(f"Individual {ind_tuple} exceeds total expenditure budget in phase {phase+1}: {phase_total_expenditure[phase]} > {self.total_expenditure_budget_per_phase[phase]}")
                 total_roi = -1000
                 total_npv = -1000000
                 break
@@ -1282,6 +1295,7 @@ class DTNExpansionOptimizer:
                     phase_ghg = phase_emissions[phase+1]['operation']  # +1 because phases are 1-indexed in the results
                     if phase_ghg > self.ghg_budget_per_phase[phase]:
                         # Apply penalty for exceeding GHG budget
+                        log().warning(f"Individual {ind_tuple} exceeds GHG budget in phase {phase+1}: {phase_ghg} > {self.ghg_budget_per_phase[phase]}")
                         total_roi = -1000
                         total_npv = -1000000
                         final_phase_emissions = 1000000  # Also penalize emissions objective in multi-objective mode
@@ -1328,7 +1342,7 @@ class DTNExpansionOptimizer:
             dhw_scale = dhw_df[dhw_df['code'] == dhw_code]['scale'].iloc[0] if len(dhw_df[dhw_df['code'] == dhw_code]) > 0 else 'UNKNOWN'
 
             if hs_scale != 'DISTRICT' or cs_scale != 'DISTRICT' or dhw_scale != 'DISTRICT':
-                log().warning(f"Building {row['name']} in cluster 0 does not use DISTRICT scale systems: HS={hs_scale}, CS={cs_scale}, DHW={dhw_scale}")
+                log().warning(f"Building {row['name']} in cluster 0 does not use DISTRICT scale systems: HS={hs_scale}, CS={cs_scale}, DHW={dhw_scale}. This will result in penalties for the optimization results.")
 
     def optimize(self, population_size=50, num_generations=30):
         """
@@ -1363,7 +1377,6 @@ class DTNExpansionOptimizer:
 
         if self.multi_objective_mode:
             # For multi-objective optimization, use NSGA-III
-            from deap import algorithms
 
             # Reference point for NSGA-III (automatically determined)
             ref_points = tools.uniform_reference_points(2, p=12)  # 2 objectives
@@ -1408,7 +1421,7 @@ class DTNExpansionOptimizer:
                     # Get emissions for this phase
                     ind_tuple = tuple(ind)
                     if ind_tuple in self.emissions_cache:
-                        phase_emissions = self.emissions_cache[ind_tuple]
+                        phase_emissions, _ = self.emissions_cache[ind_tuple]
                         solution[f'phase_{phase}_emissions'] = phase_emissions[phase]['operation']
 
                 pareto_solutions.append(solution)
@@ -1456,7 +1469,7 @@ class DTNExpansionOptimizer:
 
             return solution
 
-    def save_detailed_results(self, results, output_dir):
+    def save_detailed_results(self, results, output_dir, return_df=False):
         """
         Save detailed optimization results to CSV.
 
@@ -1466,11 +1479,13 @@ class DTNExpansionOptimizer:
             List of result dictionaries
         output_dir : Path
             Output directory
+        return_df : bool, optional
+            If True, return the DataFrame instead of saving to CSV
 
         Returns:
         --------
-        Path
-            Path to the detailed results file
+        Path or DataFrame
+            Path to the detailed results file or the DataFrame if return_df is True
         """
         # Create a list to store detailed results
         detailed_results = []
@@ -1655,7 +1670,7 @@ class DTNExpansionOptimizer:
             if 'individual' in result:
                 ind_tuple = tuple(result['individual'])
                 if ind_tuple in self.emissions_cache:
-                    emissions = self.emissions_cache[ind_tuple]
+                    emissions, _ = self.emissions_cache[ind_tuple]
                     # Add emissions data for this phase - only operational emissions
                     detailed_result['phase_operation_emissions_tonCO2'] = emissions[phase]['operation']
 
@@ -1693,10 +1708,12 @@ class DTNExpansionOptimizer:
                 detailed_results_df[col] = detailed_results_df[col].apply(lambda x: round(x, 4) if isinstance(x, (int, float)) and not pd.isna(x) else x)
 
         # Save to CSV with network-type specific filename
-        detailed_results_file = output_dir / f"dtn_expansion_opt_results_{self.network_type}_detailed.csv"
-        detailed_results_df.to_csv(detailed_results_file, index=False)
-
-        return detailed_results_file
+        if return_df:
+            return detailed_results_df
+        else:
+            detailed_results_file = output_dir / f"dtn_expansion_opt_results_{self.network_type}_detailed.csv"
+            detailed_results_df.to_csv(detailed_results_file, index=False)
+            return detailed_results_file
 
     def save_results(self, solution):
         """
@@ -1719,7 +1736,7 @@ class DTNExpansionOptimizer:
         # Check if this is a multi-objective result (list of solutions)
         if isinstance(solution, list):
             # For multi-objective, solution is a list of Pareto-optimal solutions
-            # Create a summary dataframe for the Pareto front
+            # Create a summary dataframe for the Pareto front (keep this for backward compatibility)
             pareto_summary = []
 
             for i, sol in enumerate(solution):
@@ -1752,14 +1769,42 @@ class DTNExpansionOptimizer:
             pareto_file = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / f"dtn_expansion_opt_pareto_{self.network_type}.csv"
             pareto_df.to_csv(pareto_file, index=False)
 
-            # Also save detailed results for each solution
+            # Create a combined detailed results file with all Pareto solutions
+            # Each solution will be separated by an empty row
+            combined_results = []
+
+            for i, sol in enumerate(solution):
+                # Add a header row identifying the solution
+                header_row = {
+                    'phase': f'Solution {i}',
+                    'objective_npv_roi': sol['fitness_npv_roi'],
+                    'objective_emissions': sol['fitness_emissions'],
+                }
+                combined_results.append(header_row)
+
+                # Get detailed results for this solution
+                detailed_results = self.save_detailed_results([sol], output_dir, return_df=True)
+
+                # Add the detailed results to the combined results
+                combined_results.extend(detailed_results.to_dict('records'))
+
+                # Add an empty row as separator (unless it's the last solution)
+                if i < len(solution) - 1:
+                    combined_results.append({})
+
+            # Save the combined results to CSV
+            combined_df = pd.DataFrame(combined_results)
+            combined_file = output_dir / f"dtn_expansion_opt_results_{self.network_type}_detailed_combined.csv"
+            combined_df.to_csv(combined_file, index=False)
+
+            # Also save individual detailed results for each solution (for backward compatibility)
             for i, sol in enumerate(solution):
                 # Create a subdirectory for each pareto solution
                 pareto_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / f"pareto_solution_{i}"
                 pareto_dir.mkdir(parents=True, exist_ok=True)
                 self.save_detailed_results([sol], pareto_dir)
 
-            return pareto_file
+            return combined_file
 
         # For single-objective optimization, use the original approach
         # Create a DataFrame with the results

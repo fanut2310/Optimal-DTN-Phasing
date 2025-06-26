@@ -330,11 +330,14 @@ Energy Supply System Optimisation:
 
   - name: dtn-expansion-optimization
     label: District Thermal Network Expansion Optimization
-    description: Analyzes optimal expansion sequence for district thermal networks by clustering buildings and determining phased connections.
+    description: |
+      Analyzes optimal expansion sequence for district thermal networks by clustering buildings and determining phased connections.
+      Note: Buildings in cluster 0 (existing DTN) should ideally use DISTRICT scale supply systems for heating, cooling, and DHW.
     interfaces: [ cli, dashboard ]
     module: cea.optimization_new.DTN_expansion_optimization
     parameters: [ 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free',
-                  'dtn-expansion-optimization:network-type', 'dtn-expansion-optimization:testing-clusters', 'dtn-expansion-optimization:chosen-buildings',
+                  'dtn-expansion-optimization:cluster0_district_scale_warning', 'dtn-expansion-optimization:network-type', 
+                  'dtn-expansion-optimization:testing-clusters', 'dtn-expansion-optimization:chosen-buildings',
                   'dtn-expansion-optimization:run-optimization', 'dtn-expansion-optimization:capex-budget-per-phase', 
                   'dtn-expansion-optimization:total-expenditure-budget-per-phase', 'dtn-expansion-optimization:cost-model',
                   'dtn-expansion-optimization:num-phases', 'dtn-expansion-optimization:phase-durations', 'dtn-expansion-optimization:interest-rate',

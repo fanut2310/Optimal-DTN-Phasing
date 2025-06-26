@@ -1537,6 +1537,29 @@ class DTNExpansionOptimizer:
         # Create DataFrame
         detailed_results_df = pd.DataFrame(detailed_results)
 
+        # Apply formatting to specific columns
+        # Integer formatting
+        integer_columns = [col for col in detailed_results_df.columns if any(substr in col for substr in [
+            'capex [USD]', 'total_expenditure [USD]', 'revenue [USD]', 'om_cost [USD]', 'npv [USD]', 'pipe_length [m]'
+        ])]
+        for col in integer_columns:
+            if col in detailed_results_df.columns:
+                detailed_results_df[col] = detailed_results_df[col].apply(lambda x: int(round(x, 0)) if isinstance(x, (int, float)) and not pd.isna(x) else x)
+
+        # 2 decimal places
+        decimal2_columns = [col for col in detailed_results_df.columns if any(substr in col for substr in [
+            'operation_emission', 'annual_Qh [MWh/yr]', 'annual_Qc [MWh/yr]', 'linear_Qh_density [MWh/km/yr]', 'linear_Qc_density [MWh/km/yr]'
+        ])]
+        for col in decimal2_columns:
+            if col in detailed_results_df.columns:
+                detailed_results_df[col] = detailed_results_df[col].apply(lambda x: round(x, 2) if isinstance(x, (int, float)) and not pd.isna(x) else x)
+
+        # 4 decimal places
+        decimal4_columns = [col for col in detailed_results_df.columns if 'roi [-]' in col]
+        for col in decimal4_columns:
+            if col in detailed_results_df.columns:
+                detailed_results_df[col] = detailed_results_df[col].apply(lambda x: round(x, 4) if isinstance(x, (int, float)) and not pd.isna(x) else x)
+
         # Save to CSV with network-type specific filename
         detailed_results_file = output_dir / f"dtn_expansion_opt_results_{self.network_type}_detailed.csv"
         detailed_results_df.to_csv(detailed_results_file, index=False)
@@ -1888,6 +1911,29 @@ class DTNExpansionOptimizer:
         metadata_df = pd.DataFrame([metadata])
         metadata_file = output_dir / "optimization_settings.csv"
         metadata_df.to_csv(metadata_file, index=False)
+
+        # Apply formatting to specific columns
+        # Integer formatting
+        integer_columns = [col for col in results_df.columns if any(substr in col for substr in [
+            'capex [USD]', 'total_expenditure [USD]', 'revenue [USD]', 'om_cost [USD]', 'npv [USD]', 'pipe_length [m]'
+        ])]
+        for col in integer_columns:
+            if col in results_df.columns:
+                results_df[col] = results_df[col].apply(lambda x: int(round(x, 0)) if isinstance(x, (int, float)) and not pd.isna(x) else x)
+
+        # 2 decimal places
+        decimal2_columns = [col for col in results_df.columns if any(substr in col for substr in [
+            'operation_emission [t CO2eq/yr]', 'annual_Qh [MWh/yr]', 'annual_Qc [MWh/yr]', 'linear_Qh_density [MWh/km/yr]', 'linear_Qc_density [MWh/km/yr]'
+        ])]
+        for col in decimal2_columns:
+            if col in results_df.columns:
+                results_df[col] = results_df[col].apply(lambda x: round(x, 2) if isinstance(x, (int, float)) and not pd.isna(x) else x)
+
+        # 4 decimal places
+        decimal4_columns = [col for col in results_df.columns if 'roi [-]' in col]
+        for col in decimal4_columns:
+            if col in results_df.columns:
+                results_df[col] = results_df[col].apply(lambda x: round(x, 4) if isinstance(x, (int, float)) and not pd.isna(x) else x)
 
         # Save results to CSV with network-type specific filename
         results_file = output_dir / f"dtn_expansion_opt_results_{self.network_type}.csv"

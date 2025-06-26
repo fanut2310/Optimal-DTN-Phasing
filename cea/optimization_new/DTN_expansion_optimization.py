@@ -64,9 +64,28 @@ import numpy as np
 import networkx as nx
 from deap import base, tools, algorithms, creator
 
-# Create the Individual class
-creator.create("FitnessMax", base.Fitness, weights=(1.0,))
-creator.create("Individual", list, fitness=creator.FitnessMax)
+# Setup function for the creator based on optimization mode
+def setup_creator(multi_objective=False, objective_function='NPV'):
+    """Set up the creator based on optimization mode"""
+    # Clear any existing creator classes to avoid conflicts
+    if hasattr(creator, "FitnessMax") or hasattr(creator, "FitnessMulti"):
+        del creator.FitnessMax
+        if hasattr(creator, "FitnessMulti"):
+            del creator.FitnessMulti
+    if hasattr(creator, "Individual"):
+        del creator.Individual
+
+    if multi_objective:
+        # For multi-objective: maximize NPV/ROI, minimize emissions
+        creator.create("FitnessMulti", base.Fitness, weights=(1.0, -1.0))
+        creator.create("Individual", list, fitness=creator.FitnessMulti)
+    else:
+        # For single-objective: maximize NPV/ROI only
+        creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+        creator.create("Individual", list, fitness=creator.FitnessMax)
+
+# Initialize with default single-objective mode
+setup_creator()
 
 import cea.config               # type: ignore
 import cea.inputlocator         # type: ignore
@@ -193,7 +212,8 @@ class DTNExpansionOptimizer:
                  pressure_loss_pa_per_m: float = 200, pump_operation_hours: int = 4000,
                  pump_efficiency: float = 0.8, pump_load_factor: float = 0.5,
                  pump_capex_a: float = 1230, pump_capex_b: float = 0.65,
-                 cooling_cop: float = 4.0, ghg_budget_per_phase: Optional[List[float]] = None):
+                 cooling_cop: float = 4.0, ghg_budget_per_phase: Optional[List[float]] = None,
+                 multi_objective_mode: bool = False):
         """
         Initialize the DTN expansion optimizer.
 
@@ -243,6 +263,8 @@ class DTNExpansionOptimizer:
             Coefficient of Performance (COP) for cooling plants
         ghg_budget_per_phase : list, optional
             GHG emission budgets for each phase (in tonCO2)
+        multi_objective_mode : bool, optional
+            If True, uses multi-objective optimization with NPV/ROI and emissions as objectives
         """
         self.locator = locator
         self.network_type = network_type
@@ -273,6 +295,10 @@ class DTNExpansionOptimizer:
         self.pump_capex_b = pump_capex_b
         self.cooling_cop = cooling_cop
         self.ghg_budget_per_phase = ghg_budget_per_phase
+        self.multi_objective_mode = multi_objective_mode
+
+        # Set up the creator based on optimization mode
+        setup_creator(multi_objective_mode, objective_function)
 
         # Load cost data from TN part 3 results
         self.cost_data = self._load_cost_data()
@@ -1180,7 +1206,7 @@ class DTNExpansionOptimizer:
         Returns:
         --------
         tuple
-            Fitness value (NPV or ROI based on objective function)
+            Fitness value(s) - single objective (NPV or ROI) or multi-objective (NPV/ROI and emissions)
         """
         # Convert individual to cluster-phase mapping
         cluster_phase_map = {cluster: phase for cluster, phase in zip(self.all_clusters, individual)}
@@ -1204,6 +1230,9 @@ class DTNExpansionOptimizer:
             phase_emissions = self.calculate_emissions_for_genome(cluster_phase_map)
             self._cache_emissions_for_individual(ind_tuple, phase_emissions)
             log().debug(f"Calculated and cached emissions for individual {ind_tuple}")
+
+        # Extract final phase emissions (last phase)
+        final_phase_emissions = phase_emissions[self.num_phases]['operation'] if self.num_phases in phase_emissions else 0
 
         # Group clusters by phase
         clusters_by_phase = {}
@@ -1246,7 +1275,7 @@ class DTNExpansionOptimizer:
                 total_npv = -1000000
                 break
 
-        # Check GHG budget constraints if specified
+        # Check GHG budget constraints if specified (apply in both single and multi-objective modes)
         if self.ghg_budget_per_phase:
             for phase in range(self.num_phases):
                 if phase < self.num_phases and self.ghg_budget_per_phase[phase] > 0:
@@ -1255,13 +1284,22 @@ class DTNExpansionOptimizer:
                         # Apply penalty for exceeding GHG budget
                         total_roi = -1000
                         total_npv = -1000000
+                        final_phase_emissions = 1000000  # Also penalize emissions objective in multi-objective mode
                         break
 
-        # Return fitness based on selected objective function
-        if self.objective_function == 'ROI':
-            return (total_roi,)
-        else:  # Default to NPV
-            return (total_npv,)
+        # Return fitness based on optimization mode
+        if self.multi_objective_mode:
+            # Return both objectives: NPV/ROI and emissions (to minimize)
+            if self.objective_function == 'ROI':
+                return (total_roi, final_phase_emissions)
+            else:  # Default to NPV
+                return (total_npv, final_phase_emissions)
+        else:
+            # Return single objective
+            if self.objective_function == 'ROI':
+                return (total_roi,)
+            else:  # Default to NPV
+                return (total_npv,)
 
     def _verify_cluster0_supply_systems(self):
         """Verify that buildings in cluster 0 have DISTRICT scale supply systems"""
@@ -1305,8 +1343,9 @@ class DTNExpansionOptimizer:
 
         Returns:
         --------
-        dict
-            Dictionary with the optimal solution
+        dict or list
+            Dictionary with the optimal solution (single-objective) or
+            list of non-dominated solutions (multi-objective)
         """
         # Verify cluster 0 buildings have district supply systems
         self._verify_cluster0_supply_systems()
@@ -1322,44 +1361,100 @@ class DTNExpansionOptimizer:
         for ind, fit in zip(invalid_ind, fitnesses):
             ind.fitness.values = fit
 
-        # Track the best individual
-        hof = tools.HallOfFame(1)
+        if self.multi_objective_mode:
+            # For multi-objective optimization, use NSGA-III
+            from deap import algorithms
 
-        # Track statistics
-        stats = tools.Statistics(lambda ind: ind.fitness.values)
-        stats.register("avg", np.mean)
-        stats.register("min", np.min)
-        stats.register("max", np.max)
+            # Reference point for NSGA-III (automatically determined)
+            ref_points = tools.uniform_reference_points(2, p=12)  # 2 objectives
 
-        # Run the genetic algorithm
-        pop, logbook = algorithms.eaSimple(pop, self.toolbox, cxpb=0.5, mutpb=0.2, 
-                                          ngen=num_generations, stats=stats, 
-                                          halloffame=hof, verbose=True)
+            # Create the NSGA-III selection operator
+            self.toolbox.register("select", tools.selNSGA3, ref_points=ref_points)
 
-        # Get the best solution
-        best_individual = hof[0]
+            # Track the Pareto front
+            pareto = tools.ParetoFront()
 
-        # Convert to cluster-phase mapping
-        solution = {
-            'cluster_phase_map': {cluster: phase for cluster, phase in 
-                                 zip(self.all_clusters, best_individual) if phase > 0},
-            'fitness': best_individual.fitness.values[0],
-            'phases': {}
-        }
+            # Run the NSGA-III algorithm
+            algorithms.eaMuPlusLambda(pop, self.toolbox, mu=population_size, 
+                                  lambda_=population_size, 
+                                  cxpb=0.5, mutpb=0.2,
+                                  ngen=num_generations, 
+                                  stats=None, halloffame=pareto, verbose=True)
 
-        # Group clusters by phase
-        for cluster, phase in solution['cluster_phase_map'].items():
-            if phase not in solution['phases']:
-                solution['phases'][phase] = []
-            solution['phases'][phase].append(cluster)
+            # Process the Pareto front solutions
+            pareto_solutions = []
+            for ind in pareto:
+                # Convert to cluster-phase mapping
+                solution = {
+                    'cluster_phase_map': {cluster: phase for cluster, phase in 
+                                         zip(self.all_clusters, ind) if phase > 0},
+                    'fitness_npv_roi': ind.fitness.values[0],
+                    'fitness_emissions': ind.fitness.values[1],
+                    'phases': {}
+                }
 
-        # Calculate metrics for each phase
-        for phase, clusters in solution['phases'].items():
-            solution[f'phase_{phase}_roi'] = self.calculate_roi(tuple(clusters), phase)
-            solution[f'phase_{phase}_npv'] = self.calculate_npv(tuple(clusters), phase)
-            solution[f'phase_{phase}_capex'] = self._calculate_phase_capex(clusters)
+                # Group clusters by phase
+                for cluster, phase in solution['cluster_phase_map'].items():
+                    if phase not in solution['phases']:
+                        solution['phases'][phase] = []
+                    solution['phases'][phase].append(cluster)
 
-        return solution
+                # Calculate metrics for each phase
+                for phase, clusters in solution['phases'].items():
+                    solution[f'phase_{phase}_roi'] = self.calculate_roi(tuple(clusters), phase)
+                    solution[f'phase_{phase}_npv'] = self.calculate_npv(tuple(clusters), phase)
+                    solution[f'phase_{phase}_capex'] = self._calculate_phase_capex(clusters)
+
+                    # Get emissions for this phase
+                    ind_tuple = tuple(ind)
+                    if ind_tuple in self.emissions_cache:
+                        phase_emissions = self.emissions_cache[ind_tuple]
+                        solution[f'phase_{phase}_emissions'] = phase_emissions[phase]['operation']
+
+                pareto_solutions.append(solution)
+
+            return pareto_solutions
+
+        else:
+            # For single-objective optimization, use the original approach
+            # Track the best individual
+            hof = tools.HallOfFame(1)
+
+            # Track statistics
+            stats = tools.Statistics(lambda ind: ind.fitness.values)
+            stats.register("avg", np.mean)
+            stats.register("min", np.min)
+            stats.register("max", np.max)
+
+            # Run the genetic algorithm
+            pop, logbook = algorithms.eaSimple(pop, self.toolbox, cxpb=0.5, mutpb=0.2, 
+                                              ngen=num_generations, stats=stats, 
+                                              halloffame=hof, verbose=True)
+
+            # Get the best solution
+            best_individual = hof[0]
+
+            # Convert to cluster-phase mapping
+            solution = {
+                'cluster_phase_map': {cluster: phase for cluster, phase in 
+                                     zip(self.all_clusters, best_individual) if phase > 0},
+                'fitness': best_individual.fitness.values[0],
+                'phases': {}
+            }
+
+            # Group clusters by phase
+            for cluster, phase in solution['cluster_phase_map'].items():
+                if phase not in solution['phases']:
+                    solution['phases'][phase] = []
+                solution['phases'][phase].append(cluster)
+
+            # Calculate metrics for each phase
+            for phase, clusters in solution['phases'].items():
+                solution[f'phase_{phase}_roi'] = self.calculate_roi(tuple(clusters), phase)
+                solution[f'phase_{phase}_npv'] = self.calculate_npv(tuple(clusters), phase)
+                solution[f'phase_{phase}_capex'] = self._calculate_phase_capex(clusters)
+
+            return solution
 
     def save_detailed_results(self, results, output_dir):
         """
@@ -1388,7 +1483,44 @@ class DTNExpansionOptimizer:
 
         # Process each phase result
         for result in results:
-            phase = result['phase']
+            # Check if this is a multi-objective solution (has 'phases' key but no 'phase' key)
+            if 'phases' in result and 'phase' not in result:
+                # Process each phase in the multi-objective solution
+                for phase_num, clusters in result['phases'].items():
+                    if phase_num == 0:
+                        # Skip phase 0 (existing DTN) for now
+                        continue
+
+                    # Create a temporary result dictionary with the structure expected by the rest of the method
+                    # Store the original result in a temporary variable
+                    original_result = result
+
+                    # Create a new result dictionary with the expected structure
+                    result = {
+                        'phase': phase_num,
+                        'newly_connected_cluster(s)': '+'.join(map(str, clusters)),
+                        'cumulative_cluster(s)': '+'.join(map(str, [0] + clusters)),  # Include cluster 0
+                        'new_cluster(s)_roi [-]': original_result.get(f'phase_{phase_num}_roi', 0),
+                        'new_cluster(s)_npv [USD]': original_result.get(f'phase_{phase_num}_npv', 0),
+                        'new_cluster(s)_capex [USD]': original_result.get(f'phase_{phase_num}_capex', 0),
+                        'district_operation_emission [t CO2eq/yr]': original_result.get(f'phase_{phase_num}_emissions', 0),
+                        'new_cluster(s)_pipe_length [m]': 0,  # Will be calculated later
+                        'cumulative_pipe_length [m]': 0,  # Will be calculated later
+                        f'new_cluster(s)_annual_{demand_type} [MWh/yr]': 0,  # Will be calculated later
+                        f'cumulative_annual_{demand_type} [MWh/yr]': 0,  # Will be calculated later
+                        f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]': 0,  # Will be calculated later
+                        f'overall_linear_{demand_type}_density [MWh/km/yr]': 0  # Will be calculated later
+                    }
+
+                    # Now we have a result with the expected structure, so we can continue with the existing logic
+                    phase = result['phase']
+                    break
+                else:
+                    # If no phases were processed, continue to the next result
+                    continue
+            else:
+                # This is a single-objective solution with the expected structure
+                phase = result['phase']
             if phase == 0:
                 # Skip phase 0 (existing DTN) for now
                 continue
@@ -1572,13 +1704,64 @@ class DTNExpansionOptimizer:
 
         Parameters:
         -----------
-        solution : dict
-            Dictionary with the optimization solution
+        solution : dict or list
+            Optimization solution (single-objective) or list of solutions (multi-objective)
+
+        Returns:
+        --------
+        Path
+            Path to the results file
         """
         # Create output directory
         output_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder())
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Check if this is a multi-objective result (list of solutions)
+        if isinstance(solution, list):
+            # For multi-objective, solution is a list of Pareto-optimal solutions
+            # Create a summary dataframe for the Pareto front
+            pareto_summary = []
+
+            for i, sol in enumerate(solution):
+                row = {
+                    'solution_id': i,
+                    'objective_npv_roi': sol['fitness_npv_roi'],
+                    'objective_emissions': sol['fitness_emissions'],
+                }
+
+                # Add phase information
+                for phase in range(1, self.num_phases + 1):
+                    if phase in sol['phases']:
+                        clusters = sol['phases'][phase]
+                        row[f'phase_{phase}_clusters'] = '+'.join(map(str, clusters))
+                        row[f'phase_{phase}_roi'] = sol.get(f'phase_{phase}_roi', 0)
+                        row[f'phase_{phase}_npv'] = sol.get(f'phase_{phase}_npv', 0)
+                        row[f'phase_{phase}_capex'] = sol.get(f'phase_{phase}_capex', 0)
+                        row[f'phase_{phase}_emissions'] = sol.get(f'phase_{phase}_emissions', 0)
+                    else:
+                        row[f'phase_{phase}_clusters'] = ''
+                        row[f'phase_{phase}_roi'] = 0
+                        row[f'phase_{phase}_npv'] = 0
+                        row[f'phase_{phase}_capex'] = 0
+                        row[f'phase_{phase}_emissions'] = 0
+
+                pareto_summary.append(row)
+
+            # Save to CSV
+            pareto_df = pd.DataFrame(pareto_summary)
+            pareto_file = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / f"dtn_expansion_opt_pareto_{self.network_type}.csv"
+            pareto_df.to_csv(pareto_file, index=False)
+
+            # Also save detailed results for each solution
+            for i, sol in enumerate(solution):
+                # Create a subdirectory for each pareto solution
+                pareto_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / f"pareto_solution_{i}"
+                pareto_dir.mkdir(parents=True, exist_ok=True)
+                self.save_detailed_results([sol], pareto_dir)
+
+            return pareto_file
+
+        # For single-objective optimization, use the original approach
         # Create a DataFrame with the results
         results = []
         total_capex = 0
@@ -2368,6 +2551,9 @@ def main(config):
             if isinstance(ghg_str, str):
                 ghg_budget_per_phase = [float(g.strip()) for g in ghg_str.split(',') if g.strip()]
 
+        # Get multi-objective mode from config
+        multi_objective_mode = config.dtn_expansion_optimization.multi_objective_mode if hasattr(config.dtn_expansion_optimization, 'multi_objective_mode') else False
+
         # Get population size and number of generations from config
         population_size = config.dtn_expansion_optimization.population_size if hasattr(config.dtn_expansion_optimization, 'population_size') else 50
         num_generations = config.dtn_expansion_optimization.num_generations if hasattr(config.dtn_expansion_optimization, 'num_generations') else 30
@@ -2394,7 +2580,8 @@ def main(config):
             pump_capex_a=pump_capex_a,
             pump_capex_b=pump_capex_b,
             cooling_cop=cooling_cop,
-            ghg_budget_per_phase=ghg_budget_per_phase
+            ghg_budget_per_phase=ghg_budget_per_phase,
+            multi_objective_mode=multi_objective_mode
         )
 
         # Run optimization

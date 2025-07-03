@@ -52,6 +52,8 @@ from __future__ import annotations
 ###############################################################################
 import argparse
 import logging
+import os
+import shutil
 import time
 import itertools
 import random
@@ -228,10 +230,10 @@ class DTNExpansionOptimizer:
     - Cooling plant costs (chillers and cooling towers) for DC networks
     """
 
-    def __init__(self, locator: cea.inputlocator.InputLocator, network_type: str, 
-                 metrics_df: pd.DataFrame, num_phases: int = 3, 
+    def __init__(self, locator: cea.inputlocator.InputLocator, network_type: str,
+                 metrics_df: pd.DataFrame, num_phases: int = 3,
                  phase_durations: Optional[List[int]] = None,
-                 capex_budget_per_phase: Optional[List[float]] = None, 
+                 capex_budget_per_phase: Optional[List[float]] = None,
                  total_expenditure_budget_per_phase: Optional[List[float]] = None,
                  interest_rate: float = 0.05,
                  cost_model: str = 'detailed', objective_function: str = 'NPV',
@@ -491,8 +493,8 @@ class DTNExpansionOptimizer:
 
         # Get main road edges (-1) that connect the clusters
         main_road_edges = cluster_edges_df[
-            (cluster_edges_df['cluster'] == -1) & 
-            (cluster_edges_df['from_C'].isin(clusters_to_connect)) & 
+            (cluster_edges_df['cluster'] == -1) &
+            (cluster_edges_df['from_C'].isin(clusters_to_connect)) &
             (cluster_edges_df['to_C'].isin(clusters_to_connect))
         ]
 
@@ -525,7 +527,7 @@ class DTNExpansionOptimizer:
                     if common_columns:
                         log().warning(f"Using only common columns for concatenation: {common_columns}")
                         required_pipes = pd.concat([
-                            cluster_edges[list(common_columns)], 
+                            cluster_edges[list(common_columns)],
                             main_road_edges[list(common_columns)]
                         ], ignore_index=True)
                     else:
@@ -553,7 +555,7 @@ class DTNExpansionOptimizer:
 
         # Get buildings in the clusters
         buildings = self.cluster_nodes[
-            (self.cluster_nodes['cluster'].isin(clusters_to_connect)) & 
+            (self.cluster_nodes['cluster'].isin(clusters_to_connect)) &
             (self.cluster_nodes['type'] == 'CONSUMER')
         ]['building'].tolist()
 
@@ -575,7 +577,7 @@ class DTNExpansionOptimizer:
         """
         # Get buildings in the specific cluster
         buildings = self.cluster_nodes[
-            (self.cluster_nodes['cluster'] == cluster_id) & 
+            (self.cluster_nodes['cluster'] == cluster_id) &
             (self.cluster_nodes['type'] == 'CONSUMER')
         ]['building'].tolist()
 
@@ -1057,6 +1059,31 @@ class DTNExpansionOptimizer:
 
         return npv
 
+    class TemporarySupplyFile:
+        """Context manager for temporarily modifying the supply.csv file."""
+
+        def __init__(self, locator, modified_supply_df):
+            self.locator = locator
+            self.modified_supply_df = modified_supply_df
+            self.supply_file = locator.get_building_supply()
+            self.backup_file = os.path.join(locator.get_temporary_folder(), 'backup_supply.csv')
+
+        def __enter__(self):
+            """Save backup and replace with modified file."""
+            # Create backup of original file
+            original_supply_df = pd.read_csv(self.supply_file)
+            original_supply_df.to_csv(self.backup_file, index=False)
+
+            # Replace with modified file
+            self.modified_supply_df.to_csv(self.supply_file, index=False)
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            """Restore original file."""
+            if os.path.exists(self.backup_file):
+                shutil.copy(self.backup_file, self.supply_file)
+                os.remove(self.backup_file)
+
     def calculate_emissions_for_genome(self, cluster_phase_map):
         """
         Calculate emissions for a specific genome by temporarily modifying supply systems
@@ -1072,11 +1099,9 @@ class DTNExpansionOptimizer:
         tuple
             (dict, bool) - Dictionary with emissions per phase and a flag indicating if cluster 0 has non-DISTRICT scale systems
         """
-        import os
-        import shutil
 
         # Initialize results dictionary - only track operation emissions
-        phase_emissions = {phase: {'operation': 0} 
+        phase_emissions = {phase: {'operation': 0}
                           for phase in range(1, self.num_phases + 1)}
 
         # Get original supply file
@@ -1138,18 +1163,8 @@ class DTNExpansionOptimizer:
                     modified_supply_df.loc[building_idx, 'supply_type_cs'] = district_cooling_system
                     modified_supply_df.loc[building_idx, 'supply_type_dhw'] = district_dhw_system
 
-        # Save modified supply file to a temporary location
-        temp_supply_file = os.path.join(self.locator.get_temporary_folder(), 'temp_supply.csv')
-        modified_supply_df.to_csv(temp_supply_file, index=False)
-
-        # Create a backup of the original file
-        backup_supply_file = os.path.join(self.locator.get_temporary_folder(), 'backup_supply.csv')
-        original_supply_df.to_csv(backup_supply_file, index=False)
-
-        try:
-            # Replace the original file with the modified one
-            shutil.copy(temp_supply_file, supply_file)
-
+        # Use context manager to safely modify and restore the supply file
+        with self.__class__.TemporarySupplyFile(self.locator, modified_supply_df):
             # Run LCA operation module
             from cea.analysis.lca.operation import lca_operation
             lca_operation(self.locator)
@@ -1177,20 +1192,186 @@ class DTNExpansionOptimizer:
                 connected_operation = lca_operation_results[lca_operation_results['name'].isin(all_connected_buildings)]
                 phase_emissions[phase]['operation'] = connected_operation['GHG_sys_tonCO2'].sum()
 
-        finally:
-            # Restore the original supply file
-            shutil.copy(backup_supply_file, supply_file)
-
         return phase_emissions, has_non_district_scale
 
     def _cache_emissions_for_individual(self, individual, emissions, has_non_district_scale):
         """Store emissions results and non-district scale flag for an individual in the cache"""
         self.emissions_cache[individual] = (emissions, has_non_district_scale)
 
+    def calculate_district_emissions_new(self):
+        """
+        Calculate district operation emissions using the new methodology.
+
+        Workflow:
+        1. Read from the generated genome to understand what cluster(s) it decides to connect at what phase
+        2. Identify corresponding building IDs of each cluster
+        3. Read from the Total_LCA_operation.csv, sum up the "GHG_sys_tonCO2" column for phase 0
+        4. Read from the building-properties/supply.csv
+        5. Make n copies of it if there are n phases in total
+        6. Modify the supplied technologies for cooling, heating, dhw, of newly cluster(s) in phase 1 to those for cluster 0
+        7. Run the LCA operation module again, repeat step 3 calculation for phase 1
+        8. Repeat steps 6 to 7 for the following phases
+        9. For the row of Total in DTN optimization result csv, copy from the last phase
+
+        Returns:
+        --------
+        dict
+            Dictionary with district operation emission and district operation emission per GFA for each phase
+        """
+
+        # Initialize results dictionary
+        results = {}
+
+        # Get original supply file
+        supply_file = self.locator.get_building_supply()
+        original_supply_df = pd.read_csv(supply_file)
+
+        # Get district supply systems from cluster 0 buildings
+        cluster0_buildings = self._get_buildings_in_specific_cluster(0)
+        if not cluster0_buildings:
+            log().warning("No buildings found in cluster 0 (existing DTN)")
+            return {}
+
+        # Get supply systems used by cluster 0 (existing DTN)
+        district_supply_systems = original_supply_df[original_supply_df['name'].isin(cluster0_buildings)]
+
+        # Extract district supply types
+        district_heating_system = district_supply_systems['supply_type_hs'].iloc[0]
+        district_cooling_system = district_supply_systems['supply_type_cs'].iloc[0]
+        district_dhw_system = district_supply_systems['supply_type_dhw'].iloc[0]
+
+        # Phase 0: Calculate emissions for the whole district with cluster 0 using district systems
+        # and all other clusters using building-scale systems
+
+        # Run LCA operation module with original supply file
+        from cea.analysis.lca.operation import lca_operation
+        lca_operation(self.locator)
+
+        # Load LCA results
+        lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
+
+        # Calculate total GHG emissions and GFA for phase 0
+        total_ghg = lca_operation_results['GHG_sys_tonCO2'].sum()
+        total_gfa = lca_operation_results['GFA_m2'].sum()
+
+        # Calculate emissions per GFA
+        ghg_per_gfa = total_ghg / total_gfa if total_gfa > 0 else 0
+
+        # Store results for phase 0
+        results[0] = {
+            'district_operation_emission [t CO2eq/yr]': total_ghg,
+            'district_operation_emission_per_gfa [t CO2eq/yr/m2]': ghg_per_gfa
+        }
+
+        # Get cluster assignments from current individual
+        if hasattr(self, 'current_individual') and self.current_individual is not None:
+            # Use the current individual's phase assignments
+            cluster_phase_map = {cluster: p for cluster, p in zip(self.all_clusters, self.current_individual)}
+            clusters_by_phase = {}
+            for phase in range(1, self.num_phases + 1):
+                clusters_by_phase[phase] = [cluster for cluster, p in cluster_phase_map.items() if p == phase]
+        else:
+            # Fallback: distribute all_clusters evenly across phases
+            log().warning("No current_individual found, using fallback cluster distribution")
+            clusters_by_phase = {}
+            clusters_per_phase = max(1, len(self.all_clusters) // self.num_phases)
+            for phase in range(1, self.num_phases + 1):
+                start_idx = (phase - 1) * clusters_per_phase
+                end_idx = min(phase * clusters_per_phase, len(self.all_clusters))
+                if phase == self.num_phases:  # Ensure last phase gets any remaining clusters
+                    end_idx = len(self.all_clusters)
+                clusters_by_phase[phase] = self.all_clusters[start_idx:end_idx]
+
+        # Log the cluster assignments for debugging
+        for phase, clusters in clusters_by_phase.items():
+            log().info(f"Phase {phase}: Connecting clusters {clusters}")
+
+        # Process each phase
+        for phase in range(1, self.num_phases + 1):
+            # Make a copy of the original supply file for this phase
+            phase_supply_df = original_supply_df.copy()
+
+            # Get all clusters connected up to this phase
+            connected_clusters = [0]  # Start with cluster 0
+            for p in range(1, phase + 1):
+                connected_clusters.extend(clusters_by_phase.get(p, []))
+
+            # Get all buildings in connected clusters
+            connected_buildings = []
+            for cluster in connected_clusters:
+                buildings = self._get_buildings_in_specific_cluster(cluster)
+                connected_buildings.extend(buildings)
+
+            # Update supply systems for connected buildings
+            for building in connected_buildings:
+                building_idx = phase_supply_df[phase_supply_df['name'] == building].index
+                if len(building_idx) > 0:
+                    phase_supply_df.loc[building_idx, 'supply_type_hs'] = district_heating_system
+                    phase_supply_df.loc[building_idx, 'supply_type_cs'] = district_cooling_system
+                    phase_supply_df.loc[building_idx, 'supply_type_dhw'] = district_dhw_system
+
+            # Use context manager to safely modify and restore the supply file
+            with self.__class__.TemporarySupplyFile(self.locator, phase_supply_df):
+                # Run LCA operation module
+                lca_operation(self.locator)
+
+                # Load LCA results
+                lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
+
+                # Calculate total GHG emissions and GFA for this phase
+                total_ghg = lca_operation_results['GHG_sys_tonCO2'].sum()
+                total_gfa = lca_operation_results['GFA_m2'].sum()
+
+                # Calculate emissions per GFA
+                ghg_per_gfa = total_ghg / total_gfa if total_gfa > 0 else 0
+
+                # Store results for this phase
+                results[phase] = {
+                    'district_operation_emission [t CO2eq/yr]': total_ghg,
+                    'district_operation_emission_per_gfa [t CO2eq/yr/m2]': ghg_per_gfa
+                }
+
+        return results
+
+    def _get_clusters_connected_in_phase(self, phase):
+        """
+        Get the clusters connected in a specific phase.
+
+        Parameters:
+        -----------
+        phase : int
+            Phase number
+
+        Returns:
+        --------
+        list
+            List of cluster IDs connected in the specified phase
+        """
+        # This method depends on how the optimization results are stored
+        # For single-objective optimization, we can get the clusters from the solution
+        if hasattr(self, 'solution') and not self.multi_objective_mode:
+            if phase in self.solution['phases']:
+                return self.solution['phases'][phase]
+
+        # For multi-objective optimization or if solution is not available,
+        # we need to check if we're in the middle of an optimization
+        # In that case, we can use the current individual being evaluated
+        if hasattr(self, 'current_individual'):
+            # Convert individual to cluster-phase mapping
+            cluster_phase_map = {cluster: p for cluster, p in zip(self.all_clusters, self.current_individual)}
+            # Get clusters connected in this phase
+            return [cluster for cluster, p in cluster_phase_map.items() if p == phase]
+
+        # If we can't determine the clusters, return an empty list
+        return []
+
     def calculate_ghg_emissions(self, cluster_set):
         """
         Calculate GHG emissions for a cluster set.
         This method is kept for backward compatibility but now uses the new approach.
+
+        Special case: When cluster_set is (0,), calculate emissions for the whole district
+        with cluster 0 using district systems and all other clusters using building-scale systems.
 
         Parameters:
         -----------
@@ -1202,8 +1383,15 @@ class DTNExpansionOptimizer:
         float
             Total GHG emissions in tonCO2
         """
-        # Create a simple cluster-phase mapping where all clusters in the set are in phase 1
-        cluster_phase_map = {cluster: 1 for cluster in cluster_set}
+        # Special case for phase 0: calculate emissions for the whole district
+        if cluster_set == (0,):
+            # Create a cluster-phase mapping where all clusters are assigned to phase 1
+            # This will make calculate_emissions_for_genome calculate emissions for the whole district
+            # with cluster 0 using district systems and other clusters using building-scale systems
+            cluster_phase_map = {cluster: 1 for cluster in self.all_clusters}
+        else:
+            # Normal case: create a simple cluster-phase mapping where all clusters in the set are in phase 1
+            cluster_phase_map = {cluster: 1 for cluster in cluster_set}
 
         # Calculate emissions using the new approach
         emissions, _ = self.calculate_emissions_for_genome(cluster_phase_map)
@@ -1216,7 +1404,7 @@ class DTNExpansionOptimizer:
         # Define genome representation: each gene is a phase number (1 to num_phases)
         # for each cluster (all clusters will be connected)
         self.toolbox.register("attr_phase", random.randint, 1, self.num_phases)
-        self.toolbox.register("individual", tools.initRepeat, creator.Individual, 
+        self.toolbox.register("individual", tools.initRepeat, creator.Individual,
                              self.toolbox.attr_phase, n=len(self.all_clusters))
         self.toolbox.register("population", tools.initRepeat, list, self.toolbox.individual)
 
@@ -1243,6 +1431,9 @@ class DTNExpansionOptimizer:
         tuple
             Fitness value(s) - single objective (NPV or ROI) or multi-objective (NPV/ROI and emissions)
         """
+        # Set current individual for use in emissions calculation
+        self.current_individual = individual
+
         # Convert individual to cluster-phase mapping
         cluster_phase_map = {cluster: phase for cluster, phase in zip(self.all_clusters, individual)}
 
@@ -1450,10 +1641,10 @@ class DTNExpansionOptimizer:
             pareto = tools.ParetoFront()
 
             # Run the NSGA-III algorithm
-            algorithms.eaMuPlusLambda(pop, self.toolbox, mu=population_size, 
-                                  lambda_=population_size, 
+            algorithms.eaMuPlusLambda(pop, self.toolbox, mu=population_size,
+                                  lambda_=population_size,
                                   cxpb=0.5, mutpb=0.2,
-                                  ngen=num_generations, 
+                                  ngen=num_generations,
                                   stats=None, halloffame=pareto, verbose=True)
 
             # Process the Pareto front solutions
@@ -1461,7 +1652,7 @@ class DTNExpansionOptimizer:
             for ind in pareto:
                 # Convert to cluster-phase mapping
                 solution = {
-                    'cluster_phase_map': {cluster: phase for cluster, phase in 
+                    'cluster_phase_map': {cluster: phase for cluster, phase in
                                          zip(self.all_clusters, ind) if phase > 0},
                     'phases': {}
                 }
@@ -1512,8 +1703,8 @@ class DTNExpansionOptimizer:
             stats.register("max", np.max)
 
             # Run the genetic algorithm
-            pop, logbook = algorithms.eaSimple(pop, self.toolbox, cxpb=0.5, mutpb=0.2, 
-                                              ngen=num_generations, stats=stats, 
+            pop, logbook = algorithms.eaSimple(pop, self.toolbox, cxpb=0.5, mutpb=0.2,
+                                              ngen=num_generations, stats=stats,
                                               halloffame=hof, verbose=True)
 
             # Get the best solution
@@ -1521,7 +1712,7 @@ class DTNExpansionOptimizer:
 
             # Convert to cluster-phase mapping
             solution = {
-                'cluster_phase_map': {cluster: phase for cluster, phase in 
+                'cluster_phase_map': {cluster: phase for cluster, phase in
                                      zip(self.all_clusters, best_individual) if phase > 0},
                 'fitness': best_individual.fitness.values[0],
                 'phases': {}
@@ -1709,7 +1900,7 @@ class DTNExpansionOptimizer:
                 'new_cluster(s)_hex_annual_fixed_om [USD/yr]': hex_annual_fixed_om,
                 'new_cluster(s)_pump_annual_fixed_om [USD/yr]': pump_annual_fixed_om,
                 'new_cluster(s)_cooling_plant_annual_fixed_om [USD/yr]': cooling_plant_annual_fixed_om,
-                'new_cluster(s)_total_annual_fixed_om [USD/yr]': pipe_annual_fixed_om + hex_annual_fixed_om + 
+                'new_cluster(s)_total_annual_fixed_om [USD/yr]': pipe_annual_fixed_om + hex_annual_fixed_om +
                                                                 pump_annual_fixed_om + cooling_plant_annual_fixed_om,
 
                 # O&M costs - variable components
@@ -1804,6 +1995,9 @@ class DTNExpansionOptimizer:
         # Create output directory
         output_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder())
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Calculate district emissions using the new methodology
+        district_emissions = self.calculate_district_emissions_new()
 
         # Check if this is a multi-objective result (list of solutions)
         if isinstance(solution, list):
@@ -1930,7 +2124,8 @@ class DTNExpansionOptimizer:
             'new_cluster(s)_om_cost [USD]': 0,  # No OM costs for existing DTN
             'cumulative_om_cost [USD]': 0,  # No cumulative OM costs for phase 0
             'ghg_cap [t CO2eq/yr]': '-',  # No GHG cap for existing DTN
-            'district_operation_emission [t CO2eq/yr]': self.calculate_ghg_emissions((0,)),
+            'district_operation_emission [t CO2eq/yr]': district_emissions.get(0, {}).get('district_operation_emission [t CO2eq/yr]', 0),
+            'district_operation_emission_per_gfa [t CO2eq/yr/m2]': district_emissions.get(0, {}).get('district_operation_emission_per_gfa [t CO2eq/yr/m2]', 0),
             'new_cluster(s)_roi [-]': 0,  # No ROI for existing DTN
             'overall_roi [-]': 0,  # No overall ROI for phase 0
             'new_cluster(s)_npv [USD]': 0,  # No NPV for existing DTN
@@ -1996,8 +2191,9 @@ class DTNExpansionOptimizer:
             annual_demand_kwh = metrics.get(f'total_annual_{demand_type}_MWh', 0) * 1000  # Convert MWh to kWh
             annual_revenue = annual_demand_kwh * self.energy_price
 
-            # Get pipe length and linear heat density
-            pipe_length = metrics.get('total_pipe_length_m', 0)
+            # Get cumulative values directly from metrics (these already include cluster 0)
+            cumulative_pipe_length = metrics.get('total_pipe_length_m', 0)
+            cumulative_annual_demand = metrics.get(f'total_annual_{demand_type}_MWh', 0)
             linear_heat_density = metrics.get(f'linear_{demand_type}_density_MWh_per_km', 0)
 
             # Get buildings in each cluster individually
@@ -2012,17 +2208,20 @@ class DTNExpansionOptimizer:
             cumulative_clusters.update(clusters)
             cumulative_buildings.update(newly_connected_buildings)
 
-            # Calculate cumulative annual heat demand by summing new_cluster(s)_annual_{demand_type} values
-            # Include phase 0 and all previous phases
-            cumulative_annual_demand = sum(r.get(f'new_cluster(s)_annual_{demand_type} [MWh/yr]', 0) for r in results)
-            # Add current phase
-            cumulative_annual_demand += metrics.get(f'total_annual_{demand_type}_MWh', 0)
+            # Calculate new values as the difference between current and previous phase
+            # Get the previous phase's cumulative values (phase 0 if this is phase 1)
+            if len(results) > 0:
+                prev_phase_result = results[-1]
+                prev_pipe_length = prev_phase_result.get('cumulative_pipe_length [m]', 0)
+                prev_annual_demand = prev_phase_result.get(f'cumulative_annual_{demand_type} [MWh/yr]', 0)
+            else:
+                # If no previous phase, use zeros
+                prev_pipe_length = 0
+                prev_annual_demand = 0
 
-            # Calculate cumulative pipe length by summing new_cluster(s)_pipe_length values
-            # Include phase 0 and all previous phases
-            cumulative_pipe_length = sum(r.get('new_cluster(s)_pipe_length [m]', 0) for r in results)
-            # Add current phase
-            cumulative_pipe_length += pipe_length
+            # Calculate new values as the difference
+            pipe_length = cumulative_pipe_length - prev_pipe_length
+            new_annual_demand = cumulative_annual_demand - prev_annual_demand
 
             # Calculate overall linear heat density
             overall_linear_density = cumulative_annual_demand / (cumulative_pipe_length / 1000) if cumulative_pipe_length > 0 else 0
@@ -2097,16 +2296,17 @@ class DTNExpansionOptimizer:
                 'new_cluster(s)_om_cost [USD]': total_om_cost,
                 'cumulative_om_cost [USD]': cumulative_om_cost,
                 'ghg_cap [t CO2eq/yr]': self.ghg_budget_per_phase[phase-1] if self.ghg_budget_per_phase and phase-1 < len(self.ghg_budget_per_phase) else 'no_limit',
-                'district_operation_emission [t CO2eq/yr]': sum(r.get('district_operation_emission [t CO2eq/yr]', 0) for r in results if r['phase'] == 0) + self.calculate_ghg_emissions(tuple(clusters)),
+                'district_operation_emission [t CO2eq/yr]': district_emissions.get(phase, {}).get('district_operation_emission [t CO2eq/yr]', 0),
+                'district_operation_emission_per_gfa [t CO2eq/yr/m2]': district_emissions.get(phase, {}).get('district_operation_emission_per_gfa [t CO2eq/yr/m2]', 0),
                 'new_cluster(s)_roi [-]': roi,
                 'overall_roi [-]': overall_roi,
                 'new_cluster(s)_npv [USD]': npv,
                 'overall_npv [USD]': overall_npv,
                 'new_cluster(s)_pipe_length [m]': pipe_length,
                 'cumulative_pipe_length [m]': cumulative_pipe_length,
-                f'new_cluster(s)_annual_{demand_type} [MWh/yr]': metrics.get(f'total_annual_{demand_type}_MWh', 0),
+                f'new_cluster(s)_annual_{demand_type} [MWh/yr]': new_annual_demand,
                 f'cumulative_annual_{demand_type} [MWh/yr]': cumulative_annual_demand,
-                f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]': linear_heat_density,
+                f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]': (new_annual_demand / (pipe_length / 1000)) if pipe_length > 0 else 0,
                 f'overall_linear_{demand_type}_density [MWh/km/yr]': overall_linear_density
             }
 
@@ -2144,7 +2344,8 @@ class DTNExpansionOptimizer:
             'new_cluster(s)_om_cost [USD]': sum(result.get('new_cluster(s)_om_cost [USD]', 0) for result in results if result['phase'] != 0),
             'cumulative_om_cost [USD]': sum(result.get('new_cluster(s)_om_cost [USD]', 0) for result in results if result['phase'] != 0),
             'ghg_cap [t CO2eq/yr]': self.ghg_budget_per_phase[-1] if self.ghg_budget_per_phase else '-',
-            'district_operation_emission [t CO2eq/yr]': last_phase_result['district_operation_emission [t CO2eq/yr]'] if results and any(r['phase'] != 0 for r in results) else 0,
+            'district_operation_emission [t CO2eq/yr]': district_emissions.get(self.num_phases, {}).get('district_operation_emission [t CO2eq/yr]', 0),
+            'district_operation_emission_per_gfa [t CO2eq/yr/m2]': district_emissions.get(self.num_phases, {}).get('district_operation_emission_per_gfa [t CO2eq/yr/m2]', 0),
             'new_cluster(s)_roi [-]': sum(result['new_cluster(s)_roi [-]'] * result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) / sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) if sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) > 0 else 0,
             'new_cluster(s)_npv [USD]': sum(result['new_cluster(s)_npv [USD]'] for result in results if result['phase'] != 0),
             'new_cluster(s)_pipe_length [m]': sum(result.get('new_cluster(s)_pipe_length [m]', result.get('newly_added_pipe_length [m]', 0)) for result in results if result['phase'] != 0),
@@ -2178,14 +2379,15 @@ class DTNExpansionOptimizer:
             summary[f'cumulative_annual_{demand_type} [MWh/yr]'] = phase0_result.get(f'cumulative_annual_{demand_type} [MWh/yr]', 0)
             summary[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = 0
             summary['district_operation_emission [t CO2eq/yr]'] = 0
+            summary['district_operation_emission_per_gfa [t CO2eq/yr/m2]'] = 0
 
         # Calculate average newly connected linear heat density (weighted by pipe length) only if not already set
         if summary[f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]'] == 0:
             total_pipe_length = sum(result.get('new_cluster(s)_pipe_length [m]', result.get('newly_added_pipe_length [m]', 0)) for result in results if result['phase'] != 0)
             if total_pipe_length > 0:
                 summary[f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]'] = sum(
-                    result.get(f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]', 0) * 
-                    result.get('new_cluster(s)_pipe_length [m]', result.get('newly_added_pipe_length [m]', 0)) 
+                    result.get(f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]', 0) *
+                    result.get('new_cluster(s)_pipe_length [m]', result.get('newly_added_pipe_length [m]', 0))
                     for result in results if result['phase'] != 0
                 ) / total_pipe_length
 
@@ -2318,7 +2520,7 @@ class PipeLayoutGenerator:
 
             # Get clusters that contain the chosen buildings
             building_clusters = self.cluster_nodes[
-                (self.cluster_nodes['type'] == 'CONSUMER') & 
+                (self.cluster_nodes['type'] == 'CONSUMER') &
                 (self.cluster_nodes['building'].isin(self.chosen_buildings))
             ]['cluster'].unique()
 
@@ -2401,8 +2603,8 @@ class PipeLayoutGenerator:
 
         # Get main road edges (-1) that connect the clusters
         main_road_edges = cluster_edges_df[
-            (cluster_edges_df['cluster'] == -1) & 
-            (cluster_edges_df['from_C'].isin(clusters_to_connect)) & 
+            (cluster_edges_df['cluster'] == -1) &
+            (cluster_edges_df['from_C'].isin(clusters_to_connect)) &
             (cluster_edges_df['to_C'].isin(clusters_to_connect))
         ]
 
@@ -2435,7 +2637,7 @@ class PipeLayoutGenerator:
                     if common_columns:
                         log().warning(f"Using only common columns for concatenation: {common_columns}")
                         required_pipes = pd.concat([
-                            cluster_edges[list(common_columns)], 
+                            cluster_edges[list(common_columns)],
                             main_road_edges[list(common_columns)]
                         ], ignore_index=True)
                     else:
@@ -2466,24 +2668,30 @@ class PipeLayoutGenerator:
         # Calculate total pipe length
         total_pipe_length = required_pipes['length_m'].sum()
 
-        # Get buildings in the clusters
+        # Get buildings in the clusters (using unique to avoid duplicates)
         buildings_in_clusters = self.cluster_nodes[
-            (self.cluster_nodes['cluster'].isin(clusters_to_connect)) & 
+            (self.cluster_nodes['cluster'].isin(clusters_to_connect)) &
             (self.cluster_nodes['type'] == 'CONSUMER')
-        ]['building'].tolist()
+        ]['building'].unique().tolist()
 
         # Calculate total annual demand
         if self.network_type == 'DH':
             # For district heating, use Qhs_sys_MWhyr
             total_annual_demand = self.total_demand[
                 self.total_demand['name'].isin(buildings_in_clusters)
-            ]['Qhs_sys_MWhyr'].sum()
+            ]['Qhs_sys_MWhyr'].sum() + self.total_demand[
+                self.total_demand['name'].isin(buildings_in_clusters)
+            ]['Qww_sys_MWhyr'].sum()
             demand_type = 'Qh'
         else:
             # For district cooling, use Qcs_sys_MWhyr
             total_annual_demand = self.total_demand[
                 self.total_demand['name'].isin(buildings_in_clusters)
-            ]['Qcs_sys_MWhyr'].sum()
+            ]['Qcs_sys_MWhyr'].sum() + self.total_demand[
+                self.total_demand['name'].isin(buildings_in_clusters)
+            ]['Qcre_sys_MWhyr'].sum() + self.total_demand[
+                self.total_demand['name'].isin(buildings_in_clusters)
+            ]['Qcdata_sys_MWhyr'].sum()
             demand_type = 'Qc'
 
         # Calculate linear heat density (LHD)
@@ -2611,8 +2819,8 @@ def main(config):
 
     # Generate pipe layouts for different sets of clusters
     pipe_layout_generator = PipeLayoutGenerator(
-        locator, 
-        network_type, 
+        locator,
+        network_type,
         phase=1,
         chosen_clusters=chosen_clusters,
         chosen_buildings=chosen_buildings

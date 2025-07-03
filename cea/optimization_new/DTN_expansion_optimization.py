@@ -454,7 +454,14 @@ class DTNExpansionOptimizer:
         """Create a mapping from cluster combinations to their metrics."""
         cluster_metrics = {}
         for _, row in self.metrics_df.iterrows():
-            cluster_metrics[row['clusters']] = row.to_dict()
+            key = row['clusters']
+            cluster_metrics[key] = row.to_dict()
+
+            # also register an alias without the leading "0+"
+            if key.startswith('0+'):
+                alias = key[2:]  # e.g. "0+2+4" → "2+4"
+                cluster_metrics[alias] = row.to_dict()
+
         return cluster_metrics
 
     def get_required_pipes_for_clusters(self, cluster_set):
@@ -1759,190 +1766,241 @@ class DTNExpansionOptimizer:
         else:
             demand_type = 'Qc'
 
-        # Process each phase result
-        for result in results:
-            # Check if this is a multi-objective solution (has 'phases' key but no 'phase' key)
-            if 'phases' in result and 'phase' not in result:
-                # Process each phase in the multi-objective solution
-                for phase_num, clusters in result['phases'].items():
+        # Process each solution in the results
+        for original_result in results:
+            phase_results = []
+            if 'phases' in original_result and 'phase' not in original_result:
+
+                # Multi-objective solution with multiple phases
+                cumulative_clusters = []
+                cumulative_clusters: list[int] = []
+                # store cumulative numbers of the *previous* phase – start with 0
+                prev_cumulative_metrics = {
+                    'total_pipe_length_m': 0,
+                    f'total_annual_{demand_type}_MWh': 0
+                }
+
+                for phase_num in sorted(original_result['phases'].keys()):
                     if phase_num == 0:
-                        # Skip phase 0 (existing DTN) for now
                         continue
 
-                    # Create a temporary result dictionary with the structure expected by the rest of the method
-                    # Store the original result in a temporary variable
-                    original_result = result
+                    # ------------------------------------------------------------------
+                    # 1) update running list of connected clusters
+                    # ------------------------------------------------------------------
+                    newly_connected = sorted(original_result['phases'][phase_num])
+                    cumulative_clusters.extend(newly_connected)
+                    cumulative_clusters = sorted(set(cumulative_clusters))
 
-                    # Create a new result dictionary with the expected structure
-                    result = {
+                    cumulative_key = '+'.join(map(str, cumulative_clusters))
+                    cumulative_metrics = self.cluster_metrics.get(cumulative_key, {})
+
+                    # ------------------------------------------------------------------
+                    # 2) derive *incremental* (newly-connected) metrics
+                    #    = current cumulative  –  previous cumulative
+                    # ------------------------------------------------------------------
+                    new_pipe_length = (
+                            cumulative_metrics.get('total_pipe_length_m', 0)
+                            - prev_cumulative_metrics['total_pipe_length_m']
+                    )
+                    new_annual_demand = (
+                            cumulative_metrics.get(f'total_annual_{demand_type}_MWh', 0)
+                            - prev_cumulative_metrics[f'total_annual_{demand_type}_MWh']
+                    )
+                    new_linear_density = (
+                        new_annual_demand / (new_pipe_length / 1000)
+                        if new_pipe_length > 0 else 0
+                    )
+
+                    # ------------------------------------------------------------------
+                    # 3) assemble phase result
+                    # ------------------------------------------------------------------
+                    phase_result = {
                         'phase': phase_num,
-                        'newly_connected_cluster(s)': '+'.join(map(str, clusters)),
-                        'cumulative_cluster(s)': '+'.join(map(str, [0] + clusters)),  # Include cluster 0
+                        'newly_connected_cluster(s)': '+'.join(map(str, newly_connected)),
+                        'cumulative_cluster(s)': '+'.join(map(str, [0] + cumulative_clusters)),
+
                         'new_cluster(s)_roi [-]': original_result.get(f'phase_{phase_num}_roi', 0),
                         'new_cluster(s)_npv [USD]': original_result.get(f'phase_{phase_num}_npv', 0),
                         'new_cluster(s)_capex [USD]': original_result.get(f'phase_{phase_num}_capex', 0),
-                        'district_operation_emission [t CO2eq/yr]': original_result.get(f'phase_{phase_num}_emissions', 0),
-                        'new_cluster(s)_pipe_length [m]': 0,  # Will be calculated later
-                        'cumulative_pipe_length [m]': 0,  # Will be calculated later
-                        f'new_cluster(s)_annual_{demand_type} [MWh/yr]': 0,  # Will be calculated later
-                        f'cumulative_annual_{demand_type} [MWh/yr]': 0,  # Will be calculated later
-                        f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]': 0,  # Will be calculated later
-                        f'overall_linear_{demand_type}_density [MWh/km/yr]': 0  # Will be calculated later
+                        'district_operation_emission [t CO2eq/yr]':
+                            original_result.get(f'phase_{phase_num}_emissions', 0),
+
+                        'new_cluster(s)_pipe_length [m]': new_pipe_length,
+                        'cumulative_pipe_length [m]':
+                            cumulative_metrics.get('total_pipe_length_m', 0),
+
+                        f'new_cluster(s)_annual_{demand_type} [MWh/yr]': new_annual_demand,
+                        f'cumulative_annual_{demand_type} [MWh/yr]':
+                            cumulative_metrics.get(f'total_annual_{demand_type}_MWh', 0),
+
+                        f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]': new_linear_density,
+                        f'overall_linear_{demand_type}_density [MWh/km/yr]':
+                            cumulative_metrics.get(f'linear_{demand_type}_density_MWh_per_km', 0),
+
+                        'individual': original_result.get('individual')
                     }
+                    phase_results.append(phase_result)
 
-                    # Now we have a result with the expected structure, so we can continue with the existing logic
-                    phase = result['phase']
-                    break
-                else:
-                    # If no phases were processed, continue to the next result
-                    continue
+                    # ------------------------------------------------------------------
+                    # 4) store current cumulative values for next iteration
+                    # ------------------------------------------------------------------
+                    prev_cumulative_metrics = {
+                        'total_pipe_length_m': cumulative_metrics.get('total_pipe_length_m', 0),
+                        f'total_annual_{demand_type}_MWh':
+                            cumulative_metrics.get(f'total_annual_{demand_type}_MWh', 0)
+                    }
             else:
-                # This is a single-objective solution with the expected structure
+                # Single-objective solution or already processed phase
+                if 'phase' in original_result and original_result['phase'] > 0:
+                    phase_results.append(original_result)
+
+            # Process each phase result (either from multi-objective or single-objective)
+            for result in phase_results:
                 phase = result['phase']
-            if phase == 0:
-                # Skip phase 0 (existing DTN) for now
-                continue
 
-            # Get clusters for this phase
-            clusters = [int(c) for c in result['newly_connected_cluster(s)'].split('+')]
+                # Get clusters for this phase
+                clusters = [int(c) for c in result['newly_connected_cluster(s)'].split('+')]
 
-            # Calculate detailed CAPEX components
-            if self.cost_model == 'detailed':
-                pipe_capex = self.calculate_detailed_capex(tuple(clusters))
-            else:
-                pipe_capex = self.calculate_simplified_capex(tuple(clusters))
+                # Calculate detailed CAPEX components
+                if self.cost_model == 'detailed':
+                    pipe_capex = self.calculate_detailed_capex(tuple(clusters))
+                else:
+                    pipe_capex = self.calculate_simplified_capex(tuple(clusters))
 
-            # Get buildings in the clusters
-            buildings = self._get_buildings_in_clusters(tuple(clusters))
+                # Get buildings in the clusters
+                buildings = self._get_buildings_in_clusters(tuple(clusters))
 
-            # Calculate heat exchanger costs
-            if self.cost_model == 'detailed':
-                hex_capex = self.calculate_hex_costs(tuple(clusters))
-            else:
-                hex_capex = len(buildings) * (self.cost_data['capex_hex_USD'] / self.total_buildings)
+                # Calculate heat exchanger costs
+                if self.cost_model == 'detailed':
+                    hex_capex = self.calculate_hex_costs(tuple(clusters))
+                else:
+                    hex_capex = len(buildings) * (self.cost_data['capex_hex_USD'] / self.total_buildings)
 
-            # Calculate pump costs
-            if self.cost_model == 'detailed':
-                pump_capex, pump_electricity = self.calculate_pump_costs(tuple(clusters))
-            else:
-                required_pipes = self.get_required_pipes_for_clusters(tuple(clusters))
-                pipe_length_ratio = required_pipes['length_m'].sum() / self.cost_data['network_length_m']
-                pump_capex = self.cost_data['capex_pumps_USD'] * pipe_length_ratio
-                pump_electricity = 0  # Not calculated in simplified model
+                # Calculate pump costs
+                if self.cost_model == 'detailed':
+                    pump_capex, pump_electricity = self.calculate_pump_costs(tuple(clusters))
+                else:
+                    required_pipes = self.get_required_pipes_for_clusters(tuple(clusters))
+                    pipe_length_ratio = required_pipes['length_m'].sum() / self.cost_data['network_length_m']
+                    pump_capex = self.cost_data['capex_pumps_USD'] * pipe_length_ratio
+                    pump_electricity = 0  # Not calculated in simplified model
 
-            # Calculate cooling plant costs for DC networks
-            if self.network_type == 'DC':
-                cooling_plant_capex, cooling_plant_electricity = self.calculate_cooling_plant_costs(tuple(clusters))
-            else:
-                cooling_plant_capex = 0
-                cooling_plant_electricity = 0
+                # Calculate cooling plant costs for DC networks
+                if self.network_type == 'DC':
+                    cooling_plant_capex, cooling_plant_electricity = self.calculate_cooling_plant_costs(tuple(clusters))
+                else:
+                    cooling_plant_capex = 0
+                    cooling_plant_electricity = 0
 
-            # Calculate annualized costs (assuming 25 year lifetime and 5% interest rate)
-            pipe_annual_capex = calc_capex_annualized(pipe_capex, 5, 25)
-            hex_annual_capex = calc_capex_annualized(hex_capex, 5, 25)
-            pump_annual_capex = calc_capex_annualized(pump_capex, 5, 25)
-            cooling_plant_annual_capex = calc_capex_annualized(cooling_plant_capex, 5, 25)
+                # Calculate annualized costs (assuming 25 year lifetime and 5% interest rate)
+                pipe_annual_capex = calc_capex_annualized(pipe_capex, 5, 25)
+                hex_annual_capex = calc_capex_annualized(hex_capex, 5, 25)
+                pump_annual_capex = calc_capex_annualized(pump_capex, 5, 25)
+                cooling_plant_annual_capex = calc_capex_annualized(cooling_plant_capex, 5, 25)
 
-            # Calculate O&M costs
-            # Fixed O&M costs (infrastructure components like pipes and HEX use 1.5% of CAPEX)
-            pipe_annual_fixed_om = 0.015 * pipe_capex
-            hex_annual_fixed_om = 0.015 * hex_capex
+                # Calculate O&M costs
+                # Fixed O&M costs (infrastructure components like pipes and HEX use 1.5% of CAPEX)
+                pipe_annual_fixed_om = 0.015 * pipe_capex
+                hex_annual_fixed_om = 0.015 * hex_capex
 
-            # Fixed O&M costs (equipment like pumps and cooling plants use 1.0% of CAPEX)
-            pump_annual_fixed_om = 0.01 * pump_capex
-            cooling_plant_annual_fixed_om = 0.01 * cooling_plant_capex
+                # Fixed O&M costs (equipment like pumps and cooling plants use 1.0% of CAPEX)
+                pump_annual_fixed_om = 0.01 * pump_capex
+                cooling_plant_annual_fixed_om = 0.01 * cooling_plant_capex
 
-            # Variable O&M costs based on electricity consumption
-            # Get electricity price (USD/kWh)
-            from cea.technologies.supply_systems_database import SupplySystemsDatabase
-            try:
-                supply_systems = SupplySystemsDatabase(self.locator)
-                from cea.optimization.prices import Prices  # Import Prices class
-                prices = Prices(supply_systems)
-                electricity_price = np.mean(prices.ELEC_PRICE, dtype=np.float64)  # [USD/W]
-                log().info(f"Using electricity price: {electricity_price} USD/W")
-            except Exception as e:
-                log().warning(f"Could not get electricity price: {e}. Using default value of 0.1 USD/kWh")
-                electricity_price = 0.1 / 1000  # Convert from USD/kWh to USD/W
+                # Variable O&M costs based on electricity consumption
+                # Get electricity price (USD/kWh)
+                from cea.technologies.supply_systems_database import SupplySystemsDatabase
+                try:
+                    supply_systems = SupplySystemsDatabase(self.locator)
+                    from cea.optimization.prices import Prices  # Import Prices class
+                    prices = Prices(supply_systems)
+                    electricity_price = np.mean(prices.ELEC_PRICE, dtype=np.float64)  # [USD/W]
+                    log().info(f"Using electricity price: {electricity_price} USD/W")
+                except Exception as e:
+                    log().warning(f"Could not get electricity price: {e}. Using default value of 0.1 USD/kWh")
+                    electricity_price = 0.1 / 1000  # Convert from USD/kWh to USD/W
 
-            # Calculate variable O&M costs
-            pump_annual_variable_om = pump_electricity * electricity_price  # Wh * USD/W = USD
-            cooling_plant_annual_variable_om = cooling_plant_electricity * 1000 * electricity_price  # kWh * 1000 * USD/W = USD
+                # Calculate variable O&M costs
+                pump_annual_variable_om = pump_electricity * electricity_price  # Wh * USD/W = USD
+                cooling_plant_annual_variable_om = cooling_plant_electricity * 1000 * electricity_price  # kWh * 1000 * USD/W = USD
 
-            # Total O&M costs
-            pipe_annual_om = pipe_annual_fixed_om
-            hex_annual_om = hex_annual_fixed_om
-            pump_annual_om = pump_annual_fixed_om + pump_annual_variable_om
-            cooling_plant_annual_om = cooling_plant_annual_fixed_om + cooling_plant_annual_variable_om
+                # Total O&M costs
+                pipe_annual_om = pipe_annual_fixed_om
+                hex_annual_om = hex_annual_fixed_om
+                pump_annual_om = pump_annual_fixed_om + pump_annual_variable_om
+                cooling_plant_annual_om = cooling_plant_annual_fixed_om + cooling_plant_annual_variable_om
 
-            # Create detailed result dictionary
-            detailed_result = {
-                'phase': phase,
-                'newly_connected_cluster(s)': result['newly_connected_cluster(s)'],
-                'cumulative_cluster(s)': result['cumulative_cluster(s)'],
+                # Create detailed result dictionary
+                detailed_result = {
+                    'phase': phase,
+                    'newly_connected_cluster(s)': result['newly_connected_cluster(s)'],
+                    'cumulative_cluster(s)': result['cumulative_cluster(s)'],
 
-                # CAPEX components
-                'new_cluster(s)_pipe_capex [USD]': pipe_capex,
-                'new_cluster(s)_hex_capex [USD]': hex_capex,
-                'new_cluster(s)_pump_capex [USD]': pump_capex,
-                'new_cluster(s)_cooling_plant_capex [USD]': cooling_plant_capex,
-                'new_cluster(s)_total_capex [USD]': result['new_cluster(s)_capex [USD]'],
+                    # CAPEX components
+                    'new_cluster(s)_pipe_capex [USD]': pipe_capex,
+                    'new_cluster(s)_hex_capex [USD]': hex_capex,
+                    'new_cluster(s)_pump_capex [USD]': pump_capex,
+                    'new_cluster(s)_cooling_plant_capex [USD]': cooling_plant_capex,
+                    'new_cluster(s)_total_capex [USD]': result['new_cluster(s)_capex [USD]'],
 
-                # Annualized CAPEX components
-                'new_cluster(s)_pipe_annual_capex [USD/yr]': pipe_annual_capex,
-                'new_cluster(s)_hex_annual_capex [USD/yr]': hex_annual_capex,
-                'new_cluster(s)_pump_annual_capex [USD/yr]': pump_annual_capex,
-                'new_cluster(s)_cooling_plant_annual_capex [USD/yr]': cooling_plant_annual_capex,
-                'new_cluster(s)_total_annual_capex [USD/yr]': pipe_annual_capex + hex_annual_capex + pump_annual_capex + cooling_plant_annual_capex,
+                    # Annualized CAPEX components
+                    'new_cluster(s)_pipe_annual_capex [USD/yr]': pipe_annual_capex,
+                    'new_cluster(s)_hex_annual_capex [USD/yr]': hex_annual_capex,
+                    'new_cluster(s)_pump_annual_capex [USD/yr]': pump_annual_capex,
+                    'new_cluster(s)_cooling_plant_annual_capex [USD/yr]': cooling_plant_annual_capex,
+                    'new_cluster(s)_total_annual_capex [USD/yr]': pipe_annual_capex + hex_annual_capex + pump_annual_capex + cooling_plant_annual_capex,
 
-                # O&M costs - fixed components
-                'new_cluster(s)_pipe_annual_fixed_om [USD/yr]': pipe_annual_fixed_om,
-                'new_cluster(s)_hex_annual_fixed_om [USD/yr]': hex_annual_fixed_om,
-                'new_cluster(s)_pump_annual_fixed_om [USD/yr]': pump_annual_fixed_om,
-                'new_cluster(s)_cooling_plant_annual_fixed_om [USD/yr]': cooling_plant_annual_fixed_om,
-                'new_cluster(s)_total_annual_fixed_om [USD/yr]': pipe_annual_fixed_om + hex_annual_fixed_om +
-                                                                pump_annual_fixed_om + cooling_plant_annual_fixed_om,
+                    # O&M costs - fixed components
+                    'new_cluster(s)_pipe_annual_fixed_om [USD/yr]': pipe_annual_fixed_om,
+                    'new_cluster(s)_hex_annual_fixed_om [USD/yr]': hex_annual_fixed_om,
+                    'new_cluster(s)_pump_annual_fixed_om [USD/yr]': pump_annual_fixed_om,
+                    'new_cluster(s)_cooling_plant_annual_fixed_om [USD/yr]': cooling_plant_annual_fixed_om,
+                    'new_cluster(s)_total_annual_fixed_om [USD/yr]': pipe_annual_fixed_om + hex_annual_fixed_om + \
+                                                                     pump_annual_fixed_om + cooling_plant_annual_fixed_om,
 
-                # O&M costs - variable components
-                'new_cluster(s)_pump_annual_variable_om [USD/yr]': pump_annual_variable_om,
-                'new_cluster(s)_cooling_plant_annual_variable_om [USD/yr]': cooling_plant_annual_variable_om,
-                'new_cluster(s)_total_annual_variable_om [USD/yr]': pump_annual_variable_om + cooling_plant_annual_variable_om,
+                    # O&M costs - variable components
+                    'new_cluster(s)_pump_annual_variable_om [USD/yr]': pump_annual_variable_om,
+                    'new_cluster(s)_cooling_plant_annual_variable_om [USD/yr]': cooling_plant_annual_variable_om,
+                    'new_cluster(s)_total_annual_variable_om [USD/yr]': pump_annual_variable_om + cooling_plant_annual_variable_om,
 
-                # O&M costs - total (for backward compatibility)
-                'new_cluster(s)_pipe_annual_om [USD/yr]': pipe_annual_om,
-                'new_cluster(s)_hex_annual_om [USD/yr]': hex_annual_om,
-                'new_cluster(s)_pump_annual_om [USD/yr]': pump_annual_om,
-                'new_cluster(s)_cooling_plant_annual_om [USD/yr]': cooling_plant_annual_om,
-                'new_cluster(s)_total_annual_om [USD/yr]': pipe_annual_om + hex_annual_om + pump_annual_om + cooling_plant_annual_om,
+                    # O&M costs - total (for backward compatibility)
+                    'new_cluster(s)_pipe_annual_om [USD/yr]': pipe_annual_om,
+                    'new_cluster(s)_hex_annual_om [USD/yr]': hex_annual_om,
+                    'new_cluster(s)_pump_annual_om [USD/yr]': pump_annual_om,
+                    'new_cluster(s)_cooling_plant_annual_om [USD/yr]': cooling_plant_annual_om,
+                    'new_cluster(s)_total_annual_om [USD/yr]': pipe_annual_om + hex_annual_om + pump_annual_om + cooling_plant_annual_om,
 
-                # Energy consumption
-                'new_cluster(s)_pump_electricity [kWh/yr]': pump_electricity / 1000,  # Convert Wh to kWh
-                'new_cluster(s)_cooling_plant_electricity [kWh/yr]': cooling_plant_electricity,
+                    # Energy consumption
+                    'new_cluster(s)_pump_electricity [kWh/yr]': pump_electricity / 1000,  # Convert Wh to kWh
+                    'new_cluster(s)_cooling_plant_electricity [kWh/yr]': cooling_plant_electricity,
 
-                # Other metrics
-                # Get annual demand directly from cluster metrics
-                f'new_cluster(s)_annual_{demand_type} [MWh/yr]': self.cluster_metrics.get('+'.join(map(str, sorted(clusters))), {}).get(f'total_annual_{demand_type}_MWh', 0),
-                f'cumulative_annual_{demand_type} [MWh/yr]': result[f'cumulative_annual_{demand_type} [MWh/yr]'],
-                'new_cluster(s)_pipe_length [m]': result['new_cluster(s)_pipe_length [m]'],
-                'cumulative_pipe_length [m]': result['cumulative_pipe_length [m]'],
-                f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]': result[f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]'],
-                f'overall_linear_{demand_type}_density [MWh/km/yr]': result[f'overall_linear_{demand_type}_density [MWh/km/yr]']
-            }
+                    # Other metrics
+                    # Get annual demand directly from cluster metrics
+                    f'new_cluster(s)_annual_{demand_type} [MWh/yr]': self.cluster_metrics.get(
+                        '+'.join(map(str, sorted(clusters))), {}).get(f'total_annual_{demand_type}_MWh', 0),
+                    f'cumulative_annual_{demand_type} [MWh/yr]': result[f'cumulative_annual_{demand_type} [MWh/yr]'],
+                    'new_cluster(s)_pipe_length [m]': result['new_cluster(s)_pipe_length [m]'],
+                    'cumulative_pipe_length [m]': result['cumulative_pipe_length [m]'],
+                    f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]': result[
+                        f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]'],
+                    f'overall_linear_{demand_type}_density [MWh/km/yr]': result[
+                        f'overall_linear_{demand_type}_density [MWh/km/yr]']
+                }
 
-            # Add emissions data from the best individual
-            if 'individual' in result:
-                ind_tuple = tuple(result['individual'])
-                if ind_tuple in self.emissions_cache:
-                    emissions, _ = self.emissions_cache[ind_tuple]
-                    # Add emissions data for this phase - only operational emissions
-                    detailed_result['phase_operation_emissions_tonCO2'] = emissions[phase]['operation']
+                # Add emissions data from the best individual
+                if 'individual' in result and result['individual'] is not None:
+                    ind_tuple = tuple(result['individual'])
+                    if ind_tuple in self.emissions_cache:
+                        emissions, _ = self.emissions_cache[ind_tuple]
+                        # Add emissions data for this phase - only operational emissions
+                        detailed_result['phase_operation_emissions_tonCO2'] = emissions[phase]['operation']
 
-                    # Add cumulative emissions data (sum of all phases up to this one)
-                    cumulative_operation = sum(emissions[p]['operation'] for p in range(1, phase + 1))
-                    detailed_result['cumulative_operation_emissions_tonCO2'] = cumulative_operation
-                    detailed_result['district_operation_emission_tonCO2'] = cumulative_operation
+                        # Add cumulative emissions data (sum of all phases up to this one)
+                        cumulative_operation = sum(emissions[p]['operation'] for p in range(1, phase + 1))
+                        detailed_result['cumulative_operation_emissions_tonCO2'] = cumulative_operation
+                        detailed_result['district_operation_emission_tonCO2'] = cumulative_operation
 
-            detailed_results.append(detailed_result)
+                detailed_results.append(detailed_result)
 
         # Create DataFrame
         detailed_results_df = pd.DataFrame(detailed_results)
@@ -1954,21 +2012,25 @@ class DTNExpansionOptimizer:
         ])]
         for col in integer_columns:
             if col in detailed_results_df.columns:
-                detailed_results_df[col] = detailed_results_df[col].apply(lambda x: int(round(x, 0)) if isinstance(x, (int, float)) and not pd.isna(x) else x)
+                detailed_results_df[col] = detailed_results_df[col].apply(
+                    lambda x: int(round(x, 0)) if isinstance(x, (int, float)) and not pd.isna(x) else x)
 
         # 2 decimal places
         decimal2_columns = [col for col in detailed_results_df.columns if any(substr in col for substr in [
-            'operation_emission', 'annual_Qh [MWh/yr]', 'annual_Qc [MWh/yr]', 'linear_Qh_density [MWh/km/yr]', 'linear_Qc_density [MWh/km/yr]'
+            'operation_emission', 'annual_Qh [MWh/yr]', 'annual_Qc [MWh/yr]', 'linear_Qh_density [MWh/km/yr]',
+            'linear_Qc_density [MWh/km/yr]'
         ])]
         for col in decimal2_columns:
             if col in detailed_results_df.columns:
-                detailed_results_df[col] = detailed_results_df[col].apply(lambda x: round(x, 2) if isinstance(x, (int, float)) and not pd.isna(x) else x)
+                detailed_results_df[col] = detailed_results_df[col].apply(
+                    lambda x: round(x, 2) if isinstance(x, (int, float)) and not pd.isna(x) else x)
 
         # 4 decimal places
         decimal4_columns = [col for col in detailed_results_df.columns if 'roi [-]' in col]
         for col in decimal4_columns:
             if col in detailed_results_df.columns:
-                detailed_results_df[col] = detailed_results_df[col].apply(lambda x: round(x, 4) if isinstance(x, (int, float)) and not pd.isna(x) else x)
+                detailed_results_df[col] = detailed_results_df[col].apply(
+                    lambda x: round(x, 4) if isinstance(x, (int, float)) and not pd.isna(x) else x)
 
         # Save to CSV with network-type specific filename
         if return_df:
@@ -2175,8 +2237,18 @@ class DTNExpansionOptimizer:
 
         # Calculate metrics for each phase
         for phase, clusters in sorted(solution['phases'].items()):
+            # Get buildings in each cluster individually
+            newly_connected_buildings = set()
+            for cluster in clusters:
+                cluster_buildings = self._get_buildings_in_specific_cluster(cluster)
+                newly_connected_buildings.update(cluster_buildings)
+
+            # Update cumulative values
+            cumulative_clusters.update(clusters)
+            cumulative_buildings.update(newly_connected_buildings)
+
             # Get metrics for this cluster set
-            key = '+'.join(map(str, sorted(clusters)))
+            key = '+'.join(map(str, sorted(cumulative_clusters)))
             metrics = self.cluster_metrics.get(key, {})
 
             # Calculate financial metrics
@@ -2196,17 +2268,7 @@ class DTNExpansionOptimizer:
             cumulative_annual_demand = metrics.get(f'total_annual_{demand_type}_MWh', 0)
             linear_heat_density = metrics.get(f'linear_{demand_type}_density_MWh_per_km', 0)
 
-            # Get buildings in each cluster individually
-            newly_connected_buildings = set()
-            for cluster in clusters:
-                cluster_buildings = self._get_buildings_in_specific_cluster(cluster)
-                newly_connected_buildings.update(cluster_buildings)
-
             num_newly_connected_buildings = len(newly_connected_buildings)
-
-            # Update cumulative values
-            cumulative_clusters.update(clusters)
-            cumulative_buildings.update(newly_connected_buildings)
 
             # Calculate new values as the difference between current and previous phase
             # Get the previous phase's cumulative values (phase 0 if this is phase 1)
@@ -2702,7 +2764,7 @@ class PipeLayoutGenerator:
 
         # Create metrics dictionary
         metrics = {
-            'clusters': '+'.join(map(str, sorted(cluster_set))),
+            'clusters': '+'.join(map(str, sorted(clusters_to_connect))),
             f'total_annual_{demand_type}_MWh': total_annual_demand,
             'total_pipe_length_m': total_pipe_length,
             f'linear_{demand_type}_density_MWh_per_km': linear_heat_density

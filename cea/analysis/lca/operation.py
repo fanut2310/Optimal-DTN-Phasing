@@ -22,13 +22,15 @@ __status__ = "Production"
 from cea.datamanagement.format_helper.cea4_verify_db import get_csv_filenames
 
 
-def lca_operation(locator):
+def lca_operation(locator, custom_supply_path=None):
     """
     Algorithm to calculate the primary energy and GHG_kgCO2MJ emissions of buildings according to the method used in the
     integrated model of [Fonseca-Schlueter-2015]_ and the performance factors of [ecobau.ch].
 
     :param locator: an InputLocator instance set to the scenario to work on
     :type locator: InputLocator
+    :param custom_supply_path: optional path to a custom supply systems file
+    :type custom_supply_path: str
 
 
     The following file is created by this script:
@@ -48,7 +50,10 @@ def lca_operation(locator):
     ## get demand results for the scenario
     demand = pd.read_csv(locator.get_total_demand())
     ## get the supply systems for each building in the scenario
-    supply_systems = pd.read_csv(locator.get_building_supply())
+    if custom_supply_path and os.path.exists(custom_supply_path):
+        supply_systems = pd.read_csv(custom_supply_path)
+    else:
+        supply_systems = pd.read_csv(locator.get_building_supply())
     ## get the non-renewable primary energy and greenhouse gas emissions factors for each supply system in the database
     factors_heating = pd.read_csv(locator.get_database_assemblies_supply_heating())
     factors_dhw = pd.read_csv(locator.get_database_assemblies_supply_hot_water())
@@ -173,7 +178,12 @@ def main(config):
 
     print('Running emissions with scenario = %s' % config.scenario)
 
-    lca_operation(locator=locator)
+    # Check if custom supply path is provided
+    custom_supply_path = config.lca_operation.custom_supply_path if hasattr(config.lca_operation, 'custom_supply_path') else None
+    if custom_supply_path:
+        print(f'Using custom supply file: {custom_supply_path}')
+
+    lca_operation(locator=locator, custom_supply_path=custom_supply_path)
 
 
 if __name__ == '__main__':

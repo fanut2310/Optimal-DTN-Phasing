@@ -243,7 +243,8 @@ class DTNExpansionOptimizer:
                  pump_efficiency: float = 0.8, pump_load_factor: float = 0.5,
                  pump_capex_a: float = 1230, pump_capex_b: float = 0.65,
                  cooling_cop: float = 4.0, ghg_budget_per_phase: Optional[List[float]] = None,
-                 multi_objective_mode: bool = False, multi_objective_functions: Optional[List[str]] = None):
+                 multi_objective_mode: bool = False, multi_objective_functions: Optional[List[str]] = None,
+                 testing_clusters=None):
         """
         Initialize the DTN expansion optimizer.
 
@@ -297,6 +298,8 @@ class DTNExpansionOptimizer:
             If True, uses multi-objective optimization with selected objectives
         multi_objective_functions : list, optional
             List of objectives to use for multi-objective optimization. Options are 'NPV', 'ROI', 'emissions', and 'total_capex'
+        testing_clusters : list, optional
+            List of cluster IDs to include in the optimization (if None, all clusters are included)
         """
         self.locator = locator
         self.network_type = network_type
@@ -329,6 +332,7 @@ class DTNExpansionOptimizer:
         self.ghg_budget_per_phase = ghg_budget_per_phase
         self.multi_objective_mode = multi_objective_mode
         self.multi_objective_functions = multi_objective_functions
+        self.testing_clusters = testing_clusters
 
         # Set up the creator based on optimization mode and selected objectives
         setup_creator(multi_objective_mode, objective_function, multi_objective_functions)
@@ -430,25 +434,45 @@ class DTNExpansionOptimizer:
         total_demand_path = Path(self.locator.get_total_demand())
         self.total_demand = pd.read_csv(total_demand_path)
 
-        # Extract unique clusters from the metrics DataFrame
-        # This ensures we only consider clusters that have metrics (i.e., the chosen clusters)
-        unique_clusters = set()
-        for cluster_str in self.metrics_df['clusters']:
-            # Skip cluster 0 (existing DTN)
-            if cluster_str == '0':
-                continue
-            # Split the cluster string (e.g., '1+3+4') into individual clusters
-            for c in cluster_str.split('+'):
-                if c != '0':  # Skip cluster 0
-                    unique_clusters.add(int(c))
+        # If testing_clusters is specified, use only those clusters
+        if self.testing_clusters:
+            log().info(f"Filtering to include only testing clusters: {self.testing_clusters}")
+            self.all_clusters = sorted(self.testing_clusters)
+        else:
+            # Extract unique clusters from the metrics DataFrame
+            unique_clusters = set()
+            for cluster_str in self.metrics_df['clusters']:
+                # Skip cluster 0 (existing DTN)
+                if cluster_str == '0':
+                    continue
+                # Split the cluster string (e.g., '1+3+4') into individual clusters
+                for c in cluster_str.split('+'):
+                    if c != '0':  # Skip cluster 0
+                        unique_clusters.add(int(c))
 
-        # Sort the clusters to maintain the same order as before
-        self.all_clusters = sorted(list(unique_clusters))
+            # Sort the clusters to maintain the same order as before
+            self.all_clusters = sorted(list(unique_clusters))
 
-        log().info(f"Using {len(self.all_clusters)} clusters from metrics: {self.all_clusters}")
+        log().info(f"Using {len(self.all_clusters)} clusters: {self.all_clusters}")
 
         # Get total number of buildings
         self.total_buildings = len(self.total_demand['name'].unique())
+
+        # Get buildings in testing clusters (including cluster 0)
+        if self.testing_clusters:
+            self.buildings_in_testing_clusters = []
+            # Always include cluster 0 (existing DTN)
+            cluster0_buildings = self._get_buildings_in_specific_cluster(0)
+            self.buildings_in_testing_clusters.extend(cluster0_buildings)
+
+            # Add buildings from testing clusters
+            for cluster in self.testing_clusters:
+                buildings = self._get_buildings_in_specific_cluster(cluster)
+                self.buildings_in_testing_clusters.extend(buildings)
+
+            # Remove duplicates
+            self.buildings_in_testing_clusters = list(set(self.buildings_in_testing_clusters))
+            log().info(f"Filtered to {len(self.buildings_in_testing_clusters)} buildings out of {self.total_buildings} total buildings")
 
     def _create_cluster_metrics_mapping(self):
         """Create a mapping from cluster combinations to their metrics."""
@@ -587,6 +611,9 @@ class DTNExpansionOptimizer:
             (self.cluster_nodes['cluster'] == cluster_id) &
             (self.cluster_nodes['type'] == 'CONSUMER')
         ]['building'].tolist()
+
+        # Add debug logging
+        log().debug(f"Cluster {cluster_id} consists of buildings: {buildings}")
 
         return buildings
 
@@ -1073,13 +1100,13 @@ class DTNExpansionOptimizer:
             self.locator = locator
             self.modified_supply_df = modified_supply_df
             self.supply_file = locator.get_building_supply()
-            self.backup_file = os.path.join(locator.get_temporary_folder(), 'backup_supply.csv')
+            # Use a unique identifier in the backup filename to avoid conflicts
+            self.backup_file = os.path.join(locator.get_temporary_folder(), f'backup_supply_{id(self)}.csv')
 
         def __enter__(self):
             """Save backup and replace with modified file."""
             # Create backup of original file
-            original_supply_df = pd.read_csv(self.supply_file)
-            original_supply_df.to_csv(self.backup_file, index=False)
+            shutil.copy(self.supply_file, self.backup_file)
 
             # Replace with modified file
             self.modified_supply_df.to_csv(self.supply_file, index=False)
@@ -1093,8 +1120,8 @@ class DTNExpansionOptimizer:
 
     def calculate_emissions_for_genome(self, cluster_phase_map):
         """
-        Calculate emissions for a specific genome by temporarily modifying supply systems
-        and running the LCA operation module.
+        Calculate emissions for a specific genome by creating phase-specific supply files
+        and running the LCA operation module for each phase with its specific supply file.
 
         Parameters:
         -----------
@@ -1114,9 +1141,6 @@ class DTNExpansionOptimizer:
         # Get original supply file
         supply_file = self.locator.get_building_supply()
         original_supply_df = pd.read_csv(supply_file)
-
-        # Make a copy for modifications
-        modified_supply_df = original_supply_df.copy()
 
         # Get district supply systems from cluster 0 buildings
         cluster0_buildings = self._get_buildings_in_specific_cluster(0)
@@ -1146,58 +1170,66 @@ class DTNExpansionOptimizer:
         if has_non_district_scale:
             log().warning("Cluster 0 buildings are not using DISTRICT scale supply systems. This will result in penalties for the optimization results.")
 
-            # Continue with the calculation using the existing systems, even if they're not DISTRICT scale
-            # The penalty will be applied in the _evaluate_individual method
+        # Create directory for phase-specific supply files
+        phase_files_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "phase_supply_files"
+        phase_files_dir.mkdir(parents=True, exist_ok=True)
 
-        # Process each phase
+        # Create phase 0 supply file (original)
+        phase0_supply_path = phase_files_dir / "phase0_supply.csv"
+        original_supply_df.to_csv(phase0_supply_path, index=False)
+        log().info(f"Created phase 0 supply file: {phase0_supply_path}")
+
+        # Process each phase separately
         connected_clusters_by_phase = {}
         for phase in range(1, self.num_phases + 1):
             # Get clusters connected in this phase
             newly_connected_clusters = [cluster for cluster, p in cluster_phase_map.items() if p == phase]
             connected_clusters_by_phase[phase] = newly_connected_clusters
 
-            # Get buildings in these clusters
-            newly_connected_buildings = []
-            for cluster in newly_connected_clusters:
+            # Make a copy of the original supply file for this phase
+            phase_supply_df = original_supply_df.copy()
+
+            # Get all clusters connected up to this phase
+            all_connected_clusters = [0]  # Start with cluster 0
+            for p in range(1, phase + 1):
+                all_connected_clusters.extend(connected_clusters_by_phase.get(p, []))
+
+            log().info(f"Phase {phase}: Connected clusters {all_connected_clusters}")
+
+            # Get all buildings in connected clusters
+            all_connected_buildings = []
+            for cluster in all_connected_clusters:
                 buildings = self._get_buildings_in_specific_cluster(cluster)
-                newly_connected_buildings.extend(buildings)
+                all_connected_buildings.extend(buildings)
 
-            # Update supply systems for newly connected buildings
-            for building in newly_connected_buildings:
-                building_idx = modified_supply_df[modified_supply_df['name'] == building].index
+            # Update supply systems for connected buildings
+            for building in all_connected_buildings:
+                building_idx = phase_supply_df[phase_supply_df['name'] == building].index
                 if len(building_idx) > 0:
-                    modified_supply_df.loc[building_idx, 'supply_type_hs'] = district_heating_system
-                    modified_supply_df.loc[building_idx, 'supply_type_cs'] = district_cooling_system
-                    modified_supply_df.loc[building_idx, 'supply_type_dhw'] = district_dhw_system
+                    phase_supply_df.loc[building_idx, 'supply_type_hs'] = district_heating_system
+                    phase_supply_df.loc[building_idx, 'supply_type_cs'] = district_cooling_system
+                    phase_supply_df.loc[building_idx, 'supply_type_dhw'] = district_dhw_system
 
-        # Use context manager to safely modify and restore the supply file
-        with self.__class__.TemporarySupplyFile(self.locator, modified_supply_df):
-            # Run LCA operation module
+            # Save the phase-specific supply file
+            phase_supply_path = phase_files_dir / f"phase{phase}_supply.csv"
+            phase_supply_df.to_csv(phase_supply_path, index=False)
+            log().info(f"Created phase {phase} supply file: {phase_supply_path}")
+
+            # Run LCA operation module with the phase-specific supply file
             from cea.analysis.lca.operation import lca_operation
-            lca_operation(self.locator)
+            lca_operation(self.locator, custom_supply_path=str(phase_supply_path))
 
             # Load LCA results
             lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
 
-            # Load embodied emissions if available
-            try:
-                lca_embodied_results = pd.read_csv(self.locator.get_lca_embodied())
-                has_embodied = True
-            except:
-                has_embodied = False
-                log().warning("Embodied emissions results not found. Only operational emissions will be considered.")
+            # Filter LCA results to only include buildings in testing clusters if specified
+            if hasattr(self, 'testing_clusters') and self.testing_clusters:
+                lca_operation_results = lca_operation_results[lca_operation_results['name'].isin(self.buildings_in_testing_clusters)]
 
-            # Calculate emissions for each phase
-            for phase in range(1, self.num_phases + 1):
-                # Get all buildings connected up to this phase
-                all_connected_buildings = cluster0_buildings.copy()  # Start with cluster 0
-                for p in range(1, phase + 1):
-                    for cluster in connected_clusters_by_phase.get(p, []):
-                        all_connected_buildings.extend(self._get_buildings_in_specific_cluster(cluster))
+            # Calculate total emissions for all buildings in testing clusters
+            phase_emissions[phase]['operation'] = lca_operation_results['GHG_sys_tonCO2'].sum()
 
-                # Calculate operational emissions for connected buildings
-                connected_operation = lca_operation_results[lca_operation_results['name'].isin(all_connected_buildings)]
-                phase_emissions[phase]['operation'] = connected_operation['GHG_sys_tonCO2'].sum()
+            log().info(f"Phase {phase}: Emissions = {phase_emissions[phase]['operation']:.2f} t CO2eq/yr")
 
         return phase_emissions, has_non_district_scale
 
@@ -1247,15 +1279,30 @@ class DTNExpansionOptimizer:
         district_cooling_system = district_supply_systems['supply_type_cs'].iloc[0]
         district_dhw_system = district_supply_systems['supply_type_dhw'].iloc[0]
 
+        # Create directory for phase-specific supply files
+        phase_files_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "phase_supply_files"
+        phase_files_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create phase 0 supply file (original)
+        phase0_supply_path = phase_files_dir / "phase0_supply.csv"
+        original_supply_df.to_csv(phase0_supply_path, index=False)
+        log().info(f"Created phase 0 supply file: {phase0_supply_path}")
+
         # Phase 0: Calculate emissions for the whole district with cluster 0 using district systems
         # and all other clusters using building-scale systems
 
         # Run LCA operation module with original supply file
         from cea.analysis.lca.operation import lca_operation
-        lca_operation(self.locator)
+        lca_operation(self.locator, custom_supply_path=str(phase0_supply_path))
 
         # Load LCA results
         lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
+
+        # Filter LCA results to only include buildings in testing clusters if specified
+        if hasattr(self, 'testing_clusters') and self.testing_clusters:
+            log().info(f"Filtering emissions to only include buildings in testing clusters: {self.testing_clusters}")
+            lca_operation_results = lca_operation_results[lca_operation_results['name'].isin(self.buildings_in_testing_clusters)]
+            log().info(f"Filtered to {len(lca_operation_results)} buildings for emissions calculation")
 
         # Calculate total GHG emissions and GFA for phase 0
         total_ghg = lca_operation_results['GHG_sys_tonCO2'].sum()
@@ -1317,26 +1364,33 @@ class DTNExpansionOptimizer:
                     phase_supply_df.loc[building_idx, 'supply_type_cs'] = district_cooling_system
                     phase_supply_df.loc[building_idx, 'supply_type_dhw'] = district_dhw_system
 
-            # Use context manager to safely modify and restore the supply file
-            with self.__class__.TemporarySupplyFile(self.locator, phase_supply_df):
-                # Run LCA operation module
-                lca_operation(self.locator)
+            # Save the phase-specific supply file
+            phase_supply_path = phase_files_dir / f"phase{phase}_supply_new.csv"
+            phase_supply_df.to_csv(phase_supply_path, index=False)
+            log().info(f"Created phase {phase} supply file: {phase_supply_path}")
 
-                # Load LCA results
-                lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
+            # Run LCA operation module with the phase-specific supply file
+            lca_operation(self.locator, custom_supply_path=str(phase_supply_path))
 
-                # Calculate total GHG emissions and GFA for this phase
-                total_ghg = lca_operation_results['GHG_sys_tonCO2'].sum()
-                total_gfa = lca_operation_results['GFA_m2'].sum()
+            # Load LCA results
+            lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
 
-                # Calculate emissions per GFA
-                ghg_per_gfa = total_ghg / total_gfa if total_gfa > 0 else 0
+            # Filter LCA results to only include buildings in testing clusters if specified
+            if hasattr(self, 'testing_clusters') and self.testing_clusters:
+                lca_operation_results = lca_operation_results[lca_operation_results['name'].isin(self.buildings_in_testing_clusters)]
 
-                # Store results for this phase
-                results[phase] = {
-                    'district_operation_emission [t CO2eq/yr]': total_ghg,
-                    'district_operation_emission_per_gfa [t CO2eq/yr/m2]': ghg_per_gfa
-                }
+            # Calculate total GHG emissions and GFA for this phase
+            total_ghg = lca_operation_results['GHG_sys_tonCO2'].sum()
+            total_gfa = lca_operation_results['GFA_m2'].sum()
+
+            # Calculate emissions per GFA
+            ghg_per_gfa = total_ghg / total_gfa if total_gfa > 0 else 0
+
+            # Store results for this phase
+            results[phase] = {
+                'district_operation_emission [t CO2eq/yr]': total_ghg,
+                'district_operation_emission_per_gfa [t CO2eq/yr/m2]': ghg_per_gfa
+            }
 
         return results
 
@@ -1503,7 +1557,7 @@ class DTNExpansionOptimizer:
         for phase in range(self.num_phases):
             if phase < len(phase_capex) and self.capex_budget_per_phase and phase_capex[phase] > self.capex_budget_per_phase[phase]:
                 # Apply penalty for exceeding CAPEX budget
-                log().warning(f"Individual {ind_tuple} exceeds CAPEX budget in phase {phase+1}: {phase_capex[phase]} > {self.capex_budget_per_phase[phase]}")
+                log().info(f"Individual {ind_tuple} exceeds CAPEX budget in phase {phase+1}: {phase_capex[phase]} > {self.capex_budget_per_phase[phase]}")
                 total_roi = -1000
                 total_npv = -1000000
                 break
@@ -1512,7 +1566,7 @@ class DTNExpansionOptimizer:
         for phase in range(self.num_phases):
             if phase < len(phase_total_expenditure) and self.total_expenditure_budget_per_phase and phase_total_expenditure[phase] > self.total_expenditure_budget_per_phase[phase]:
                 # Apply penalty for exceeding total expenditure budget
-                log().warning(f"Individual {ind_tuple} exceeds total expenditure budget in phase {phase+1}: {phase_total_expenditure[phase]} > {self.total_expenditure_budget_per_phase[phase]}")
+                log().info(f"Individual {ind_tuple} exceeds total expenditure budget in phase {phase+1}: {phase_total_expenditure[phase]} > {self.total_expenditure_budget_per_phase[phase]}")
                 total_roi = -1000
                 total_npv = -1000000
                 break
@@ -1524,7 +1578,7 @@ class DTNExpansionOptimizer:
                     phase_ghg = phase_emissions[phase+1]['operation']  # +1 because phases are 1-indexed in the results
                     if phase_ghg > self.ghg_budget_per_phase[phase]:
                         # Apply penalty for exceeding GHG budget
-                        log().warning(f"Individual {ind_tuple} exceeds GHG budget in phase {phase+1}: {phase_ghg} > {self.ghg_budget_per_phase[phase]}")
+                        log().info(f"Individual {ind_tuple} exceeds GHG budget in phase {phase+1}: {phase_ghg} > {self.ghg_budget_per_phase[phase]}")
                         total_roi = -1000
                         total_npv = -1000000
                         final_phase_emissions = 1000000  # Also penalize emissions objective in multi-objective mode
@@ -2527,7 +2581,7 @@ class DTNExpansionOptimizer:
 class PipeLayoutGenerator:
     """Generate pipe layouts for different sets of clusters and calculate metrics."""
 
-    def __init__(self, locator: cea.inputlocator.InputLocator, network_type: str, phase: int = 1, chosen_clusters=None, chosen_buildings=None):
+    def __init__(self, locator: cea.inputlocator.InputLocator, network_type: str, phase: int = 1, testing_clusters=None, chosen_buildings=None):
         """
         Initialize the PipeLayoutGenerator.
 
@@ -2539,7 +2593,7 @@ class PipeLayoutGenerator:
             'DH' for district heating or 'DC' for district cooling
         phase : int
             The phase number for the expansion
-        chosen_clusters : list, optional
+        testing_clusters : list, optional
             List of cluster IDs to include (if None, all clusters are included)
         chosen_buildings : list, optional
             List of building names to include (if None, all buildings are included)
@@ -2547,7 +2601,7 @@ class PipeLayoutGenerator:
         self.locator = locator
         self.network_type = network_type
         self.phase = phase
-        self.chosen_clusters = chosen_clusters
+        self.testing_clusters = testing_clusters
         self.chosen_buildings = chosen_buildings
         self.output_folder = Path(locator.get_dtn_expansion_optimization_results_folder()) / f"phase_{phase}"
         self.output_folder.mkdir(parents=True, exist_ok=True)
@@ -2572,8 +2626,19 @@ class PipeLayoutGenerator:
         total_demand_path = Path(self.locator.get_total_demand())
         self.total_demand = pd.read_csv(total_demand_path)
 
-        # Filter by chosen buildings if specified
-        if self.chosen_buildings:
+        # Get unique clusters (excluding 0 and -1)
+        all_clusters = sorted([c for c in self.cluster_edges['cluster'].unique() if c > 0])
+
+        # If testing_clusters is specified, use it directly
+        if self.testing_clusters:
+            # Convert to list if it's a string
+            if isinstance(self.testing_clusters, str):
+                self.testing_clusters = [int(c.strip()) for c in self.testing_clusters.split(',') if c.strip()]
+
+            # No need to use chosen_buildings if testing_clusters is specified
+            log().info(f"Using specified testing clusters: {self.testing_clusters}")
+        # Otherwise, try to derive clusters from chosen buildings if specified
+        elif self.chosen_buildings:
             # Convert to list if it's a string
             if isinstance(self.chosen_buildings, str):
                 self.chosen_buildings = [b.strip() for b in self.chosen_buildings.split(',') if b.strip()]
@@ -2586,28 +2651,19 @@ class PipeLayoutGenerator:
                 (self.cluster_nodes['building'].isin(self.chosen_buildings))
             ]['cluster'].unique()
 
-            # If chosen_clusters is not specified, use the clusters from chosen buildings
-            if self.chosen_clusters is None:
-                self.chosen_clusters = sorted([c for c in building_clusters if c > 0])
-                log().info(f"Derived clusters from chosen buildings: {self.chosen_clusters}")
+            # Use the clusters from chosen buildings
+            self.testing_clusters = sorted([c for c in building_clusters if c > 0])
+            log().info(f"Derived clusters from chosen buildings: {self.testing_clusters}")
 
-        # Get unique clusters (excluding 0 and -1)
-        all_clusters = sorted([c for c in self.cluster_edges['cluster'].unique() if c > 0])
-
-        # Filter by chosen clusters if specified
-        if self.chosen_clusters:
-            # Convert to list if it's a string
-            if isinstance(self.chosen_clusters, str):
-                self.chosen_clusters = [int(c.strip()) for c in self.chosen_clusters.split(',') if c.strip()]
-
-            # Ensure all chosen clusters exist
-            valid_clusters = [c for c in self.chosen_clusters if c in all_clusters]
-            if len(valid_clusters) != len(self.chosen_clusters):
-                missing = set(self.chosen_clusters) - set(valid_clusters)
-                log().warning(f"Some chosen clusters do not exist: {missing}")
+        # Ensure all testing clusters exist
+        if self.testing_clusters:
+            valid_clusters = [c for c in self.testing_clusters if c in all_clusters]
+            if len(valid_clusters) != len(self.testing_clusters):
+                missing = set(self.testing_clusters) - set(valid_clusters)
+                log().warning(f"Some testing clusters do not exist: {missing}")
 
             self.clusters = sorted(valid_clusters)
-            log().info(f"Using {len(self.clusters)} chosen clusters: {self.clusters}")
+            log().info(f"Using {len(self.clusters)} testing clusters: {self.clusters}")
         else:
             self.clusters = all_clusters
             log().info(f"Using all {len(self.clusters)} clusters (excluding existing DTN and main roads)")
@@ -2843,18 +2899,18 @@ def main(config):
         network_type = args.network_type
 
     # Get testing clusters and buildings from command line arguments or config
-    chosen_clusters = config.dtn_expansion_optimization.testing_clusters
+    testing_clusters = config.dtn_expansion_optimization.testing_clusters
     chosen_buildings = config.dtn_expansion_optimization.chosen_buildings
 
     # Override with command line arguments if provided
     if args:
         if args.chosen_clusters:
-            chosen_clusters = args.chosen_clusters
+            testing_clusters = args.chosen_clusters
         if args.chosen_buildings:
             chosen_buildings = args.chosen_buildings
 
     # Determine if we should bypass the prerequisite check
-    bypass_check = bool(chosen_clusters or chosen_buildings)
+    bypass_check = bool(testing_clusters or chosen_buildings)
 
     # Check prerequisites
     if not check_thermal_network_prerequisites(locator, network_type, bypass_check):
@@ -2867,11 +2923,11 @@ def main(config):
     # Print completion message
     log().info(f"Starting DTN expansion optimization. Pipe layouts of connecting different sets of building clusters in phase [1] are being generated.")
 
-    # If chosen_clusters is provided, convert it to a list of integers
-    if chosen_clusters:
-        if isinstance(chosen_clusters, str):
-            chosen_clusters = [int(c.strip()) for c in chosen_clusters.split(',') if c.strip()]
-        log().info(f"Using chosen clusters: {chosen_clusters}")
+    # If testing_clusters is provided, convert it to a list of integers
+    if testing_clusters:
+        if isinstance(testing_clusters, str):
+            testing_clusters = [int(c.strip()) for c in testing_clusters.split(',') if c.strip()]
+        log().info(f"Using testing clusters: {testing_clusters}")
 
     # If chosen_buildings is provided, ensure it's a list
     if chosen_buildings:
@@ -2880,13 +2936,21 @@ def main(config):
         log().info(f"Using chosen buildings: {chosen_buildings}")
 
     # Generate pipe layouts for different sets of clusters
-    pipe_layout_generator = PipeLayoutGenerator(
-        locator,
-        network_type,
-        phase=1,
-        chosen_clusters=chosen_clusters,
-        chosen_buildings=chosen_buildings
-    )
+    # If testing_clusters is specified, don't pass chosen_buildings
+    if testing_clusters:
+        pipe_layout_generator = PipeLayoutGenerator(
+            locator,
+            network_type,
+            phase=1,
+            testing_clusters=testing_clusters
+        )
+    else:
+        pipe_layout_generator = PipeLayoutGenerator(
+            locator,
+            network_type,
+            phase=1,
+            chosen_buildings=chosen_buildings
+        )
     metrics_df = pipe_layout_generator.generate_pipe_layouts()
 
     # Run optimization if requested
@@ -2986,7 +3050,8 @@ def main(config):
             cooling_cop=cooling_cop,
             ghg_budget_per_phase=ghg_budget_per_phase,
             multi_objective_mode=multi_objective_mode,
-            multi_objective_functions=multi_objective_functions
+            multi_objective_functions=multi_objective_functions,
+            testing_clusters=testing_clusters
         )
 
         # Run optimization

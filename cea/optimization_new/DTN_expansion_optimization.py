@@ -2317,6 +2317,40 @@ class DTNExpansionOptimizer:
                     'cumulative_cooling_plant_electricity [kWh/yr]': 0  # Will be updated if data is available
                 }
 
+                # Total CAPEX already calculated above
+                total_capex_p0 = pipe_capex + hex_capex + pump_capex + cooling_plant_capex
+
+                # Present-value total expenditure (CAPEX + discounted O&M of phase 0)
+                total_exp_p0 = self._calculate_phase_total_expenditure((0,), 1)
+
+                # Annual O&M (simple 2.5 % of CAPEX)
+                annual_om_p0 = 0.025 * total_capex_p0
+
+                # Annual revenue of cluster 0
+                if self.network_type == 'DH':
+                    demand_kwh = annual_demand * 1000  # MWh → kWh
+                else:
+                    demand_kwh = annual_demand * 1000
+                annual_rev_p0 = demand_kwh * self.energy_price
+
+                # One-phase ROI and NPV
+                roi_p0 = self.calculate_roi((0,), 1)
+                npv_p0 = self.calculate_npv((0,), 1)
+
+                # Write back into the dictionary
+                phase0_result.update({
+                    'new_cluster(s)_total_expenditure [USD]': total_exp_p0,
+                    'cumulative_total_expenditure [USD]': total_exp_p0,
+                    'new_cluster(s)_revenue [USD]': annual_rev_p0,
+                    'cumulative_revenue [USD]': annual_rev_p0,
+                    'new_cluster(s)_om_cost [USD]': annual_om_p0,
+                    'cumulative_om_cost [USD]': annual_om_p0,
+                    'new_cluster(s)_roi [-]': roi_p0,
+                    'overall_roi [-]': roi_p0,
+                    'new_cluster(s)_npv [USD]': npv_p0,
+                    'overall_npv [USD]': npv_p0,
+                })
+
                 # Try to get metrics for cluster 0 if available
                 cluster0_key = '0'
                 annual_demand = 0
@@ -2581,7 +2615,7 @@ class DTNExpansionOptimizer:
                     }
             else:
                 # Single-objective solution or already processed phase
-                if 'phase' in original_result and original_result['phase'] > 0:
+                if 'phase' in original_result:
                     phase_results.append(original_result)
 
             # Process each phase result (either from multi-objective or single-objective)
@@ -2825,12 +2859,16 @@ class DTNExpansionOptimizer:
             'new_cluster(s)_pump_annual_om [USD/yr]', 'cumulative_pump_annual_om [USD/yr]',
             'new_cluster(s)_cooling_plant_annual_om [USD/yr]', 'cumulative_cooling_plant_annual_om [USD/yr]',
             'new_cluster(s)_total_annual_om [USD/yr]', 'cumulative_total_annual_om [USD/yr]',
+            'new_cluster(s)_om_cost [USD]', 'cumulative_om_cost [USD]',
+            'new_cluster(s)_total_expenditure [USD]', 'cumulative_total_expenditure [USD]',
+            'new_cluster(s)_revenue [USD]', 'cumulative_revenue [USD]',
             'new_cluster(s)_pump_electricity [kWh/yr]', 'cumulative_pump_electricity [kWh/yr]',
             'new_cluster(s)_cooling_plant_electricity [kWh/yr]', 'cumulative_cooling_plant_electricity [kWh/yr]',
             'new_cluster(s)_pipe_length [m]', 'cumulative_pipe_length [m]',
             f'new_cluster(s)_annual_{demand_type} [MWh/yr]', f'cumulative_annual_{demand_type} [MWh/yr]',
             f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]', f'overall_linear_{demand_type}_density [MWh/km/yr]',
-            'new_cluster(s)_roi [-]', 'new_cluster(s)_npv [USD]',
+            'new_cluster(s)_roi [-]', 'overall_roi [-]',
+            'new_cluster(s)_npv [USD]', 'overall_npv [USD]',
             'district_operation_emission [t CO2eq/yr]',
             'individual'
         ]
@@ -3046,17 +3084,17 @@ class DTNExpansionOptimizer:
             'total_expenditure_budget_per_phase [USD]': '-',  # No total expenditure budget for existing DTN
             'new_cluster(s)_total_expenditure [USD]': 0,  # Will be calculated if data is available
             'cumulative_total_expenditure [USD]': 0,  # Will be calculated if data is available
-            'new_cluster(s)_revenue [USD]': 0,  # No revenue for existing DTN
-            'cumulative_revenue [USD]': 0,  # No cumulative revenue for phase 0
+            'new_cluster(s)_revenue [USD]': 0,  # Will be calculated if data is available
+            'cumulative_revenue [USD]': 0,  # Will be calculated if data is available
             'new_cluster(s)_om_cost [USD]': 0,  # No OM costs for existing DTN
             'cumulative_om_cost [USD]': 0,  # No cumulative OM costs for phase 0
             'ghg_cap [t CO2eq/yr]': '-',  # No GHG cap for existing DTN
             'district_operation_emission [t CO2eq/yr]': district_emissions.get(0, {}).get('district_operation_emission [t CO2eq/yr]', 0),
             'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': district_emissions.get(0, {}).get('district_operation_emission_per_gfa [kg CO2eq/yr/m2]', 0),
-            'new_cluster(s)_roi [-]': 0,  # No ROI for existing DTN
-            'overall_roi [-]': 0,  # No overall ROI for phase 0
-            'new_cluster(s)_npv [USD]': 0,  # No NPV for existing DTN
-            'overall_npv [USD]': 0,  # No overall NPV for phase 0
+            'new_cluster(s)_roi [-]': 0,  # Will be calculated if data is available
+            'overall_roi [-]': 0,  # Will be calculated if data is available
+            'new_cluster(s)_npv [USD]': 0,  # Will be calculated if data is available
+            'overall_npv [USD]': 0,  # Will be calculated if data is available
             'new_cluster(s)_pipe_length [m]': 0,  # No new pipes for existing DTN
             'cumulative_pipe_length [m]': 0,  # Will be updated if data is available
             f'new_cluster(s)_annual_{demand_type} [MWh/yr]': 0,  # Will be updated if data is available
@@ -3114,9 +3152,45 @@ class DTNExpansionOptimizer:
             # Calculate total CAPEX
             total_capex = pipe_capex + hex_capex + pump_capex + cooling_plant_capex
 
-            # Update phase0_result with calculated CAPEX components
-            phase0_result['new_cluster(s)_capex [USD]'] = total_capex
-            phase0_result['cumulative_capex [USD]'] = total_capex
+            # ---- phase-0 financials -----------------------------------------
+            total_capex_p0 = pipe_capex + hex_capex + pump_capex + cooling_plant_capex
+            phase0_result['new_cluster(s)_capex [USD]'] = total_capex_p0
+            phase0_result['cumulative_capex [USD]'] = total_capex_p0
+
+            # Present-value expenditure (CAPEX + discounted OPEX of phase 0)
+            total_expend_p0 = self._calculate_phase_total_expenditure((0,), 1)
+            phase0_result['new_cluster(s)_total_expenditure [USD]'] = total_expend_p0
+            phase0_result['cumulative_total_expenditure [USD]'] = total_expend_p0
+
+            # Calculate annual revenue (energy price * annual demand)
+            if self.network_type == 'DH':
+                annual_demand_kwh = metrics.get('total_annual_Qh_MWh', 0) * 1000  # Convert MWh to kWh
+            else:
+                annual_demand_kwh = metrics.get('total_annual_Qc_MWh', 0) * 1000  # Convert MWh to kWh
+            annual_revenue = annual_demand_kwh * self.energy_price
+
+            # Calculate phase duration
+            phase_duration = self.phase_durations[0]  # Phase 0 duration is the same as phase 1
+
+            # Calculate present value of revenue for all years in the phase
+            total_revenue = 0
+            for year in range(phase_duration):
+                discount_factor = 1 / ((1 + self.interest_rate) ** (year + 1))
+                total_revenue += annual_revenue * discount_factor
+
+            # Update revenue
+            phase0_result['new_cluster(s)_revenue [USD]'] = total_revenue
+            phase0_result['cumulative_revenue [USD]'] = total_revenue
+
+            # Calculate ROI and NPV for phase 0
+            roi_p0 = self.calculate_roi((0,), 1)  # Use phase 1 for calculation
+            npv_p0 = self.calculate_npv((0,), 1)  # Use phase 1 for calculation
+
+            # Update ROI and NPV
+            phase0_result['new_cluster(s)_roi [-]'] = roi_p0
+            phase0_result['overall_roi [-]'] = roi_p0
+            phase0_result['new_cluster(s)_npv [USD]'] = npv_p0
+            phase0_result['overall_npv [USD]'] = npv_p0
 
             # Calculate annual O&M costs (2.5% of CAPEX)
             annual_om_cost = 0.025 * total_capex
@@ -3194,8 +3268,9 @@ class DTNExpansionOptimizer:
 
             # Calculate overall ROI (weighted by CAPEX)
             if overall_capex > 0:
-                overall_roi = sum(r.get('new_cluster(s)_roi [-]', 0) * r.get('new_cluster(s)_capex [USD]', 0) for r in results if r['phase'] != 0)
-                overall_roi = (overall_roi + (roi * capex)) / overall_capex
+                overall_roi = sum(r['new_cluster(s)_roi [-]'] * r['new_cluster(s)_capex [USD]']
+                                  for r in results) / \
+                              sum(r['new_cluster(s)_capex [USD]'] for r in results)
             else:
                 overall_roi = 0
 

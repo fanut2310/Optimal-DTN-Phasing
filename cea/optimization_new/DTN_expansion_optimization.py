@@ -64,6 +64,8 @@ import geopandas as gpd
 import pandas as pd
 import numpy as np
 import networkx as nx
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
 from deap import base, tools, algorithms, creator
 
 # Setup function for the creator based on optimization mode
@@ -101,9 +103,11 @@ def setup_creator(multi_objective=False, objective_function='NPV', multi_objecti
 
         # Set weights based on objectives (maximize NPV/ROI, minimize emissions and total_capex)
         for obj in multi_objective_functions:
-            if obj in ['NPV', 'ROI']:
+            # Convert to lowercase for case-insensitive comparison
+            obj_lower = obj.lower() if isinstance(obj, str) else obj
+            if obj_lower in ['npv', 'roi']:
                 weights.append(1.0)  # Maximize NPV/ROI
-            elif obj in ['emissions', 'total_capex']:
+            elif obj_lower in ['emissions', 'total_capex']:
                 weights.append(-1.0)  # Minimize emissions and total_capex
 
         # Create fitness class with appropriate weights
@@ -879,55 +883,65 @@ class DTNExpansionOptimizer:
 
         return total_hex_capex
 
-    def _calculate_phase_capex(self, cluster_set):
+    def _calculate_phase_capex(self, cluster_set, phase=None):
         """
-        Calculate total CAPEX for a phase.
+        Calculate total CAPEX for a phase with interest rate adjustment.
 
         Parameters:
         -----------
         cluster_set : tuple or list
             Tuple or list of cluster IDs
+        phase : int, optional
+            Phase number (1-based). If provided, applies interest rate adjustment.
 
         Returns:
         --------
-        float
-            Total CAPEX for the phase
+        tuple
+            (float, dict) - Total CAPEX for the phase with interest rate adjustment and a dictionary with component costs
         """
-        # Calculate pipe CAPEX based on selected cost model
+        # Calculate base CAPEX
         if self.cost_model == 'detailed':
             pipe_capex = self.calculate_detailed_capex(cluster_set)
-        else:
-            pipe_capex = self.calculate_simplified_capex(cluster_set)
-
-        # Calculate heat exchanger costs
-        if self.cost_model == 'detailed':
-            # Use the detailed HEX cost calculation
             hex_capex = self.calculate_hex_costs(cluster_set)
+            pump_capex, _ = self.calculate_pump_costs(cluster_set)
+            cooling_plant_capex = 0
+            if self.network_type == 'DC':
+                cooling_plant_capex, _ = self.calculate_cooling_plant_costs(cluster_set)
         else:
-            # Use the simplified approach based on number of buildings
+            # Simplified cost model calculations
+            pipe_capex = self.calculate_simplified_capex(cluster_set)
             buildings = self._get_buildings_in_clusters(cluster_set)
             hex_capex = len(buildings) * (self.cost_data['capex_hex_USD'] / self.total_buildings)
-
-        # Calculate pump costs based on selected cost model
-        if self.cost_model == 'detailed':
-            # Use the detailed pump cost calculation with configurable parameters
-            pump_capex, _ = self.calculate_pump_costs(cluster_set)
-        else:
-            # Use the simplified approach based on pipe length ratio
             required_pipes = self.get_required_pipes_for_clusters(cluster_set)
             pipe_length_ratio = required_pipes['length_m'].sum() / self.cost_data['network_length_m']
             pump_capex = self.cost_data['capex_pumps_USD'] * pipe_length_ratio
-
-        # Calculate cooling plant costs for DC networks
-        if self.network_type == 'DC':
-            cooling_plant_capex, _ = self.calculate_cooling_plant_costs(cluster_set)
-        else:
             cooling_plant_capex = 0
+            if self.network_type == 'DC':
+                cooling_plant_capex = self.cost_data['capex_cooling_plant_USD'] * pipe_length_ratio
 
-        # Calculate total CAPEX
-        total_capex = pipe_capex + hex_capex + pump_capex + cooling_plant_capex
+        # Calculate total base CAPEX
+        total_base_capex = pipe_capex + hex_capex + pump_capex + cooling_plant_capex
 
-        return total_capex
+        # Apply interest rate adjustment based on phase
+        discount_factor = 1.0
+        if phase is not None:
+            year_offset = 0
+            for p in range(1, phase):
+                year_offset += self.phase_durations[p-1]
+
+            # Discount factor based on when the phase starts
+            discount_factor = 1 / ((1 + self.interest_rate) ** year_offset)
+
+        # Apply discount factor to get present value
+        total_capex = total_base_capex * discount_factor
+
+        return total_capex, {
+            'pipe_capex': pipe_capex * discount_factor,
+            'hex_capex': hex_capex * discount_factor,
+            'pump_capex': pump_capex * discount_factor,
+            'cooling_plant_capex': cooling_plant_capex * discount_factor,
+            'discount_factor': discount_factor
+        }
 
     def _calculate_phase_total_expenditure(self, cluster_set, phase):
         """
@@ -945,8 +959,8 @@ class DTNExpansionOptimizer:
         float
             Total expenditure for the phase (CAPEX + OPEX across all years)
         """
-        # Calculate CAPEX
-        capex = self._calculate_phase_capex(cluster_set)
+        # Calculate CAPEX with interest rate adjustment
+        capex, _ = self._calculate_phase_capex(cluster_set, phase)
 
         # Get metrics for this cluster set
         key = '+'.join(map(str, sorted(cluster_set)))
@@ -1003,8 +1017,8 @@ class DTNExpansionOptimizer:
 
         metrics = self.cluster_metrics[key]
 
-        # Calculate CAPEX
-        capex = self._calculate_phase_capex(cluster_set)
+        # Calculate CAPEX with interest rate adjustment
+        capex, _ = self._calculate_phase_capex(cluster_set, phase)
 
         # Calculate annual revenue (energy price * annual demand)
         if self.network_type == 'DH':
@@ -1053,8 +1067,8 @@ class DTNExpansionOptimizer:
 
         metrics = self.cluster_metrics[key]
 
-        # Calculate CAPEX
-        capex = self._calculate_phase_capex(cluster_set)
+        # Calculate CAPEX with interest rate adjustment
+        capex, _ = self._calculate_phase_capex(cluster_set, phase)
 
         # Calculate annual revenue and O&M costs
         if self.network_type == 'DH':
@@ -1314,7 +1328,7 @@ class DTNExpansionOptimizer:
         # Store results for phase 0
         results[0] = {
             'district_operation_emission [t CO2eq/yr]': total_ghg,
-            'district_operation_emission_per_gfa [t CO2eq/yr/m2]': ghg_per_gfa
+            'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': ghg_per_gfa * 1000  # Convert to kg
         }
 
         # Get cluster assignments from current individual
@@ -1389,7 +1403,7 @@ class DTNExpansionOptimizer:
             # Store results for this phase
             results[phase] = {
                 'district_operation_emission [t CO2eq/yr]': total_ghg,
-                'district_operation_emission_per_gfa [t CO2eq/yr/m2]': ghg_per_gfa
+                'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': ghg_per_gfa * 1000  # Convert to kg
             }
 
         return results
@@ -1425,6 +1439,225 @@ class DTNExpansionOptimizer:
 
         # If we can't determine the clusters, return an empty list
         return []
+
+    def plot_multi_objective_results(self, all_individuals, pareto_front, objectives):
+        """
+        Create a scatter plot of all solutions tested during multi-objective optimization.
+
+        Parameters:
+        -----------
+        all_individuals : list
+            List of all individuals tested during optimization
+        pareto_front : list
+            List of Pareto-optimal individuals
+        objectives : list
+            List of objective functions used
+
+        Returns:
+        --------
+        Path
+            Path to the saved plot file
+        """
+        # Create output directory
+        output_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder())
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Extract fitness values for all individuals
+        all_fitness = []
+        for ind in all_individuals:
+            if hasattr(ind, 'fitness') and hasattr(ind.fitness, 'values') and len(ind.fitness.values) > 0:
+                all_fitness.append(ind.fitness.values)
+
+        # Extract fitness values for Pareto front
+        pareto_fitness = [ind.fitness.values for ind in pareto_front]
+
+        # Create figure
+        fig = plt.figure(figsize=(10, 8))
+
+        # Determine plot type based on number of objectives
+        if len(objectives) == 2:
+            # 2D scatter plot
+            ax = fig.add_subplot(111)
+
+            # Plot all solutions
+            x_all = [fit[0] for fit in all_fitness]
+            y_all = [fit[1] for fit in all_fitness]
+            ax.scatter(x_all, y_all, color='lightgray', alpha=0.5, label='All Solutions')
+
+            # Plot Pareto front
+            x_pareto = [fit[0] for fit in pareto_fitness]
+            y_pareto = [fit[1] for fit in pareto_fitness]
+            pareto_scatter = ax.scatter(x_pareto, y_pareto, color='red', s=100, label='Pareto Solutions')
+
+            # Add solution IDs for Pareto solutions
+            for i, (x, y) in enumerate(zip(x_pareto, y_pareto)):
+                # Get the individual_id from the solution if available
+                if i < len(pareto_front):
+                    # Find the individual_id for this Pareto solution
+                    pareto_ind = pareto_front[i]
+                    ind_tuple = tuple(pareto_ind)
+
+                    # Search in all_individuals to find matching individual_id
+                    label_id = i  # Default fallback
+                    for j, eval_ind in enumerate(all_individuals):
+                        if hasattr(eval_ind, 'fitness') and hasattr(eval_ind.fitness, 'values'):
+                            if tuple(eval_ind) == ind_tuple:
+                                label_id = j
+                                break
+
+                    ax.annotate(f"ID {label_id}", (x, y), xytext=(5, 5), textcoords='offset points')
+                else:
+                    ax.annotate(f"ID {i}", (x, y), xytext=(5, 5), textcoords='offset points')
+
+            # Set axis labels with units
+            if objectives[0] == 'NPV':
+                ax.set_xlabel('NPV [USD]')
+            elif objectives[0] == 'ROI':
+                ax.set_xlabel('ROI [-]')
+            elif objectives[0] == 'emissions':
+                ax.set_xlabel('Emissions [t CO2eq]')
+            elif objectives[0] == 'total_capex':
+                ax.set_xlabel('Total CAPEX [USD]')
+
+            if objectives[1] == 'NPV':
+                ax.set_ylabel('NPV [USD]')
+            elif objectives[1] == 'ROI':
+                ax.set_ylabel('ROI [-]')
+            elif objectives[1] == 'emissions':
+                ax.set_ylabel('Emissions [t CO2eq]')
+            elif objectives[1] == 'total_capex':
+                ax.set_ylabel('Total CAPEX [USD]')
+
+        elif len(objectives) == 3:
+            # 3D scatter plot
+            ax = fig.add_subplot(111, projection='3d')
+
+            # Plot all solutions
+            x_all = [fit[0] for fit in all_fitness]
+            y_all = [fit[1] for fit in all_fitness]
+            z_all = [fit[2] for fit in all_fitness]
+            ax.scatter(x_all, y_all, z_all, color='lightgray', alpha=0.5, label='All Solutions')
+
+            # Plot Pareto front
+            x_pareto = [fit[0] for fit in pareto_fitness]
+            y_pareto = [fit[1] for fit in pareto_fitness]
+            z_pareto = [fit[2] for fit in pareto_fitness]
+            pareto_scatter = ax.scatter(x_pareto, y_pareto, z_pareto, color='red', s=100, label='Pareto Solutions')
+
+            # Add solution IDs for Pareto solutions
+            for i, (x, y, z) in enumerate(zip(x_pareto, y_pareto, z_pareto)):
+                ax.text(x, y, z, str(i), size=8)
+
+            # Set axis labels with units
+            if objectives[0] == 'NPV':
+                ax.set_xlabel('NPV [USD]')
+            elif objectives[0] == 'ROI':
+                ax.set_xlabel('ROI [-]')
+            elif objectives[0] == 'emissions':
+                ax.set_xlabel('Emissions [t CO2eq]')
+            elif objectives[0] == 'total_capex':
+                ax.set_xlabel('Total CAPEX [USD]')
+
+            if objectives[1] == 'NPV':
+                ax.set_ylabel('NPV [USD]')
+            elif objectives[1] == 'ROI':
+                ax.set_ylabel('ROI [-]')
+            elif objectives[1] == 'emissions':
+                ax.set_ylabel('Emissions [t CO2eq]')
+            elif objectives[1] == 'total_capex':
+                ax.set_ylabel('Total CAPEX [USD]')
+
+            if objectives[2] == 'NPV':
+                ax.set_zlabel('NPV [USD]')
+            elif objectives[2] == 'ROI':
+                ax.set_zlabel('ROI [-]')
+            elif objectives[2] == 'emissions':
+                ax.set_zlabel('Emissions [t CO2eq]')
+            elif objectives[2] == 'total_capex':
+                ax.set_zlabel('Total CAPEX [USD]')
+
+        # Add title and legend with bigger, bold font
+        plt.title(f'Multi-Objective Optimization Results - {self.network_type}', 
+                  fontsize=14, fontweight='bold')
+        plt.legend(loc='best')
+
+        # Save figure
+        plot_file = output_dir / f"dtn_expansion_opt_pareto_plot_{self.network_type}.png"
+        plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+        plt.close()
+
+        # For 2D plots, also create a version with the 3rd objective as color/size if available
+        if len(objectives) == 3:
+            fig = plt.figure(figsize=(10, 8))
+            ax = fig.add_subplot(111)
+
+            # Plot all solutions
+            scatter_all = ax.scatter(x_all, y_all, c=z_all, cmap='viridis', alpha=0.5, s=50)
+
+            # Plot Pareto front
+            scatter_pareto = ax.scatter(x_pareto, y_pareto, c=z_pareto, cmap='viridis', 
+                                       edgecolors='red', linewidths=2, s=100)
+
+            # Add solution IDs for Pareto solutions
+            for i, (x, y) in enumerate(zip(x_pareto, y_pareto)):
+                # Get the individual_id from the solution if available
+                if i < len(pareto_front):
+                    # Find the individual_id for this Pareto solution
+                    pareto_ind = pareto_front[i]
+                    ind_tuple = tuple(pareto_ind)
+
+                    # Search in all_individuals to find matching individual_id
+                    label_id = i  # Default fallback
+                    for j, eval_ind in enumerate(all_individuals):
+                        if hasattr(eval_ind, 'fitness') and hasattr(eval_ind.fitness, 'values'):
+                            if tuple(eval_ind) == ind_tuple:
+                                label_id = j
+                                break
+
+                    ax.annotate(f"ID {label_id}", (x, y), xytext=(5, 5), textcoords='offset points')
+                else:
+                    ax.annotate(f"ID {i}", (x, y), xytext=(5, 5), textcoords='offset points')
+
+            # Set axis labels with units
+            if objectives[0] == 'NPV':
+                ax.set_xlabel('NPV [USD]')
+            elif objectives[0] == 'ROI':
+                ax.set_xlabel('ROI [-]')
+            elif objectives[0] == 'emissions':
+                ax.set_xlabel('Emissions [t CO2eq]')
+            elif objectives[0] == 'total_capex':
+                ax.set_xlabel('Total CAPEX [USD]')
+
+            if objectives[1] == 'NPV':
+                ax.set_ylabel('NPV [USD]')
+            elif objectives[1] == 'ROI':
+                ax.set_ylabel('ROI [-]')
+            elif objectives[1] == 'emissions':
+                ax.set_ylabel('Emissions [t CO2eq]')
+            elif objectives[1] == 'total_capex':
+                ax.set_ylabel('Total CAPEX [USD]')
+
+            # Add colorbar
+            cbar = plt.colorbar(scatter_all)
+            if objectives[2] == 'NPV':
+                cbar.set_label('NPV [USD]')
+            elif objectives[2] == 'ROI':
+                cbar.set_label('ROI [-]')
+            elif objectives[2] == 'emissions':
+                cbar.set_label('Emissions [t CO2eq]')
+            elif objectives[2] == 'total_capex':
+                cbar.set_label('Total CAPEX [USD]')
+
+            # Add title and legend with bigger, bold font
+            plt.title(f'Multi-Objective Optimization Results - {self.network_type}\n(Color: {objectives[2]})', 
+                      fontsize=14, fontweight='bold')
+
+            # Save figure
+            plot_file_2d = output_dir / f"dtn_expansion_opt_pareto_plot_2d_{self.network_type}.png"
+            plt.savefig(plot_file_2d, dpi=300, bbox_inches='tight')
+            plt.close()
+
+        return plot_file
 
     def calculate_ghg_emissions(self, cluster_set):
         """
@@ -1518,7 +1751,14 @@ class DTNExpansionOptimizer:
             self._cache_emissions_for_individual(ind_tuple, phase_emissions, has_non_district_scale)
             log().debug(f"Calculated and cached emissions for individual {ind_tuple}")
 
-        # Extract final phase emissions (last phase)
+        # Calculate weighted emissions across all phases
+        weighted_emissions = 0
+        for phase in range(1, self.num_phases + 1):
+            phase_duration = self.phase_durations[phase-1]
+            if phase in phase_emissions:
+                weighted_emissions += phase_emissions[phase]['operation'] * phase_duration
+
+        # Keep final phase emissions for backward compatibility
         final_phase_emissions = phase_emissions[self.num_phases]['operation'] if self.num_phases in phase_emissions else 0
 
         # Apply penalty if cluster 0 has non-DISTRICT scale systems
@@ -1526,7 +1766,8 @@ class DTNExpansionOptimizer:
             log().debug(f"Applying penalty for non-DISTRICT scale systems in cluster 0 for individual {ind_tuple}")
             total_roi = -1000
             total_npv = -1000000
-            final_phase_emissions = 1000000  # Also penalize emissions objective in multi-objective mode
+            weighted_emissions = 1000000  # Penalize weighted emissions for multi-objective mode
+            final_phase_emissions = 1000000  # Also penalize final phase emissions for backward compatibility
 
         # Group clusters by phase
         clusters_by_phase = {}
@@ -1538,8 +1779,8 @@ class DTNExpansionOptimizer:
 
         # Calculate ROI, NPV, and costs for each phase
         for phase, clusters in clusters_by_phase.items():
-            # Calculate CAPEX for this phase
-            capex = self._calculate_phase_capex(clusters)
+            # Calculate CAPEX for this phase with interest rate adjustment
+            capex, capex_components = self._calculate_phase_capex(clusters, phase)
             phase_capex[phase-1] = capex
 
             # Calculate total expenditure for this phase
@@ -1581,10 +1822,11 @@ class DTNExpansionOptimizer:
                         log().info(f"Individual {ind_tuple} exceeds GHG budget in phase {phase+1}: {phase_ghg} > {self.ghg_budget_per_phase[phase]}")
                         total_roi = -1000
                         total_npv = -1000000
-                        final_phase_emissions = 1000000  # Also penalize emissions objective in multi-objective mode
+                        weighted_emissions = 1000000  # Penalize weighted emissions for multi-objective mode
+                        final_phase_emissions = 1000000  # Also penalize final phase emissions for backward compatibility
                         break
 
-        # Calculate total CAPEX across all phases
+        # Calculate discounted total CAPEX across all phases
         total_capex = sum(phase_capex)
 
         # Return fitness based on optimization mode
@@ -1602,19 +1844,23 @@ class DTNExpansionOptimizer:
 
             # Add fitness values based on selected objectives
             for obj in objectives:
-                if obj == 'NPV':
+                # Convert to lowercase for case-insensitive comparison
+                obj_lower = obj.lower() if isinstance(obj, str) else obj
+                if obj_lower == 'npv':
                     fitness_values.append(total_npv)
-                elif obj == 'ROI':
+                elif obj_lower == 'roi':
                     fitness_values.append(total_roi)
-                elif obj == 'emissions':
-                    fitness_values.append(final_phase_emissions)
-                elif obj == 'total_capex':
+                elif obj_lower == 'emissions':
+                    fitness_values.append(weighted_emissions)
+                elif obj_lower == 'total_capex':
                     fitness_values.append(total_capex)
 
             return tuple(fitness_values)
         else:
             # Return single objective
-            if self.objective_function == 'ROI':
+            # Convert to lowercase for case-insensitive comparison
+            obj_func_lower = self.objective_function.lower() if isinstance(self.objective_function, str) else self.objective_function
+            if obj_func_lower == 'roi':
                 return (total_roi,)
             else:  # Default to NPV
                 return (total_npv,)
@@ -1671,6 +1917,27 @@ class DTNExpansionOptimizer:
         # Create initial population
         pop = self.toolbox.population(n=population_size)
 
+        # Add a list to track all evaluated individuals
+        all_evaluated_individuals = []
+
+        # Store the original evaluate function
+        original_evaluate = self.toolbox.evaluate
+
+        # Define a new evaluate function that tracks individuals
+        def evaluate_and_track(individual):
+            fitness = original_evaluate(individual)
+            # Create a proper DEAP Individual copy using the creator
+            if self.multi_objective_mode:
+                ind_copy = creator.Individual(individual)
+            else:
+                ind_copy = creator.Individual(individual)
+            ind_copy.fitness.values = fitness
+            all_evaluated_individuals.append(ind_copy)
+            return fitness
+
+        # Replace the evaluate function in the toolbox
+        self.toolbox.evaluate = evaluate_and_track
+
         # Evaluate the individuals with an invalid fitness
         invalid_ind = [ind for ind in pop if not ind.fitness.valid]
         fitnesses = self.toolbox.map(self.toolbox.evaluate, invalid_ind)
@@ -1701,7 +1968,7 @@ class DTNExpansionOptimizer:
             # Track the Pareto front
             pareto = tools.ParetoFront()
 
-            # Run the NSGA-III algorithm
+            # Use the custom evaluation function in the algorithm
             algorithms.eaMuPlusLambda(pop, self.toolbox, mu=population_size,
                                   lambda_=population_size,
                                   cxpb=0.5, mutpb=0.2,
@@ -1710,11 +1977,26 @@ class DTNExpansionOptimizer:
 
             # Process the Pareto front solutions
             pareto_solutions = []
-            for ind in pareto:
+            for i, ind in enumerate(pareto):
+                # Find the corresponding individual_id from all_evaluated_individuals
+                individual_id = None
+                ind_tuple = tuple(ind)
+
+                # Search for this individual in all_evaluated_individuals to get its index
+                for j, eval_ind in enumerate(all_evaluated_individuals):
+                    if tuple(eval_ind) == ind_tuple:
+                        individual_id = j
+                        break
+
+                if individual_id is None:
+                    log().warning(f"Could not find individual_id for Pareto solution {i}")
+                    individual_id = f"unknown_{i}"
+
                 # Convert to cluster-phase mapping
                 solution = {
+                    'individual_id': individual_id,  # Use actual individual_id
                     'cluster_phase_map': {cluster: phase for cluster, phase in
-                                         zip(self.all_clusters, ind) if phase > 0},
+                                          zip(self.all_clusters, ind) if phase > 0},
                     'phases': {}
                 }
 
@@ -1740,7 +2022,7 @@ class DTNExpansionOptimizer:
                 for phase, clusters in solution['phases'].items():
                     solution[f'phase_{phase}_roi'] = self.calculate_roi(tuple(clusters), phase)
                     solution[f'phase_{phase}_npv'] = self.calculate_npv(tuple(clusters), phase)
-                    solution[f'phase_{phase}_capex'] = self._calculate_phase_capex(clusters)
+                    solution[f'phase_{phase}_capex'], _ = self._calculate_phase_capex(clusters, phase)
 
                     # Get emissions for this phase
                     ind_tuple = tuple(ind)
@@ -1749,6 +2031,12 @@ class DTNExpansionOptimizer:
                         solution[f'phase_{phase}_emissions'] = phase_emissions[phase]['operation']
 
                 pareto_solutions.append(solution)
+
+            # Create a scatter plot of all solutions tested during multi-objective optimization
+            self.plot_multi_objective_results(all_evaluated_individuals, pareto, self.multi_objective_functions)
+
+            # Save metrics for all evaluated individuals
+            self.save_all_evaluated_individuals(all_evaluated_individuals, self.locator.get_dtn_expansion_optimization_results_folder())
 
             return pareto_solutions
 
@@ -1763,7 +2051,7 @@ class DTNExpansionOptimizer:
             stats.register("min", np.min)
             stats.register("max", np.max)
 
-            # Run the genetic algorithm
+            # Use the custom evaluation function in the algorithm
             pop, logbook = algorithms.eaSimple(pop, self.toolbox, cxpb=0.5, mutpb=0.2,
                                               ngen=num_generations, stats=stats,
                                               halloffame=hof, verbose=True)
@@ -1789,9 +2077,104 @@ class DTNExpansionOptimizer:
             for phase, clusters in solution['phases'].items():
                 solution[f'phase_{phase}_roi'] = self.calculate_roi(tuple(clusters), phase)
                 solution[f'phase_{phase}_npv'] = self.calculate_npv(tuple(clusters), phase)
-                solution[f'phase_{phase}_capex'] = self._calculate_phase_capex(clusters)
+                solution[f'phase_{phase}_capex'], _ = self._calculate_phase_capex(clusters, phase)
+
+            # Save metrics for all evaluated individuals
+            self.save_all_evaluated_individuals(all_evaluated_individuals, self.locator.get_dtn_expansion_optimization_results_folder())
 
             return solution
+
+    def save_all_evaluated_individuals(self, all_individuals, output_dir):
+        """
+        Save metrics for all evaluated individuals during optimization to a CSV file.
+
+        Parameters:
+        -----------
+        all_individuals : list
+            List of all individuals evaluated during optimization
+        output_dir : Path
+            Output directory
+
+        Returns:
+        --------
+        Path
+            Path to the saved CSV file
+        """
+        # Create output directory
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create a list to store all individual metrics
+        all_metrics = []
+
+        # Process each individual
+        for i, ind in enumerate(all_individuals):
+            # Skip individuals without valid fitness
+            if not hasattr(ind, 'fitness') or not hasattr(ind.fitness, 'values') or len(ind.fitness.values) == 0:
+                continue
+
+            # Create a dictionary to store metrics for this individual
+            metrics = {
+                'individual_id': i,
+                'genome': str(list(ind)),
+            }
+
+            # Add fitness values
+            objectives = self.multi_objective_functions
+            if not objectives or len(objectives) == 0:
+                objectives = ['NPV', 'emissions']
+
+            # Limit to 3 objectives maximum
+            objectives = objectives[:3]
+
+            # Add fitness values to metrics
+            for j, obj in enumerate(objectives):
+                if j < len(ind.fitness.values):
+                    metrics[f'fitness_{obj}'] = ind.fitness.values[j]
+
+            # Convert individual to cluster-phase mapping
+            cluster_phase_map = {cluster: phase for cluster, phase in zip(self.all_clusters, ind)}
+
+            # Group clusters by phase
+            clusters_by_phase = {}
+            for cluster, phase in cluster_phase_map.items():
+                if phase > 0:  # Skip unconnected clusters (phase 0)
+                    if phase not in clusters_by_phase:
+                        clusters_by_phase[phase] = []
+                    clusters_by_phase[phase].append(cluster)
+
+            # Add phase information
+            metrics['num_phases'] = len(clusters_by_phase)
+            for phase, clusters in clusters_by_phase.items():
+                metrics[f'phase_{phase}_clusters'] = str(clusters)
+                metrics[f'phase_{phase}_num_clusters'] = len(clusters)
+
+                # Calculate metrics for this phase
+                if len(clusters) > 0:
+                    metrics[f'phase_{phase}_roi'] = self.calculate_roi(tuple(clusters), phase)
+                    metrics[f'phase_{phase}_npv'] = self.calculate_npv(tuple(clusters), phase)
+                    metrics[f'phase_{phase}_capex'], _ = self._calculate_phase_capex(clusters, phase)
+
+                    # Get emissions for this phase if available
+                    ind_tuple = tuple(ind)
+                    if ind_tuple in self.emissions_cache:
+                        phase_emissions, _ = self.emissions_cache[ind_tuple]
+                        if phase in phase_emissions:
+                            metrics[f'phase_{phase}_emissions'] = phase_emissions[phase]['operation']
+
+            # Add to list of all metrics
+            all_metrics.append(metrics)
+
+        # Convert to DataFrame
+        df = pd.DataFrame(all_metrics)
+
+        # Save to CSV
+        csv_file = output_dir / f"all_evaluated_individuals_{self.network_type}.csv"
+        df.to_csv(csv_file, index=False)
+
+        log().info(f"Metrics for all {len(all_metrics)} evaluated individuals saved to {csv_file}")
+
+        return csv_file
 
     def save_detailed_results(self, results, output_dir, return_df=False):
         """
@@ -1828,49 +2211,342 @@ class DTNExpansionOptimizer:
                 # Multi-objective solution with multiple phases
                 cumulative_clusters = []
                 cumulative_clusters: list[int] = []
-                # store cumulative numbers of the *previous* phase – start with 0
+
+                # Initialize prev_cumulative_metrics with zeros
                 prev_cumulative_metrics = {
                     'total_pipe_length_m': 0,
                     f'total_annual_{demand_type}_MWh': 0
                 }
 
-                for phase_num in sorted(original_result['phases'].keys()):
-                    if phase_num == 0:
-                        continue
+                # Add a row for phase 0 (existing DTN)
+                # Get district emissions
+                district_emissions = self.calculate_district_emissions_new()
 
-                    # ------------------------------------------------------------------
-                    # 1) update running list of connected clusters
-                    # ------------------------------------------------------------------
-                    newly_connected = sorted(original_result['phases'][phase_num])
-                    cumulative_clusters.extend(newly_connected)
-                    cumulative_clusters = sorted(set(cumulative_clusters))
+                # Get buildings in cluster 0 (existing DTN)
+                cluster0_buildings = self._get_buildings_in_specific_cluster(0)
+
+                # Create phase 0 result
+                phase0_result = {
+                    'phase': 0,
+                    'newly_connected_cluster(s)': '0',
+                    'cumulative_cluster(s)': '0',
+                    'new_cluster(s)_roi [-]': 0,  # No ROI for existing DTN
+                    'new_cluster(s)_npv [USD]': 0,  # No NPV for existing DTN
+                    'new_cluster(s)_capex [USD]': 0,  # No CAPEX for existing DTN
+                    'district_operation_emission [t CO2eq/yr]': district_emissions.get(0, {}).get('district_operation_emission [t CO2eq/yr]', 0),
+                    'new_cluster(s)_pipe_length [m]': 0,  # Will be updated if data is available
+                    'cumulative_pipe_length [m]': 0,  # Will be updated if data is available
+                    f'new_cluster(s)_annual_{demand_type} [MWh/yr]': 0,  # Will be updated if data is available
+                    f'cumulative_annual_{demand_type} [MWh/yr]': 0,  # Will be updated if data is available
+                    f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]': 0,  # Will be calculated if data is available
+                    f'overall_linear_{demand_type}_density [MWh/km/yr]': 0,  # Will be calculated if data is available
+                    'individual': original_result.get('individual'),
+
+                    # CAPEX components
+                    'new_cluster(s)_pipe_capex [USD]': 0,  # No CAPEX for existing DTN
+                    'new_cluster(s)_hex_capex [USD]': 0,  # No CAPEX for existing DTN
+                    'new_cluster(s)_pump_capex [USD]': 0,  # No CAPEX for existing DTN
+                    'new_cluster(s)_cooling_plant_capex [USD]': 0,  # No CAPEX for existing DTN
+                    'new_cluster(s)_total_capex [USD]': 0,  # No CAPEX for existing DTN
+
+                    # Cumulative CAPEX components
+                    'cumulative_pipe_capex [USD]': 0,  # No CAPEX for existing DTN
+                    'cumulative_hex_capex [USD]': 0,  # No CAPEX for existing DTN
+                    'cumulative_pump_capex [USD]': 0,  # No CAPEX for existing DTN
+                    'cumulative_cooling_plant_capex [USD]': 0,  # No CAPEX for existing DTN
+                    'cumulative_total_capex [USD]': 0,  # No CAPEX for existing DTN
+
+                    # Annualized CAPEX components
+                    'new_cluster(s)_pipe_annual_capex [USD/yr]': 0,  # No CAPEX for existing DTN
+                    'new_cluster(s)_hex_annual_capex [USD/yr]': 0,  # No CAPEX for existing DTN
+                    'new_cluster(s)_pump_annual_capex [USD/yr]': 0,  # No CAPEX for existing DTN
+                    'new_cluster(s)_cooling_plant_annual_capex [USD/yr]': 0,  # No CAPEX for existing DTN
+                    'new_cluster(s)_total_annual_capex [USD/yr]': 0,  # No CAPEX for existing DTN
+
+                    # Cumulative annualized CAPEX components
+                    'cumulative_pipe_annual_capex [USD/yr]': 0,  # No CAPEX for existing DTN
+                    'cumulative_hex_annual_capex [USD/yr]': 0,  # No CAPEX for existing DTN
+                    'cumulative_pump_annual_capex [USD/yr]': 0,  # No CAPEX for existing DTN
+                    'cumulative_cooling_plant_annual_capex [USD/yr]': 0,  # No CAPEX for existing DTN
+                    'cumulative_total_annual_capex [USD/yr]': 0,  # No CAPEX for existing DTN
+
+                    # O&M costs - fixed components
+                    'new_cluster(s)_pipe_annual_fixed_om [USD/yr]': 0,  # Will be updated if data is available
+                    'new_cluster(s)_hex_annual_fixed_om [USD/yr]': 0,  # Will be updated if data is available
+                    'new_cluster(s)_pump_annual_fixed_om [USD/yr]': 0,  # Will be updated if data is available
+                    'new_cluster(s)_cooling_plant_annual_fixed_om [USD/yr]': 0,  # Will be updated if data is available
+                    'new_cluster(s)_total_annual_fixed_om [USD/yr]': 0,  # Will be updated if data is available
+
+                    # Cumulative O&M costs - fixed components
+                    'cumulative_pipe_annual_fixed_om [USD/yr]': 0,  # Will be updated if data is available
+                    'cumulative_hex_annual_fixed_om [USD/yr]': 0,  # Will be updated if data is available
+                    'cumulative_pump_annual_fixed_om [USD/yr]': 0,  # Will be updated if data is available
+                    'cumulative_cooling_plant_annual_fixed_om [USD/yr]': 0,  # Will be updated if data is available
+                    'cumulative_total_annual_fixed_om [USD/yr]': 0,  # Will be updated if data is available
+
+                    # O&M costs - variable components
+                    'new_cluster(s)_pump_annual_variable_om [USD/yr]': 0,  # Will be updated if data is available
+                    'new_cluster(s)_cooling_plant_annual_variable_om [USD/yr]': 0,  # Will be updated if data is available
+                    'new_cluster(s)_total_annual_variable_om [USD/yr]': 0,  # Will be updated if data is available
+
+                    # Cumulative O&M costs - variable components
+                    'cumulative_pump_annual_variable_om [USD/yr]': 0,  # Will be updated if data is available
+                    'cumulative_cooling_plant_annual_variable_om [USD/yr]': 0,  # Will be updated if data is available
+                    'cumulative_total_annual_variable_om [USD/yr]': 0,  # Will be updated if data is available
+
+                    # O&M costs - total (for backward compatibility)
+                    'new_cluster(s)_pipe_annual_om [USD/yr]': 0,  # Will be updated if data is available
+                    'new_cluster(s)_hex_annual_om [USD/yr]': 0,  # Will be updated if data is available
+                    'new_cluster(s)_pump_annual_om [USD/yr]': 0,  # Will be updated if data is available
+                    'new_cluster(s)_cooling_plant_annual_om [USD/yr]': 0,  # Will be updated if data is available
+                    'new_cluster(s)_total_annual_om [USD/yr]': 0,  # Will be updated if data is available
+
+                    # Cumulative O&M costs - total
+                    'cumulative_pipe_annual_om [USD/yr]': 0,  # Will be updated if data is available
+                    'cumulative_hex_annual_om [USD/yr]': 0,  # Will be updated if data is available
+                    'cumulative_pump_annual_om [USD/yr]': 0,  # Will be updated if data is available
+                    'cumulative_cooling_plant_annual_om [USD/yr]': 0,  # Will be updated if data is available
+                    'cumulative_total_annual_om [USD/yr]': 0,  # Will be updated if data is available
+
+                    # Energy consumption
+                    'new_cluster(s)_pump_electricity [kWh/yr]': 0,  # Will be updated if data is available
+                    'new_cluster(s)_cooling_plant_electricity [kWh/yr]': 0,  # Will be updated if data is available
+
+                    # Cumulative energy consumption
+                    'cumulative_pump_electricity [kWh/yr]': 0,  # Will be updated if data is available
+                    'cumulative_cooling_plant_electricity [kWh/yr]': 0  # Will be updated if data is available
+                }
+
+                # Try to get metrics for cluster 0 if available
+                cluster0_key = '0'
+                annual_demand = 0
+                pipe_length = 0
+                pipe_length_recalculated = 0
+
+                if cluster0_key in self.cluster_metrics:
+                    metrics = self.cluster_metrics[cluster0_key]
+                    annual_demand = metrics.get(f'total_annual_{demand_type}_MWh', 0)
+                    pipe_length = metrics.get('total_pipe_length_m', 0)
+
+                # Get required pipes for cluster 0
+                required_pipes = self.get_required_pipes_for_clusters((0,))
+                pipe_length_recalculated = required_pipes['length_m'].sum()
+
+                # Update phase 0 metrics
+                phase0_result['new_cluster(s)_pipe_length [m]'] = pipe_length_recalculated
+                phase0_result['cumulative_pipe_length [m]'] = pipe_length_recalculated
+                phase0_result[f'new_cluster(s)_annual_{demand_type} [MWh/yr]'] = annual_demand
+                phase0_result[f'cumulative_annual_{demand_type} [MWh/yr]'] = annual_demand
+
+                if cluster0_key in self.cluster_metrics:
+                    metrics = self.cluster_metrics[cluster0_key]
+                    phase0_result[f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]'] = metrics.get(f'linear_{demand_type}_density_MWh_per_km', 0)
+
+                    # Recalculate overall linear heat density for consistency
+                    if pipe_length_recalculated > 0:
+                        phase0_result[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = annual_demand / (pipe_length_recalculated / 1000)
+                    else:
+                        phase0_result[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = metrics.get(f'linear_{demand_type}_density_MWh_per_km', 0)
+
+                # Calculate CAPEX components for cluster 0
+                if self.cost_model == 'detailed':
+                    pipe_capex = self.calculate_detailed_capex((0,))
+                    hex_capex = self.calculate_hex_costs((0,))
+                    pump_capex, pump_electricity = self.calculate_pump_costs((0,))
+                    cooling_plant_capex = 0
+                    cooling_plant_electricity = 0
+                    if self.network_type == 'DC':
+                        cooling_plant_capex, cooling_plant_electricity = self.calculate_cooling_plant_costs((0,))
+                else:
+                    # Simplified cost model calculations
+                    pipe_capex = self.calculate_simplified_capex((0,))
+                    buildings = self._get_buildings_in_clusters((0,))
+                    hex_capex = len(buildings) * (self.cost_data['capex_hex_USD'] / self.total_buildings)
+                    required_pipes = self.get_required_pipes_for_clusters((0,))
+                    pipe_length_ratio = required_pipes['length_m'].sum() / self.cost_data['network_length_m']
+                    pump_capex = self.cost_data['capex_pumps_USD'] * pipe_length_ratio
+                    cooling_plant_capex = 0
+                    pump_electricity = 0
+                    cooling_plant_electricity = 0
+                    if self.network_type == 'DC':
+                        cooling_plant_capex = self.cost_data['capex_cooling_plant_USD'] * pipe_length_ratio
+
+                # Update phase0_result with calculated CAPEX components
+                phase0_result['new_cluster(s)_pipe_capex [USD]'] = pipe_capex
+                phase0_result['new_cluster(s)_hex_capex [USD]'] = hex_capex
+                phase0_result['new_cluster(s)_pump_capex [USD]'] = pump_capex
+                phase0_result['new_cluster(s)_cooling_plant_capex [USD]'] = cooling_plant_capex
+
+                # Update cumulative CAPEX components
+                phase0_result['cumulative_pipe_capex [USD]'] = pipe_capex
+                phase0_result['cumulative_hex_capex [USD]'] = hex_capex
+                phase0_result['cumulative_pump_capex [USD]'] = pump_capex
+                phase0_result['cumulative_cooling_plant_capex [USD]'] = cooling_plant_capex
+
+                # Explicitly calculate cumulative_total_capex for phase 0 as the sum of individual components
+                cumulative_total_capex = (
+                        pipe_capex +  # Use the direct variables instead of dict lookup
+                        hex_capex +
+                        pump_capex +
+                        cooling_plant_capex
+                )
+
+                # Assign the calculated total CAPEX
+                phase0_result['cumulative_total_capex [USD]'] = cumulative_total_capex
+
+                # Debug logging to verify the calculation
+                log().debug(
+                    f"Phase 0 CAPEX components: pipe={pipe_capex}, hex={hex_capex}, pump={pump_capex}, cooling={cooling_plant_capex}")
+                log().debug(f"Phase 0 cumulative_total_capex calculated as: {cumulative_total_capex}")
+
+                # Calculate annualized costs (assuming 25 year lifetime and 5% interest rate)
+                pipe_annual_capex = calc_capex_annualized(pipe_capex, 5, 25)
+                hex_annual_capex = calc_capex_annualized(hex_capex, 5, 25)
+                pump_annual_capex = calc_capex_annualized(pump_capex, 5, 25)
+                cooling_plant_annual_capex = calc_capex_annualized(cooling_plant_capex, 5, 25)
+                total_annual_capex = pipe_annual_capex + hex_annual_capex + pump_annual_capex + cooling_plant_annual_capex
+
+                # Update annualized CAPEX components
+                phase0_result['new_cluster(s)_pipe_annual_capex [USD/yr]'] = pipe_annual_capex
+                phase0_result['new_cluster(s)_hex_annual_capex [USD/yr]'] = hex_annual_capex
+                phase0_result['new_cluster(s)_pump_annual_capex [USD/yr]'] = pump_annual_capex
+                phase0_result['new_cluster(s)_cooling_plant_annual_capex [USD/yr]'] = cooling_plant_annual_capex
+                phase0_result['new_cluster(s)_total_annual_capex [USD/yr]'] = total_annual_capex
+
+                # Update cumulative annualized CAPEX components
+                phase0_result['cumulative_pipe_annual_capex [USD/yr]'] = pipe_annual_capex
+                phase0_result['cumulative_hex_annual_capex [USD/yr]'] = hex_annual_capex
+                phase0_result['cumulative_pump_annual_capex [USD/yr]'] = pump_annual_capex
+                phase0_result['cumulative_cooling_plant_annual_capex [USD/yr]'] = cooling_plant_annual_capex
+                phase0_result['cumulative_total_annual_capex [USD/yr]'] = total_annual_capex
+
+                # Calculate O&M costs
+                # Fixed O&M costs (infrastructure components like pipes and HEX use 1.5% of CAPEX)
+                pipe_annual_fixed_om = 0.015 * pipe_capex
+                hex_annual_fixed_om = 0.015 * hex_capex
+
+                # Fixed O&M costs (equipment like pumps and cooling plants use 1.0% of CAPEX)
+                pump_annual_fixed_om = 0.01 * pump_capex
+                cooling_plant_annual_fixed_om = 0.01 * cooling_plant_capex
+
+                # Update O&M costs - fixed components
+                phase0_result['new_cluster(s)_pipe_annual_fixed_om [USD/yr]'] = pipe_annual_fixed_om
+                phase0_result['new_cluster(s)_hex_annual_fixed_om [USD/yr]'] = hex_annual_fixed_om
+                phase0_result['new_cluster(s)_pump_annual_fixed_om [USD/yr]'] = pump_annual_fixed_om
+                phase0_result['new_cluster(s)_cooling_plant_annual_fixed_om [USD/yr]'] = cooling_plant_annual_fixed_om
+                phase0_result['new_cluster(s)_total_annual_fixed_om [USD/yr]'] = pipe_annual_fixed_om + hex_annual_fixed_om + pump_annual_fixed_om + cooling_plant_annual_fixed_om
+
+                # Update cumulative O&M costs - fixed components
+                phase0_result['cumulative_pipe_annual_fixed_om [USD/yr]'] = pipe_annual_fixed_om
+                phase0_result['cumulative_hex_annual_fixed_om [USD/yr]'] = hex_annual_fixed_om
+                phase0_result['cumulative_pump_annual_fixed_om [USD/yr]'] = pump_annual_fixed_om
+                phase0_result['cumulative_cooling_plant_annual_fixed_om [USD/yr]'] = cooling_plant_annual_fixed_om
+                phase0_result['cumulative_total_annual_fixed_om [USD/yr]'] = pipe_annual_fixed_om + hex_annual_fixed_om + pump_annual_fixed_om + cooling_plant_annual_fixed_om
+
+                # Variable O&M costs based on electricity consumption
+                # Get electricity price (USD/kWh)
+                from cea.technologies.supply_systems_database import SupplySystemsDatabase
+                try:
+                    supply_systems = SupplySystemsDatabase(self.locator)
+                    from cea.optimization.prices import Prices  # Import Prices class
+                    prices = Prices(supply_systems)
+                    electricity_price = np.mean(prices.ELEC_PRICE, dtype=np.float64)  # [USD/W]
+                except Exception as e:
+                    log().warning(f"Could not get electricity price: {e}. Using default value of 0.1 USD/kWh")
+                    electricity_price = 0.1 / 1000  # Convert from USD/kWh to USD/W
+
+                # Calculate variable O&M costs
+                pump_annual_variable_om = pump_electricity * electricity_price  # Wh * USD/W = USD
+                cooling_plant_annual_variable_om = cooling_plant_electricity * 1000 * electricity_price  # kWh * 1000 * USD/W = USD
+
+                # Update O&M costs - variable components
+                phase0_result['new_cluster(s)_pump_annual_variable_om [USD/yr]'] = pump_annual_variable_om
+                phase0_result['new_cluster(s)_cooling_plant_annual_variable_om [USD/yr]'] = cooling_plant_annual_variable_om
+                phase0_result['new_cluster(s)_total_annual_variable_om [USD/yr]'] = pump_annual_variable_om + cooling_plant_annual_variable_om
+
+                # Update cumulative O&M costs - variable components
+                phase0_result['cumulative_pump_annual_variable_om [USD/yr]'] = pump_annual_variable_om
+                phase0_result['cumulative_cooling_plant_annual_variable_om [USD/yr]'] = cooling_plant_annual_variable_om
+                phase0_result['cumulative_total_annual_variable_om [USD/yr]'] = pump_annual_variable_om + cooling_plant_annual_variable_om
+
+                # Total O&M costs
+                pipe_annual_om = pipe_annual_fixed_om
+                hex_annual_om = hex_annual_fixed_om
+                pump_annual_om = pump_annual_fixed_om + pump_annual_variable_om
+                cooling_plant_annual_om = cooling_plant_annual_fixed_om + cooling_plant_annual_variable_om
+                total_annual_om = pipe_annual_om + hex_annual_om + pump_annual_om + cooling_plant_annual_om
+
+                # Update O&M costs - total
+                phase0_result['new_cluster(s)_pipe_annual_om [USD/yr]'] = pipe_annual_om
+                phase0_result['new_cluster(s)_hex_annual_om [USD/yr]'] = hex_annual_om
+                phase0_result['new_cluster(s)_pump_annual_om [USD/yr]'] = pump_annual_om
+                phase0_result['new_cluster(s)_cooling_plant_annual_om [USD/yr]'] = cooling_plant_annual_om
+                phase0_result['new_cluster(s)_total_annual_om [USD/yr]'] = total_annual_om
+
+                # Update cumulative O&M costs - total
+                phase0_result['cumulative_pipe_annual_om [USD/yr]'] = pipe_annual_om
+                phase0_result['cumulative_hex_annual_om [USD/yr]'] = hex_annual_om
+                phase0_result['cumulative_pump_annual_om [USD/yr]'] = pump_annual_om
+                phase0_result['cumulative_cooling_plant_annual_om [USD/yr]'] = cooling_plant_annual_om
+                phase0_result['cumulative_total_annual_om [USD/yr]'] = total_annual_om
+
+                # Update energy consumption
+                phase0_result['new_cluster(s)_pump_electricity [kWh/yr]'] = pump_electricity / 1000  # Convert Wh to kWh
+                phase0_result['new_cluster(s)_cooling_plant_electricity [kWh/yr]'] = cooling_plant_electricity
+
+                # Update cumulative energy consumption
+                phase0_result['cumulative_pump_electricity [kWh/yr]'] = pump_electricity / 1000
+                phase0_result['cumulative_cooling_plant_electricity [kWh/yr]'] = cooling_plant_electricity
+
+                # Update prev_cumulative_metrics for phase 1
+                prev_cumulative_metrics = {
+                    'total_pipe_length_m': pipe_length_recalculated,
+                    f'total_annual_{demand_type}_MWh': annual_demand
+                }
+
+                # Add phase 0 result to phase_results
+                phase_results.append(phase0_result)
+
+                # Process each phase, including empty phases
+                for phase_num in range(1, self.num_phases + 1):
+                    # Check if this phase exists in the solution
+                    if phase_num in original_result['phases']:
+                        newly_connected = sorted(original_result['phases'][phase_num])
+                    else:
+                        # Empty phase - no clusters connected
+                        newly_connected = []
+
+                    # Update cumulative clusters (only if there are newly connected clusters)
+                    if newly_connected:
+                        cumulative_clusters.extend(newly_connected)
+                        cumulative_clusters = sorted(set(cumulative_clusters))
 
                     cumulative_key = '+'.join(map(str, cumulative_clusters))
                     cumulative_metrics = self.cluster_metrics.get(cumulative_key, {})
 
-                    # ------------------------------------------------------------------
-                    # 2) derive *incremental* (newly-connected) metrics
-                    #    = current cumulative  –  previous cumulative
-                    # ------------------------------------------------------------------
-                    new_pipe_length = (
+                    # Calculate incremental metrics
+                    new_pipe_length = 0
+                    new_annual_demand = 0
+                    new_linear_density = 0
+
+                    if newly_connected:
+                        new_pipe_length = (
                             cumulative_metrics.get('total_pipe_length_m', 0)
                             - prev_cumulative_metrics['total_pipe_length_m']
-                    )
-                    new_annual_demand = (
+                        )
+                        new_annual_demand = (
                             cumulative_metrics.get(f'total_annual_{demand_type}_MWh', 0)
                             - prev_cumulative_metrics[f'total_annual_{demand_type}_MWh']
-                    )
-                    new_linear_density = (
-                        new_annual_demand / (new_pipe_length / 1000)
-                        if new_pipe_length > 0 else 0
-                    )
+                        )
+                        new_linear_density = (
+                            new_annual_demand / (new_pipe_length / 1000)
+                            if new_pipe_length > 0 else 0
+                        )
 
-                    # ------------------------------------------------------------------
-                    # 3) assemble phase result
-                    # ------------------------------------------------------------------
+                    # Create phase result
                     phase_result = {
                         'phase': phase_num,
-                        'newly_connected_cluster(s)': '+'.join(map(str, newly_connected)),
+                        'newly_connected_cluster(s)': '+'.join(map(str, newly_connected)) if newly_connected else 'none',
                         'cumulative_cluster(s)': '+'.join(map(str, [0] + cumulative_clusters)),
 
                         'new_cluster(s)_roi [-]': original_result.get(f'phase_{phase_num}_roi', 0),
@@ -1913,44 +2589,64 @@ class DTNExpansionOptimizer:
                 phase = result['phase']
 
                 # Get clusters for this phase
-                clusters = [int(c) for c in result['newly_connected_cluster(s)'].split('+')]
-
-                # Calculate detailed CAPEX components
-                if self.cost_model == 'detailed':
-                    pipe_capex = self.calculate_detailed_capex(tuple(clusters))
-                else:
-                    pipe_capex = self.calculate_simplified_capex(tuple(clusters))
-
-                # Get buildings in the clusters
-                buildings = self._get_buildings_in_clusters(tuple(clusters))
-
-                # Calculate heat exchanger costs
-                if self.cost_model == 'detailed':
-                    hex_capex = self.calculate_hex_costs(tuple(clusters))
-                else:
-                    hex_capex = len(buildings) * (self.cost_data['capex_hex_USD'] / self.total_buildings)
-
-                # Calculate pump costs
-                if self.cost_model == 'detailed':
-                    pump_capex, pump_electricity = self.calculate_pump_costs(tuple(clusters))
-                else:
-                    required_pipes = self.get_required_pipes_for_clusters(tuple(clusters))
-                    pipe_length_ratio = required_pipes['length_m'].sum() / self.cost_data['network_length_m']
-                    pump_capex = self.cost_data['capex_pumps_USD'] * pipe_length_ratio
-                    pump_electricity = 0  # Not calculated in simplified model
-
-                # Calculate cooling plant costs for DC networks
-                if self.network_type == 'DC':
-                    cooling_plant_capex, cooling_plant_electricity = self.calculate_cooling_plant_costs(tuple(clusters))
-                else:
+                if result['newly_connected_cluster(s)'] == 'none':
+                    clusters = []
+                    # For phases with no newly connected clusters, set all CAPEX components to 0
+                    pipe_capex = 0
+                    hex_capex = 0
+                    pump_capex = 0
                     cooling_plant_capex = 0
+                    pump_electricity = 0
                     cooling_plant_electricity = 0
+                else:
+                    clusters = [int(c) for c in result['newly_connected_cluster(s)'].split('+')]
+
+                    # Calculate detailed CAPEX components
+                    if self.cost_model == 'detailed':
+                        pipe_capex = self.calculate_detailed_capex(tuple(clusters))
+                    else:
+                        pipe_capex = self.calculate_simplified_capex(tuple(clusters))
+
+                    # Get buildings in the clusters
+                    buildings = self._get_buildings_in_clusters(tuple(clusters))
+
+                    # Calculate heat exchanger costs
+                    if self.cost_model == 'detailed':
+                        hex_capex = self.calculate_hex_costs(tuple(clusters))
+                    else:
+                        hex_capex = len(buildings) * (self.cost_data['capex_hex_USD'] / self.total_buildings)
+
+                    # Calculate pump costs
+                    if self.cost_model == 'detailed':
+                        pump_capex, pump_electricity = self.calculate_pump_costs(tuple(clusters))
+                    else:
+                        required_pipes = self.get_required_pipes_for_clusters(tuple(clusters))
+                        pipe_length_ratio = required_pipes['length_m'].sum() / self.cost_data['network_length_m']
+                        pump_capex = self.cost_data['capex_pumps_USD'] * pipe_length_ratio
+                        pump_electricity = 0  # Not calculated in simplified model
+
+                    # Calculate cooling plant costs for DC networks
+                    if self.network_type == 'DC':
+                        cooling_plant_capex, cooling_plant_electricity = self.calculate_cooling_plant_costs(tuple(clusters))
+                    else:
+                        cooling_plant_capex = 0
+                        cooling_plant_electricity = 0
 
                 # Calculate annualized costs (assuming 25 year lifetime and 5% interest rate)
                 pipe_annual_capex = calc_capex_annualized(pipe_capex, 5, 25)
                 hex_annual_capex = calc_capex_annualized(hex_capex, 5, 25)
                 pump_annual_capex = calc_capex_annualized(pump_capex, 5, 25)
                 cooling_plant_annual_capex = calc_capex_annualized(cooling_plant_capex, 5, 25)
+
+                total_capex = (
+                        pipe_capex +
+                        hex_capex +
+                        pump_capex +
+                        cooling_plant_capex
+                )
+
+                # UPDATE new-cluster column
+                result['new_cluster(s)_capex [USD]'] = total_capex
 
                 # Calculate O&M costs
                 # Fixed O&M costs (infrastructure components like pipes and HEX use 1.5% of CAPEX)
@@ -1984,6 +2680,14 @@ class DTNExpansionOptimizer:
                 pump_annual_om = pump_annual_fixed_om + pump_annual_variable_om
                 cooling_plant_annual_om = cooling_plant_annual_fixed_om + cooling_plant_annual_variable_om
 
+                # Get previous cumulative values from the last detailed result
+                prev_cumulative_values = {}
+                if detailed_results:
+                    prev_result = detailed_results[-1]
+                    for key in prev_result:
+                        if key.startswith('cumulative_'):
+                            prev_cumulative_values[key] = prev_result[key]
+
                 # Create detailed result dictionary
                 detailed_result = {
                     'phase': phase,
@@ -1995,7 +2699,14 @@ class DTNExpansionOptimizer:
                     'new_cluster(s)_hex_capex [USD]': hex_capex,
                     'new_cluster(s)_pump_capex [USD]': pump_capex,
                     'new_cluster(s)_cooling_plant_capex [USD]': cooling_plant_capex,
-                    'new_cluster(s)_total_capex [USD]': result['new_cluster(s)_capex [USD]'],
+                    'new_cluster(s)_total_capex [USD]': total_capex,
+
+                    # Cumulative CAPEX components
+                    'cumulative_pipe_capex [USD]': prev_cumulative_values.get('cumulative_pipe_capex [USD]', 0) + pipe_capex,
+                    'cumulative_hex_capex [USD]': prev_cumulative_values.get('cumulative_hex_capex [USD]', 0) + hex_capex,
+                    'cumulative_pump_capex [USD]': prev_cumulative_values.get('cumulative_pump_capex [USD]', 0) + pump_capex,
+                    'cumulative_cooling_plant_capex [USD]': prev_cumulative_values.get('cumulative_cooling_plant_capex [USD]', 0) + cooling_plant_capex,
+                    'cumulative_total_capex [USD]': prev_cumulative_values.get('cumulative_total_capex [USD]', 0) + total_capex,
 
                     # Annualized CAPEX components
                     'new_cluster(s)_pipe_annual_capex [USD/yr]': pipe_annual_capex,
@@ -2003,6 +2714,13 @@ class DTNExpansionOptimizer:
                     'new_cluster(s)_pump_annual_capex [USD/yr]': pump_annual_capex,
                     'new_cluster(s)_cooling_plant_annual_capex [USD/yr]': cooling_plant_annual_capex,
                     'new_cluster(s)_total_annual_capex [USD/yr]': pipe_annual_capex + hex_annual_capex + pump_annual_capex + cooling_plant_annual_capex,
+
+                    # Cumulative annualized CAPEX components
+                    'cumulative_pipe_annual_capex [USD/yr]': prev_cumulative_values.get('cumulative_pipe_annual_capex [USD/yr]', 0) + pipe_annual_capex,
+                    'cumulative_hex_annual_capex [USD/yr]': prev_cumulative_values.get('cumulative_hex_annual_capex [USD/yr]', 0) + hex_annual_capex,
+                    'cumulative_pump_annual_capex [USD/yr]': prev_cumulative_values.get('cumulative_pump_annual_capex [USD/yr]', 0) + pump_annual_capex,
+                    'cumulative_cooling_plant_annual_capex [USD/yr]': prev_cumulative_values.get('cumulative_cooling_plant_annual_capex [USD/yr]', 0) + cooling_plant_annual_capex,
+                    'cumulative_total_annual_capex [USD/yr]': prev_cumulative_values.get('cumulative_total_annual_capex [USD/yr]', 0) + pipe_annual_capex + hex_annual_capex + pump_annual_capex + cooling_plant_annual_capex,
 
                     # O&M costs - fixed components
                     'new_cluster(s)_pipe_annual_fixed_om [USD/yr]': pipe_annual_fixed_om,
@@ -2012,10 +2730,23 @@ class DTNExpansionOptimizer:
                     'new_cluster(s)_total_annual_fixed_om [USD/yr]': pipe_annual_fixed_om + hex_annual_fixed_om + \
                                                                      pump_annual_fixed_om + cooling_plant_annual_fixed_om,
 
+                    # Cumulative O&M costs - fixed components
+                    'cumulative_pipe_annual_fixed_om [USD/yr]': prev_cumulative_values.get('cumulative_pipe_annual_fixed_om [USD/yr]', 0) + pipe_annual_fixed_om,
+                    'cumulative_hex_annual_fixed_om [USD/yr]': prev_cumulative_values.get('cumulative_hex_annual_fixed_om [USD/yr]', 0) + hex_annual_fixed_om,
+                    'cumulative_pump_annual_fixed_om [USD/yr]': prev_cumulative_values.get('cumulative_pump_annual_fixed_om [USD/yr]', 0) + pump_annual_fixed_om,
+                    'cumulative_cooling_plant_annual_fixed_om [USD/yr]': prev_cumulative_values.get('cumulative_cooling_plant_annual_fixed_om [USD/yr]', 0) + cooling_plant_annual_fixed_om,
+                    'cumulative_total_annual_fixed_om [USD/yr]': prev_cumulative_values.get('cumulative_total_annual_fixed_om [USD/yr]', 0) + pipe_annual_fixed_om + hex_annual_fixed_om + \
+                                                                     pump_annual_fixed_om + cooling_plant_annual_fixed_om,
+
                     # O&M costs - variable components
                     'new_cluster(s)_pump_annual_variable_om [USD/yr]': pump_annual_variable_om,
                     'new_cluster(s)_cooling_plant_annual_variable_om [USD/yr]': cooling_plant_annual_variable_om,
                     'new_cluster(s)_total_annual_variable_om [USD/yr]': pump_annual_variable_om + cooling_plant_annual_variable_om,
+
+                    # Cumulative O&M costs - variable components
+                    'cumulative_pump_annual_variable_om [USD/yr]': prev_cumulative_values.get('cumulative_pump_annual_variable_om [USD/yr]', 0) + pump_annual_variable_om,
+                    'cumulative_cooling_plant_annual_variable_om [USD/yr]': prev_cumulative_values.get('cumulative_cooling_plant_annual_variable_om [USD/yr]', 0) + cooling_plant_annual_variable_om,
+                    'cumulative_total_annual_variable_om [USD/yr]': prev_cumulative_values.get('cumulative_total_annual_variable_om [USD/yr]', 0) + pump_annual_variable_om + cooling_plant_annual_variable_om,
 
                     # O&M costs - total (for backward compatibility)
                     'new_cluster(s)_pipe_annual_om [USD/yr]': pipe_annual_om,
@@ -2024,9 +2755,20 @@ class DTNExpansionOptimizer:
                     'new_cluster(s)_cooling_plant_annual_om [USD/yr]': cooling_plant_annual_om,
                     'new_cluster(s)_total_annual_om [USD/yr]': pipe_annual_om + hex_annual_om + pump_annual_om + cooling_plant_annual_om,
 
+                    # Cumulative O&M costs - total
+                    'cumulative_pipe_annual_om [USD/yr]': prev_cumulative_values.get('cumulative_pipe_annual_om [USD/yr]', 0) + pipe_annual_om,
+                    'cumulative_hex_annual_om [USD/yr]': prev_cumulative_values.get('cumulative_hex_annual_om [USD/yr]', 0) + hex_annual_om,
+                    'cumulative_pump_annual_om [USD/yr]': prev_cumulative_values.get('cumulative_pump_annual_om [USD/yr]', 0) + pump_annual_om,
+                    'cumulative_cooling_plant_annual_om [USD/yr]': prev_cumulative_values.get('cumulative_cooling_plant_annual_om [USD/yr]', 0) + cooling_plant_annual_om,
+                    'cumulative_total_annual_om [USD/yr]': prev_cumulative_values.get('cumulative_total_annual_om [USD/yr]', 0) + pipe_annual_om + hex_annual_om + pump_annual_om + cooling_plant_annual_om,
+
                     # Energy consumption
                     'new_cluster(s)_pump_electricity [kWh/yr]': pump_electricity / 1000,  # Convert Wh to kWh
                     'new_cluster(s)_cooling_plant_electricity [kWh/yr]': cooling_plant_electricity,
+
+                    # Cumulative energy consumption
+                    'cumulative_pump_electricity [kWh/yr]': prev_cumulative_values.get('cumulative_pump_electricity [kWh/yr]', 0) + pump_electricity / 1000,
+                    'cumulative_cooling_plant_electricity [kWh/yr]': prev_cumulative_values.get('cumulative_cooling_plant_electricity [kWh/yr]', 0) + cooling_plant_electricity,
 
                     # Other metrics
                     # Get annual demand directly from cluster metrics
@@ -2056,8 +2798,58 @@ class DTNExpansionOptimizer:
 
                 detailed_results.append(detailed_result)
 
-        # Create DataFrame
-        detailed_results_df = pd.DataFrame(detailed_results)
+        # Create DataFrame with ordered columns
+        # Define column order to put cumulative values next to new_cluster values
+        column_order = [
+            'solution_id', 'phase', 'newly_connected_cluster(s)', 'cumulative_cluster(s)',
+            'new_cluster(s)_pipe_capex [USD]', 'cumulative_pipe_capex [USD]',
+            'new_cluster(s)_hex_capex [USD]', 'cumulative_hex_capex [USD]',
+            'new_cluster(s)_pump_capex [USD]', 'cumulative_pump_capex [USD]',
+            'new_cluster(s)_cooling_plant_capex [USD]', 'cumulative_cooling_plant_capex [USD]',
+            'new_cluster(s)_total_capex [USD]', 'cumulative_total_capex [USD]',
+            'new_cluster(s)_pipe_annual_capex [USD/yr]', 'cumulative_pipe_annual_capex [USD/yr]',
+            'new_cluster(s)_hex_annual_capex [USD/yr]', 'cumulative_hex_annual_capex [USD/yr]',
+            'new_cluster(s)_pump_annual_capex [USD/yr]', 'cumulative_pump_annual_capex [USD/yr]',
+            'new_cluster(s)_cooling_plant_annual_capex [USD/yr]', 'cumulative_cooling_plant_annual_capex [USD/yr]',
+            'new_cluster(s)_total_annual_capex [USD/yr]', 'cumulative_total_annual_capex [USD/yr]',
+            'new_cluster(s)_pipe_annual_fixed_om [USD/yr]', 'cumulative_pipe_annual_fixed_om [USD/yr]',
+            'new_cluster(s)_hex_annual_fixed_om [USD/yr]', 'cumulative_hex_annual_fixed_om [USD/yr]',
+            'new_cluster(s)_pump_annual_fixed_om [USD/yr]', 'cumulative_pump_annual_fixed_om [USD/yr]',
+            'new_cluster(s)_cooling_plant_annual_fixed_om [USD/yr]', 'cumulative_cooling_plant_annual_fixed_om [USD/yr]',
+            'new_cluster(s)_total_annual_fixed_om [USD/yr]', 'cumulative_total_annual_fixed_om [USD/yr]',
+            'new_cluster(s)_pump_annual_variable_om [USD/yr]', 'cumulative_pump_annual_variable_om [USD/yr]',
+            'new_cluster(s)_cooling_plant_annual_variable_om [USD/yr]', 'cumulative_cooling_plant_annual_variable_om [USD/yr]',
+            'new_cluster(s)_total_annual_variable_om [USD/yr]', 'cumulative_total_annual_variable_om [USD/yr]',
+            'new_cluster(s)_pipe_annual_om [USD/yr]', 'cumulative_pipe_annual_om [USD/yr]',
+            'new_cluster(s)_hex_annual_om [USD/yr]', 'cumulative_hex_annual_om [USD/yr]',
+            'new_cluster(s)_pump_annual_om [USD/yr]', 'cumulative_pump_annual_om [USD/yr]',
+            'new_cluster(s)_cooling_plant_annual_om [USD/yr]', 'cumulative_cooling_plant_annual_om [USD/yr]',
+            'new_cluster(s)_total_annual_om [USD/yr]', 'cumulative_total_annual_om [USD/yr]',
+            'new_cluster(s)_pump_electricity [kWh/yr]', 'cumulative_pump_electricity [kWh/yr]',
+            'new_cluster(s)_cooling_plant_electricity [kWh/yr]', 'cumulative_cooling_plant_electricity [kWh/yr]',
+            'new_cluster(s)_pipe_length [m]', 'cumulative_pipe_length [m]',
+            f'new_cluster(s)_annual_{demand_type} [MWh/yr]', f'cumulative_annual_{demand_type} [MWh/yr]',
+            f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]', f'overall_linear_{demand_type}_density [MWh/km/yr]',
+            'new_cluster(s)_roi [-]', 'new_cluster(s)_npv [USD]',
+            'district_operation_emission [t CO2eq/yr]',
+            'individual'
+        ]
+
+        # Filter column_order to only include columns that exist in detailed_results
+        available_columns = set()
+        for result in detailed_results:
+            available_columns.update(result.keys())
+
+        filtered_column_order = [col for col in column_order if col in available_columns]
+
+        # Create DataFrame with ordered columns
+        detailed_results_df = pd.DataFrame(detailed_results, columns=filtered_column_order)
+
+        # Add any remaining columns that weren't in column_order
+        remaining_columns = [col for col in available_columns if col not in filtered_column_order]
+        if remaining_columns:
+            remaining_df = pd.DataFrame(detailed_results)[remaining_columns]
+            detailed_results_df = pd.concat([detailed_results_df, remaining_df], axis=1)
 
         # Apply formatting to specific columns
         # Integer formatting
@@ -2131,28 +2923,37 @@ class DTNExpansionOptimizer:
 
             for i, sol in enumerate(solution):
                 row = {
-                    'solution_id': i,
+                    'solution_id': sol.get('individual_id', i),  # Use individual_id if available, fallback to i
                 }
 
-                # Add objective values
+                # Add objective values with units
                 for obj in objectives:
-                    row[f'objective_{obj}'] = sol.get(f'fitness_{obj}', 0)
+                    # Convert to lowercase for case-insensitive comparison
+                    obj_lower = obj.lower() if isinstance(obj, str) else obj
+                    if obj_lower == 'npv':
+                        row[f'objective_{obj} [USD]'] = sol.get(f'fitness_{obj}', 0)
+                    elif obj_lower == 'roi':
+                        row[f'objective_{obj} [-]'] = sol.get(f'fitness_{obj}', 0)
+                    elif obj_lower == 'emissions':
+                        row[f'objective_{obj} [t CO2eq]'] = sol.get(f'fitness_{obj}', 0)
+                    elif obj_lower == 'total_capex':
+                        row[f'objective_{obj} [USD]'] = sol.get(f'fitness_{obj}', 0)
 
                 # Add phase information
                 for phase in range(1, self.num_phases + 1):
                     if phase in sol['phases']:
                         clusters = sol['phases'][phase]
                         row[f'phase_{phase}_clusters'] = '+'.join(map(str, clusters))
-                        row[f'phase_{phase}_roi'] = sol.get(f'phase_{phase}_roi', 0)
-                        row[f'phase_{phase}_npv'] = sol.get(f'phase_{phase}_npv', 0)
-                        row[f'phase_{phase}_capex'] = sol.get(f'phase_{phase}_capex', 0)
-                        row[f'phase_{phase}_emissions'] = sol.get(f'phase_{phase}_emissions', 0)
+                        row[f'phase_{phase}_roi [-]'] = sol.get(f'phase_{phase}_roi', 0)
+                        row[f'phase_{phase}_npv [USD]'] = sol.get(f'phase_{phase}_npv', 0)
+                        row[f'phase_{phase}_capex [USD]'] = sol.get(f'phase_{phase}_capex', 0)
+                        row[f'phase_{phase}_emissions [t CO2eq]'] = sol.get(f'phase_{phase}_emissions', 0)
                     else:
                         row[f'phase_{phase}_clusters'] = ''
-                        row[f'phase_{phase}_roi'] = 0
-                        row[f'phase_{phase}_npv'] = 0
-                        row[f'phase_{phase}_capex'] = 0
-                        row[f'phase_{phase}_emissions'] = 0
+                        row[f'phase_{phase}_roi [-]'] = 0
+                        row[f'phase_{phase}_npv [USD]'] = 0
+                        row[f'phase_{phase}_capex [USD]'] = 0
+                        row[f'phase_{phase}_emissions [t CO2eq]'] = 0
 
                 pareto_summary.append(row)
 
@@ -2168,12 +2969,22 @@ class DTNExpansionOptimizer:
             for i, sol in enumerate(solution):
                 # Add a header row identifying the solution
                 header_row = {
-                    'phase': f'Solution {i}',
+                    'solution_id': sol.get('individual_id', i),  # Use individual_id if available
+                    'phase': '',  # Empty phase for the header row
                 }
 
-                # Add objective values
+                # Add objective values with units
                 for obj in objectives:
-                    header_row[f'objective_{obj}'] = sol.get(f'fitness_{obj}', 0)
+                    # Convert to lowercase for case-insensitive comparison
+                    obj_lower = obj.lower() if isinstance(obj, str) else obj
+                    if obj_lower == 'npv':
+                        header_row[f'objective_{obj} [USD]'] = sol.get(f'fitness_{obj}', 0)
+                    elif obj_lower == 'roi':
+                        header_row[f'objective_{obj} [-]'] = sol.get(f'fitness_{obj}', 0)
+                    elif obj_lower == 'emissions':
+                        header_row[f'objective_{obj} [t CO2eq]'] = sol.get(f'fitness_{obj}', 0)
+                    elif obj_lower == 'total_capex':
+                        header_row[f'objective_{obj} [USD]'] = sol.get(f'fitness_{obj}', 0)
                 combined_results.append(header_row)
 
                 # Get detailed results for this solution
@@ -2241,7 +3052,7 @@ class DTNExpansionOptimizer:
             'cumulative_om_cost [USD]': 0,  # No cumulative OM costs for phase 0
             'ghg_cap [t CO2eq/yr]': '-',  # No GHG cap for existing DTN
             'district_operation_emission [t CO2eq/yr]': district_emissions.get(0, {}).get('district_operation_emission [t CO2eq/yr]', 0),
-            'district_operation_emission_per_gfa [t CO2eq/yr/m2]': district_emissions.get(0, {}).get('district_operation_emission_per_gfa [t CO2eq/yr/m2]', 0),
+            'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': district_emissions.get(0, {}).get('district_operation_emission_per_gfa [kg CO2eq/yr/m2]', 0),
             'new_cluster(s)_roi [-]': 0,  # No ROI for existing DTN
             'overall_roi [-]': 0,  # No overall ROI for phase 0
             'new_cluster(s)_npv [USD]': 0,  # No NPV for existing DTN
@@ -2277,12 +3088,42 @@ class DTNExpansionOptimizer:
             else:
                 phase0_result[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = metrics.get(f'linear_{demand_type}_density_MWh_per_km', 0)
 
-            # Estimate CAPEX for cluster 0 (not counted in expansion costs)
-            estimated_capex = 0
+            # Calculate CAPEX components for cluster 0
             if self.cost_model == 'detailed':
-                estimated_capex = self.calculate_detailed_capex((0,))
+                pipe_capex = self.calculate_detailed_capex((0,))
+                hex_capex = self.calculate_hex_costs((0,))
+                pump_capex, pump_electricity = self.calculate_pump_costs((0,))
+                cooling_plant_capex = 0
+                cooling_plant_electricity = 0
+                if self.network_type == 'DC':
+                    cooling_plant_capex, cooling_plant_electricity = self.calculate_cooling_plant_costs((0,))
             else:
-                estimated_capex = self.calculate_simplified_capex((0,))
+                # Simplified cost model calculations
+                pipe_capex = self.calculate_simplified_capex((0,))
+                buildings = self._get_buildings_in_clusters((0,))
+                hex_capex = len(buildings) * (self.cost_data['capex_hex_USD'] / self.total_buildings)
+                required_pipes = self.get_required_pipes_for_clusters((0,))
+                pipe_length_ratio = required_pipes['length_m'].sum() / self.cost_data['network_length_m']
+                pump_capex = self.cost_data['capex_pumps_USD'] * pipe_length_ratio
+                cooling_plant_capex = 0
+                pump_electricity = 0
+                cooling_plant_electricity = 0
+                if self.network_type == 'DC':
+                    cooling_plant_capex = self.cost_data['capex_cooling_plant_USD'] * pipe_length_ratio
+
+            # Calculate total CAPEX
+            total_capex = pipe_capex + hex_capex + pump_capex + cooling_plant_capex
+
+            # Update phase0_result with calculated CAPEX components
+            phase0_result['new_cluster(s)_capex [USD]'] = total_capex
+            phase0_result['cumulative_capex [USD]'] = total_capex
+
+            # Calculate annual O&M costs (2.5% of CAPEX)
+            annual_om_cost = 0.025 * total_capex
+
+            # Update O&M costs
+            phase0_result['new_cluster(s)_om_cost [USD]'] = annual_om_cost
+            phase0_result['cumulative_om_cost [USD]'] = annual_om_cost
 
             # Update cumulative pipe length
             cumulative_pipe_length = pipe_length_recalculated
@@ -2413,7 +3254,7 @@ class DTNExpansionOptimizer:
                 'cumulative_om_cost [USD]': cumulative_om_cost,
                 'ghg_cap [t CO2eq/yr]': self.ghg_budget_per_phase[phase-1] if self.ghg_budget_per_phase and phase-1 < len(self.ghg_budget_per_phase) else 'no_limit',
                 'district_operation_emission [t CO2eq/yr]': district_emissions.get(phase, {}).get('district_operation_emission [t CO2eq/yr]', 0),
-                'district_operation_emission_per_gfa [t CO2eq/yr/m2]': district_emissions.get(phase, {}).get('district_operation_emission_per_gfa [t CO2eq/yr/m2]', 0),
+                'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': district_emissions.get(phase, {}).get('district_operation_emission_per_gfa [kg CO2eq/yr/m2]', 0),
                 'new_cluster(s)_roi [-]': roi,
                 'overall_roi [-]': overall_roi,
                 'new_cluster(s)_npv [USD]': npv,
@@ -2461,7 +3302,7 @@ class DTNExpansionOptimizer:
             'cumulative_om_cost [USD]': sum(result.get('new_cluster(s)_om_cost [USD]', 0) for result in results if result['phase'] != 0),
             'ghg_cap [t CO2eq/yr]': self.ghg_budget_per_phase[-1] if self.ghg_budget_per_phase else '-',
             'district_operation_emission [t CO2eq/yr]': district_emissions.get(self.num_phases, {}).get('district_operation_emission [t CO2eq/yr]', 0),
-            'district_operation_emission_per_gfa [t CO2eq/yr/m2]': district_emissions.get(self.num_phases, {}).get('district_operation_emission_per_gfa [t CO2eq/yr/m2]', 0),
+            'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': district_emissions.get(self.num_phases, {}).get('district_operation_emission_per_gfa [kg CO2eq/yr/m2]', 0),
             'new_cluster(s)_roi [-]': sum(result['new_cluster(s)_roi [-]'] * result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) / sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) if sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) > 0 else 0,
             'new_cluster(s)_npv [USD]': sum(result['new_cluster(s)_npv [USD]'] for result in results if result['phase'] != 0),
             'new_cluster(s)_pipe_length [m]': sum(result.get('new_cluster(s)_pipe_length [m]', result.get('newly_added_pipe_length [m]', 0)) for result in results if result['phase'] != 0),
@@ -2495,7 +3336,7 @@ class DTNExpansionOptimizer:
             summary[f'cumulative_annual_{demand_type} [MWh/yr]'] = phase0_result.get(f'cumulative_annual_{demand_type} [MWh/yr]', 0)
             summary[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = 0
             summary['district_operation_emission [t CO2eq/yr]'] = 0
-            summary['district_operation_emission_per_gfa [t CO2eq/yr/m2]'] = 0
+            summary['district_operation_emission_per_gfa [kg CO2eq/yr/m2]'] = 0
 
         # Calculate average newly connected linear heat density (weighted by pipe length) only if not already set
         if summary[f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]'] == 0:
@@ -3021,6 +3862,15 @@ def main(config):
         multi_objective_functions = None
         if hasattr(config.dtn_expansion_optimization, 'multi_objective_functions') and config.dtn_expansion_optimization.multi_objective_functions:
             multi_objective_functions = config.dtn_expansion_optimization.multi_objective_functions
+            # Parse string into list if necessary
+            if isinstance(multi_objective_functions, str):
+                # Handle both comma-separated and "vs" separated values
+                if "," in multi_objective_functions:
+                    multi_objective_functions = [obj.strip().lower() for obj in multi_objective_functions.split(",") if obj.strip()]
+                elif " vs " in multi_objective_functions:
+                    multi_objective_functions = [obj.strip().lower() for obj in multi_objective_functions.split(" vs ") if obj.strip()]
+                # Log the parsed objectives
+                log().info(f"Using multi-objective functions: {multi_objective_functions}")
 
         # Get population size and number of generations from config
         population_size = config.dtn_expansion_optimization.population_size if hasattr(config.dtn_expansion_optimization, 'population_size') else 50

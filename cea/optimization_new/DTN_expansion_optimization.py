@@ -301,7 +301,7 @@ class DTNExpansionOptimizer:
         multi_objective_mode : bool, optional
             If True, uses multi-objective optimization with selected objectives
         multi_objective_functions : list, optional
-            List of objectives to use for multi-objective optimization. Options are 'NPV', 'ROI', 'emissions', and 'total_capex'
+            List of objectives to use for multi-objective optimization. Options are 'NPV', 'Discounted_ROI', 'emissions', and 'total_capex'
         testing_clusters : list, optional
             List of cluster IDs to include in the optimization (if None, all clusters are included)
         """
@@ -959,6 +959,12 @@ class DTNExpansionOptimizer:
         float
             Total expenditure for the phase (CAPEX + OPEX across all years)
         """
+        # --- phase-0 has no duration: only the (discounted) CAPEX ------------
+        if phase == 0:
+            capex, _ = self._calculate_phase_capex(cluster_set, phase=None)
+            return capex
+        # ---------------------------------------------------------------------
+
         # Calculate CAPEX with interest rate adjustment
         capex, _ = self._calculate_phase_capex(cluster_set, phase)
 
@@ -994,9 +1000,11 @@ class DTNExpansionOptimizer:
 
     def calculate_roi(self, cluster_set, phase):
         """
-        Calculate ROI for a cluster set in a specific phase.
+        Calculate Discounted ROI for a cluster set in a specific phase.
 
-        ROI = net annual return / CAPEX
+        Discounted ROI = present value of net annual returns over phase duration / CAPEX
+
+        This calculation fully discounts all future cash flows to account for the time value of money.
 
         Parameters:
         -----------
@@ -1008,8 +1016,12 @@ class DTNExpansionOptimizer:
         Returns:
         --------
         float
-            Return on Investment (ROI)
+            Discounted Return on Investment (ROI)
         """
+        # For phase 0, return 0 as per requirements
+        if phase == 0:
+            return 0
+
         # Get metrics for this cluster set
         key = '+'.join(map(str, sorted(cluster_set)))
         if key not in self.cluster_metrics:
@@ -1034,9 +1046,18 @@ class DTNExpansionOptimizer:
         # Net annual return
         net_annual_return = annual_revenue - annual_om_cost
 
-        # Calculate ROI (net annual return / CAPEX)
+        # Get the duration of this phase
+        phase_duration = self.phase_durations[phase-1]
+
+        # Calculate present value of net annual returns over the entire phase duration
+        present_value_of_returns = 0
+        for year in range(phase_duration):
+            discount_factor = 1 / ((1 + self.interest_rate) ** (year + 1))
+            present_value_of_returns += net_annual_return * discount_factor
+
+        # Calculate Discounted ROI (present value of net annual returns / CAPEX)
         if capex > 0:
-            roi = net_annual_return / capex
+            roi = present_value_of_returns / capex
         else:
             roi = 0
 
@@ -1060,15 +1081,19 @@ class DTNExpansionOptimizer:
         float
             Net Present Value (NPV)
         """
+        # Calculate CAPEX with interest rate adjustment
+        capex, _ = self._calculate_phase_capex(cluster_set, phase)
+
+        # For phase 0, return negative CAPEX as per requirements
+        if phase == 0:
+            return -capex
+
         # Get metrics for this cluster set
         key = '+'.join(map(str, sorted(cluster_set)))
         if key not in self.cluster_metrics:
             return -float('inf')  # Invalid cluster set
 
         metrics = self.cluster_metrics[key]
-
-        # Calculate CAPEX with interest rate adjustment
-        capex, _ = self._calculate_phase_capex(cluster_set, phase)
 
         # Calculate annual revenue and O&M costs
         if self.network_type == 'DH':
@@ -2230,7 +2255,7 @@ class DTNExpansionOptimizer:
                     'phase': 0,
                     'newly_connected_cluster(s)': '0',
                     'cumulative_cluster(s)': '0',
-                    'new_cluster(s)_roi [-]': 0,  # No ROI for existing DTN
+                    'new_cluster(s)_discounted_roi [-]': 0,  # No ROI for existing DTN
                     'new_cluster(s)_npv [USD]': 0,  # No NPV for existing DTN
                     'new_cluster(s)_capex [USD]': 0,  # No CAPEX for existing DTN
                     'district_operation_emission [t CO2eq/yr]': district_emissions.get(0, {}).get('district_operation_emission [t CO2eq/yr]', 0),
@@ -2317,25 +2342,18 @@ class DTNExpansionOptimizer:
                     'cumulative_cooling_plant_electricity [kWh/yr]': 0  # Will be updated if data is available
                 }
 
-                # Total CAPEX already calculated above
-                total_capex_p0 = pipe_capex + hex_capex + pump_capex + cooling_plant_capex
+                # Total expenditure for phase 0 is just CAPEX (no O&M)
+                total_exp_p0 = self._calculate_phase_total_expenditure((0,), 0)
 
-                # Present-value total expenditure (CAPEX + discounted O&M of phase 0)
-                total_exp_p0 = self._calculate_phase_total_expenditure((0,), 1)
+                # Annual O&M (simple 2.5 % of CAPEX) - set to 0 for phase 0
+                annual_om_p0 = 0
 
-                # Annual O&M (simple 2.5 % of CAPEX)
-                annual_om_p0 = 0.025 * total_capex_p0
+                # For phase 0, revenue should be 0 (no duration, so no "annual demand" and "heat sales")
+                annual_rev_p0 = 0
 
-                # Annual revenue of cluster 0
-                if self.network_type == 'DH':
-                    demand_kwh = annual_demand * 1000  # MWh → kWh
-                else:
-                    demand_kwh = annual_demand * 1000
-                annual_rev_p0 = demand_kwh * self.energy_price
-
-                # One-phase ROI and NPV
-                roi_p0 = self.calculate_roi((0,), 1)
-                npv_p0 = self.calculate_npv((0,), 1)
+                # One-phase ROI and NPV - for phase 0, ROI=0 and NPV=-CAPEX
+                roi_p0 = self.calculate_roi((0,), 0)
+                npv_p0 = self.calculate_npv((0,), 0)
 
                 # Write back into the dictionary
                 phase0_result.update({
@@ -2345,8 +2363,8 @@ class DTNExpansionOptimizer:
                     'cumulative_revenue [USD]': annual_rev_p0,
                     'new_cluster(s)_om_cost [USD]': annual_om_p0,
                     'cumulative_om_cost [USD]': annual_om_p0,
-                    'new_cluster(s)_roi [-]': roi_p0,
-                    'overall_roi [-]': roi_p0,
+                    'new_cluster(s)_discounted_roi [-]': roi_p0,
+                    'overall_discounted_roi [-]': roi_p0,
                     'new_cluster(s)_npv [USD]': npv_p0,
                     'overall_npv [USD]': npv_p0,
                 })
@@ -2427,6 +2445,9 @@ class DTNExpansionOptimizer:
 
                 # Assign the calculated total CAPEX
                 phase0_result['cumulative_total_capex [USD]'] = cumulative_total_capex
+
+                # Set total_capex_p0 for use elsewhere in the code
+                total_capex_p0 = cumulative_total_capex
 
                 # Debug logging to verify the calculation
                 log().debug(
@@ -2583,7 +2604,7 @@ class DTNExpansionOptimizer:
                         'newly_connected_cluster(s)': '+'.join(map(str, newly_connected)) if newly_connected else 'none',
                         'cumulative_cluster(s)': '+'.join(map(str, [0] + cumulative_clusters)),
 
-                        'new_cluster(s)_roi [-]': original_result.get(f'phase_{phase_num}_roi', 0),
+                        'new_cluster(s)_discounted_roi [-]': original_result.get(f'phase_{phase_num}_roi', 0),
                         'new_cluster(s)_npv [USD]': original_result.get(f'phase_{phase_num}_npv', 0),
                         'new_cluster(s)_capex [USD]': original_result.get(f'phase_{phase_num}_capex', 0),
                         'district_operation_emission [t CO2eq/yr]':
@@ -2867,7 +2888,7 @@ class DTNExpansionOptimizer:
             'new_cluster(s)_pipe_length [m]', 'cumulative_pipe_length [m]',
             f'new_cluster(s)_annual_{demand_type} [MWh/yr]', f'cumulative_annual_{demand_type} [MWh/yr]',
             f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]', f'overall_linear_{demand_type}_density [MWh/km/yr]',
-            'new_cluster(s)_roi [-]', 'overall_roi [-]',
+            'new_cluster(s)_discounted_roi [-]', 'overall_discounted_roi [-]',
             'new_cluster(s)_npv [USD]', 'overall_npv [USD]',
             'district_operation_emission [t CO2eq/yr]',
             'individual'
@@ -2910,7 +2931,7 @@ class DTNExpansionOptimizer:
                     lambda x: round(x, 2) if isinstance(x, (int, float)) and not pd.isna(x) else x)
 
         # 4 decimal places
-        decimal4_columns = [col for col in detailed_results_df.columns if 'roi [-]' in col]
+        decimal4_columns = [col for col in detailed_results_df.columns if 'discounted_roi [-]' in col]
         for col in decimal4_columns:
             if col in detailed_results_df.columns:
                 detailed_results_df[col] = detailed_results_df[col].apply(
@@ -3091,8 +3112,8 @@ class DTNExpansionOptimizer:
             'ghg_cap [t CO2eq/yr]': '-',  # No GHG cap for existing DTN
             'district_operation_emission [t CO2eq/yr]': district_emissions.get(0, {}).get('district_operation_emission [t CO2eq/yr]', 0),
             'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': district_emissions.get(0, {}).get('district_operation_emission_per_gfa [kg CO2eq/yr/m2]', 0),
-            'new_cluster(s)_roi [-]': 0,  # Will be calculated if data is available
-            'overall_roi [-]': 0,  # Will be calculated if data is available
+            'new_cluster(s)_discounted_roi [-]': 0,  # Will be calculated if data is available
+            'overall_discounted_roi [-]': 0,  # Will be calculated if data is available
             'new_cluster(s)_npv [USD]': 0,  # Will be calculated if data is available
             'overall_npv [USD]': 0,  # Will be calculated if data is available
             'new_cluster(s)_pipe_length [m]': 0,  # No new pipes for existing DTN
@@ -3157,43 +3178,30 @@ class DTNExpansionOptimizer:
             phase0_result['new_cluster(s)_capex [USD]'] = total_capex_p0
             phase0_result['cumulative_capex [USD]'] = total_capex_p0
 
-            # Present-value expenditure (CAPEX + discounted OPEX of phase 0)
-            total_expend_p0 = self._calculate_phase_total_expenditure((0,), 1)
+            # Total expenditure for phase 0 is just CAPEX (no O&M)
+            total_expend_p0 = self._calculate_phase_total_expenditure((0,), 0)
             phase0_result['new_cluster(s)_total_expenditure [USD]'] = total_expend_p0
             phase0_result['cumulative_total_expenditure [USD]'] = total_expend_p0
 
-            # Calculate annual revenue (energy price * annual demand)
-            if self.network_type == 'DH':
-                annual_demand_kwh = metrics.get('total_annual_Qh_MWh', 0) * 1000  # Convert MWh to kWh
-            else:
-                annual_demand_kwh = metrics.get('total_annual_Qc_MWh', 0) * 1000  # Convert MWh to kWh
-            annual_revenue = annual_demand_kwh * self.energy_price
+            # For phase 0, revenue should be 0 (no duration, so no "annual demand" and "heat sales")
+            annual_revenue = 0
 
-            # Calculate phase duration
-            phase_duration = self.phase_durations[0]  # Phase 0 duration is the same as phase 1
+            # Set revenue to 0 for phase 0
+            phase0_result['new_cluster(s)_revenue [USD]'] = annual_revenue
+            phase0_result['cumulative_revenue [USD]'] = annual_revenue
 
-            # Calculate present value of revenue for all years in the phase
-            total_revenue = 0
-            for year in range(phase_duration):
-                discount_factor = 1 / ((1 + self.interest_rate) ** (year + 1))
-                total_revenue += annual_revenue * discount_factor
-
-            # Update revenue
-            phase0_result['new_cluster(s)_revenue [USD]'] = total_revenue
-            phase0_result['cumulative_revenue [USD]'] = total_revenue
-
-            # Calculate ROI and NPV for phase 0
-            roi_p0 = self.calculate_roi((0,), 1)  # Use phase 1 for calculation
-            npv_p0 = self.calculate_npv((0,), 1)  # Use phase 1 for calculation
+            # Calculate ROI and NPV for phase 0 - for phase 0, ROI=0 and NPV=-CAPEX
+            roi_p0 = self.calculate_roi((0,), 0)
+            npv_p0 = self.calculate_npv((0,), 0)
 
             # Update ROI and NPV
-            phase0_result['new_cluster(s)_roi [-]'] = roi_p0
-            phase0_result['overall_roi [-]'] = roi_p0
+            phase0_result['new_cluster(s)_discounted_roi [-]'] = roi_p0
+            phase0_result['overall_discounted_roi [-]'] = roi_p0
             phase0_result['new_cluster(s)_npv [USD]'] = npv_p0
             phase0_result['overall_npv [USD]'] = npv_p0
 
-            # Calculate annual O&M costs (2.5% of CAPEX)
-            annual_om_cost = 0.025 * total_capex
+            # For phase 0, O&M costs are set to 0
+            annual_om_cost = 0
 
             # Update O&M costs
             phase0_result['new_cluster(s)_om_cost [USD]'] = annual_om_cost
@@ -3268,9 +3276,9 @@ class DTNExpansionOptimizer:
 
             # Calculate overall ROI (weighted by CAPEX)
             if overall_capex > 0:
-                overall_roi = sum(r['new_cluster(s)_roi [-]'] * r['new_cluster(s)_capex [USD]']
-                                  for r in results) / \
-                              sum(r['new_cluster(s)_capex [USD]'] for r in results)
+                # Include current phase in the calculation
+                overall_roi = (sum(r['new_cluster(s)_discounted_roi [-]'] * r['new_cluster(s)_capex [USD]'] for r in results) + roi * capex) / \
+                              (sum(r['new_cluster(s)_capex [USD]'] for r in results) + capex)
             else:
                 overall_roi = 0
 
@@ -3330,8 +3338,8 @@ class DTNExpansionOptimizer:
                 'ghg_cap [t CO2eq/yr]': self.ghg_budget_per_phase[phase-1] if self.ghg_budget_per_phase and phase-1 < len(self.ghg_budget_per_phase) else 'no_limit',
                 'district_operation_emission [t CO2eq/yr]': district_emissions.get(phase, {}).get('district_operation_emission [t CO2eq/yr]', 0),
                 'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': district_emissions.get(phase, {}).get('district_operation_emission_per_gfa [kg CO2eq/yr/m2]', 0),
-                'new_cluster(s)_roi [-]': roi,
-                'overall_roi [-]': overall_roi,
+                'new_cluster(s)_discounted_roi [-]': roi,
+                'overall_discounted_roi [-]': overall_roi,
                 'new_cluster(s)_npv [USD]': npv,
                 'overall_npv [USD]': overall_npv,
                 'new_cluster(s)_pipe_length [m]': pipe_length,
@@ -3348,7 +3356,7 @@ class DTNExpansionOptimizer:
         # The final overall ROI is in the last phase's result
         if results and any(r['phase'] != 0 for r in results):
             last_phase_result = [r for r in results if r['phase'] != 0][-1]
-            final_overall_roi = last_phase_result['overall_roi [-]']
+            final_overall_roi = last_phase_result['overall_discounted_roi [-]']
         else:
             final_overall_roi = 0
 
@@ -3378,7 +3386,7 @@ class DTNExpansionOptimizer:
             'ghg_cap [t CO2eq/yr]': self.ghg_budget_per_phase[-1] if self.ghg_budget_per_phase else '-',
             'district_operation_emission [t CO2eq/yr]': district_emissions.get(self.num_phases, {}).get('district_operation_emission [t CO2eq/yr]', 0),
             'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': district_emissions.get(self.num_phases, {}).get('district_operation_emission_per_gfa [kg CO2eq/yr/m2]', 0),
-            'new_cluster(s)_roi [-]': sum(result['new_cluster(s)_roi [-]'] * result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) / sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) if sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) > 0 else 0,
+            'new_cluster(s)_discounted_roi [-]': sum(result['new_cluster(s)_discounted_roi [-]'] * result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) / sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) if sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) > 0 else 0,
             'new_cluster(s)_npv [USD]': sum(result['new_cluster(s)_npv [USD]'] for result in results if result['phase'] != 0),
             'new_cluster(s)_pipe_length [m]': sum(result.get('new_cluster(s)_pipe_length [m]', result.get('newly_added_pipe_length [m]', 0)) for result in results if result['phase'] != 0),
             f'new_cluster(s)_annual_{demand_type} [MWh/yr]': sum(result.get(f'new_cluster(s)_annual_{demand_type} [MWh/yr]', 0) for result in results if result['phase'] != 0),
@@ -3394,7 +3402,7 @@ class DTNExpansionOptimizer:
             summary['cumulative_number_of_buildings_connected'] = last_phase_result['cumulative_number_of_buildings_connected']
             summary['cumulative_capex [USD]'] = last_phase_result['cumulative_capex [USD]']
             summary['cumulative_total_expenditure [USD]'] = last_phase_result['cumulative_total_expenditure [USD]']
-            summary['overall_roi [-]'] = final_overall_roi  # Already set to last phase value
+            summary['overall_discounted_roi [-]'] = final_overall_roi  # Already set to last phase value
             summary['overall_npv [USD]'] = last_phase_result['overall_npv [USD]']
             summary['cumulative_pipe_length [m]'] = last_phase_result['cumulative_pipe_length [m]']
             summary[f'cumulative_annual_{demand_type} [MWh/yr]'] = last_phase_result[f'cumulative_annual_{demand_type} [MWh/yr]']
@@ -3405,7 +3413,7 @@ class DTNExpansionOptimizer:
             summary['cumulative_number_of_buildings_connected'] = len(cumulative_buildings)
             summary['cumulative_capex [USD]'] = 0
             summary['cumulative_total_expenditure [USD]'] = 0
-            summary['overall_roi [-]'] = 0
+            summary['overall_discounted_roi [-]'] = 0
             summary['overall_npv [USD]'] = 0
             summary['cumulative_pipe_length [m]'] = cumulative_pipe_length
             summary[f'cumulative_annual_{demand_type} [MWh/yr]'] = phase0_result.get(f'cumulative_annual_{demand_type} [MWh/yr]', 0)
@@ -3476,7 +3484,7 @@ class DTNExpansionOptimizer:
                 results_df[col] = results_df[col].apply(lambda x: round(x, 2) if isinstance(x, (int, float)) and not pd.isna(x) else x)
 
         # 4 decimal places
-        decimal4_columns = [col for col in results_df.columns if 'roi [-]' in col]
+        decimal4_columns = [col for col in results_df.columns if 'discounted_roi [-]' in col]
         for col in decimal4_columns:
             if col in results_df.columns:
                 results_df[col] = results_df[col].apply(lambda x: round(x, 4) if isinstance(x, (int, float)) and not pd.isna(x) else x)

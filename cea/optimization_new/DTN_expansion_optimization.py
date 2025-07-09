@@ -1606,13 +1606,14 @@ class DTNExpansionOptimizer:
                   fontsize=14, fontweight='bold')
         plt.legend(loc='best')
 
-        # Save figure
-        plot_file = output_dir / f"dtn_expansion_opt_pareto_plot_{self.network_type}.png"
-        plt.savefig(plot_file, dpi=300, bbox_inches='tight')
-        plt.close()
-
-        # For 2D plots, also create a version with the 3rd objective as color/size if available
+        # Save figure with appropriate name based on number of objectives
         if len(objectives) == 3:
+            # For 3D plots, use "3d" in the filename
+            plot_file_3d = output_dir / f"dtn_expansion_opt_pareto_plot_3d_{self.network_type}.png"
+            plt.savefig(plot_file_3d, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            # Also create a 2D version with the 3rd objective as color/size as a secondary visualization
             fig = plt.figure(figsize=(10, 8))
             ax = fig.add_subplot(111)
 
@@ -1682,7 +1683,14 @@ class DTNExpansionOptimizer:
             plt.savefig(plot_file_2d, dpi=300, bbox_inches='tight')
             plt.close()
 
-        return plot_file
+            # Return the 3D plot file path for 3 objectives
+            return plot_file_3d
+        else:
+            # For 2D plots, use the generic filename
+            plot_file = output_dir / f"dtn_expansion_opt_pareto_plot_{self.network_type}.png"
+            plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+            plt.close()
+            return plot_file
 
     def calculate_ghg_emissions(self, cluster_set):
         """

@@ -8,6 +8,7 @@ import io
 import logging
 import os
 import shutil
+import sys
 import time
 import pandas as pd
 import numpy as np
@@ -20,9 +21,59 @@ from cea.optimization_new.DTN_expansion_optimization import DTNExpansionOptimize
 from cea.technologies.thermal_network.thermal_network import main as thermal_network_simulation_main
 from cea.technologies.thermal_network_costs.thermal_network_costs_new import main as thermal_network_costs_main
 
+###############################################################################
+# 2) CUSTOM INPUTLOCATOR                                                     #
+###############################################################################
+
+class ModifiedDemandsLocator(cea.inputlocator.InputLocator):
+    """A custom InputLocator that redirects demand file requests to modified versions."""
+
+    def __init__(self, locator, modified_demand_files):
+        """
+        Initialize with the original locator and a mapping of modified files.
+
+        Args:
+            locator: The original InputLocator
+            modified_demand_files: Dictionary mapping building names to modified file paths
+        """
+        # Copy all attributes from the original locator
+        self.__dict__.update(locator.__dict__)
+        self.original_locator = locator
+        self.modified_demand_files = modified_demand_files
+
+    def get_demand_results_file(self, building, format='csv'):
+        """
+        Override to return the path to the modified demand file if available.
+
+        Args:
+            building: Building name
+            format: File format (default: 'csv')
+
+        Returns:
+            Path to the modified demand file if available, otherwise the original path
+        """
+        if building in self.modified_demand_files:
+            return self.modified_demand_files[building]['modified']
+        else:
+            return self.original_locator.get_demand_results_file(building, format)
+
 __author__ = "Fan Ut Chang"
 __copyright__ = "Copyright 2025, City Energy Analyst"
 __license__ = "MIT"
+
+###############################################################################
+# 3) LOGGING                                                                 #
+###############################################################################
+
+def log() -> logging.Logger:
+    """Configure and return a logger for the dynamic DTN optimization module."""
+    lg = logging.getLogger("cea.dynamic_dtn_optimization")
+    if not lg.handlers:
+        # Configure logging to output to console
+        logging.basicConfig(level=logging.INFO,
+                           format="%(asctime)s | %(levelname)5s | %(message)s",
+                           datefmt="%H:%M:%S")
+    return lg
 
 def parse_args():
     """Parse command line arguments."""
@@ -54,8 +105,17 @@ class DynamicDTNOptimizer:
         self.electricity_reduction = config.dynamic_dtn_optimization.electricity_demand_reduction / 100.0  # Convert percentage to fraction
         self.num_last_clusters = config.dynamic_dtn_optimization.num_last_clusters
 
+        # Get testing clusters from config if available
+        self.testing_clusters = None
+        if hasattr(config.dtn_expansion_optimization, 'testing_clusters') and config.dtn_expansion_optimization.testing_clusters:
+            # Convert string to list of integers if needed
+            if isinstance(config.dtn_expansion_optimization.testing_clusters, str):
+                self.testing_clusters = [int(c.strip()) for c in config.dtn_expansion_optimization.testing_clusters.split(',') if c.strip()]
+            else:
+                self.testing_clusters = config.dtn_expansion_optimization.testing_clusters
+
         # Set up logging
-        self.logger = logging.getLogger(__name__)
+        self.logger = log()
         self.logger.info("Initializing Dynamic DTN Optimization module")
 
     def check_dtn_optimization_results(self):
@@ -68,6 +128,7 @@ class DynamicDTNOptimizer:
         """
         # Get the path to the DTN expansion optimization results folder
         results_folder = Path(self.locator.get_dtn_expansion_optimization_results_folder())
+        self.logger.info(f"Checking for DTN expansion optimization results in: {results_folder}")
 
         # Check if the folder exists
         if not results_folder.exists():
@@ -80,6 +141,7 @@ class DynamicDTNOptimizer:
             self.logger.error(f"DTN expansion optimization results file not found: {results_file}")
             return False, None
 
+        self.logger.info(f"DTN expansion optimization results found: {results_file}")
         return True, str(results_file)
 
     def load_original_optimization_results(self, results_file):
@@ -97,13 +159,28 @@ class DynamicDTNOptimizer:
         # Load the results file
         results_df = pd.read_csv(results_file)
 
+        # Also load the optimization settings file to get testing_clusters if available
+        results_folder = Path(self.locator.get_dtn_expansion_optimization_results_folder())
+        settings_file = results_folder / "optimization_settings.csv"
+        if settings_file.exists():
+            try:
+                settings_df = pd.read_csv(settings_file)
+                if 'testing_clusters' in settings_df.columns and not pd.isna(settings_df['testing_clusters'].iloc[0]):
+                    testing_clusters_str = settings_df['testing_clusters'].iloc[0]
+                    self.testing_clusters = [int(c.strip()) for c in testing_clusters_str.split(',') if c.strip()]
+                    self.logger.info(f"Loaded testing clusters from optimization settings: {self.testing_clusters}")
+            except Exception as e:
+                self.logger.warning(f"Error loading testing clusters from optimization settings: {e}")
+
         # Find the best solution (highest fitness for the objective function)
         if 'fitness_NPV' in results_df.columns:
             # For NPV objective, higher is better
             best_row = results_df.loc[results_df['fitness_NPV'].idxmax()]
+            self.logger.info(f"Found optimal solution with highest NPV: {best_row['fitness_NPV']}")
         elif 'fitness_ROI' in results_df.columns:
             # For ROI objective, higher is better
             best_row = results_df.loc[results_df['fitness_ROI'].idxmax()]
+            self.logger.info(f"Found optimal solution with highest ROI: {best_row['fitness_ROI']}")
         else:
             # If neither NPV nor ROI is found, use the first row
             self.logger.warning("Could not find NPV or ROI fitness values in results. Using first solution.")
@@ -111,7 +188,16 @@ class DynamicDTNOptimizer:
 
         # Extract the genome (connection sequence)
         genome_str = best_row['genome']
-        genome = eval(genome_str)  # Convert string representation to list
+        self.logger.info(f"Extracting optimal genome from solution with ID: {best_row['individual_id']}")
+
+        # Check if genome_str is already a list or needs conversion
+        if isinstance(genome_str, list):
+            genome = genome_str
+        else:
+            # Convert string representation to list
+            genome = eval(genome_str)  # Convert string representation to list
+
+        self.logger.info(f"Optimal genome extracted: {genome}")
 
         # Create a solution dictionary similar to what DTNExpansionOptimizer.optimize() would return
         solution = {
@@ -150,15 +236,24 @@ class DynamicDTNOptimizer:
 
         # Get the genome (connection sequence)
         genome = results['genome']
+        self.logger.info(f"Genome: {genome}")
+        self.logger.info(f"Testing clusters: {self.testing_clusters}")
 
         # Get all clusters that are connected (phase > 0)
         connected_clusters = []
         for i, phase in enumerate(genome):
             if phase > 0:  # Skip unconnected clusters (phase 0)
-                connected_clusters.append((i, phase))  # (cluster_id, phase)
+                # Map genome index to actual cluster ID if testing_clusters is available
+                if self.testing_clusters and i < len(self.testing_clusters):
+                    cluster_id = self.testing_clusters[i]
+                else:
+                    cluster_id = i + 1  # Use 1-based indexing for cluster IDs
+                connected_clusters.append((cluster_id, phase))  # (cluster_id, phase)
+                self.logger.info(f"Cluster {cluster_id} is connected in phase {phase}")
 
         # Sort by phase (descending) to get the last connected clusters
         connected_clusters.sort(key=lambda x: x[1], reverse=True)
+        self.logger.info(f"Connected clusters sorted by phase (descending): {connected_clusters}")
 
         # Get the last N clusters
         last_clusters = [cluster_id for cluster_id, _ in connected_clusters[:self.num_last_clusters]]
@@ -190,12 +285,12 @@ class DynamicDTNOptimizer:
             self.logger.error(f"Cluster assignment file not found: {cluster_assignment_file}")
             raise FileNotFoundError(f"Cluster assignment file not found: {cluster_assignment_file}")
 
-        # Convert back to string with proper escaping
-        cluster_assignment_file_str = str(cluster_assignment_file).replace('\\', '/')
+        # Use os.path.normpath to ensure the path is properly formatted for the current OS
+        cluster_assignment_file_str = os.path.normpath(str(cluster_assignment_file))
         self.logger.info(f"Reading cluster assignment file from: {cluster_assignment_file_str}")
 
         try:
-            # Read the file using the string representation of the path
+            # Read the file using the normalized path
             cluster_df = pd.read_csv(cluster_assignment_file_str)
         except Exception as e:
             self.logger.error(f"Error reading cluster assignment file: {e}")
@@ -213,7 +308,7 @@ class DynamicDTNOptimizer:
         # Get all buildings in the last clusters
         buildings_to_modify = []
         for cluster_id in last_clusters:
-            cluster_buildings = cluster_df[cluster_df['cluster_id'] == cluster_id]['building_name'].tolist()
+            cluster_buildings = cluster_df[cluster_df['cluster'] == cluster_id]['name'].tolist()
             buildings_to_modify.extend(cluster_buildings)
 
         self.logger.info(f"Buildings to modify: {buildings_to_modify}")
@@ -239,12 +334,12 @@ class DynamicDTNOptimizer:
                 self.logger.error(f"Demand results file not found for building {building}: {original_demand_file}")
                 raise FileNotFoundError(f"Demand results file not found for building {building}: {original_demand_file}")
 
-            # Convert back to string with proper escaping
-            original_demand_file_str = str(original_demand_file).replace('\\', '/')
+            # Use os.path.normpath to ensure the path is properly formatted for the current OS
+            original_demand_file_str = os.path.normpath(str(original_demand_file))
             self.logger.info(f"Reading demand results file from: {original_demand_file_str}")
 
             try:
-                # Read the file using the string representation of the path
+                # Read the file using the normalized path
                 demand_df = pd.read_csv(original_demand_file_str)
             except Exception as e:
                 self.logger.error(f"Error reading demand results file for building {building}: {e}")
@@ -260,33 +355,84 @@ class DynamicDTNOptimizer:
 
             # Apply reductions to the demand
             if self.heating_reduction > 0:
-                heating_columns = [col for col in demand_df.columns if 'QH' in col]
-                for col in heating_columns:
+                self.logger.info(f"Applying {self.heating_reduction*100}% heating demand reduction to building {building}")
+                # Space heating related columns
+                heating_patterns = ['QH', 'Qhs', 'hs_', '_hs']
+                heating_columns = []
+                for pattern in heating_patterns:
+                    pattern_columns = [col for col in demand_df.columns if pattern in col]
+                    heating_columns.extend(pattern_columns)
+                    self.logger.debug(f"Found {len(pattern_columns)} columns matching pattern '{pattern}'")
+
+                # Exclude DHW columns if they were caught by the patterns
+                heating_columns = [col for col in heating_columns if 'ww' not in col.lower() and 'hw' not in col.lower()]
+                unique_heating_columns = set(heating_columns)
+                self.logger.info(f"Identified {len(unique_heating_columns)} unique heating columns to modify: {', '.join(sorted(unique_heating_columns))}")
+
+                # Apply reduction to all heating columns
+                for col in set(heating_columns):  # Use set to remove duplicates
                     demand_df[col] = demand_df[col] * (1 - self.heating_reduction)
 
             if self.cooling_reduction > 0:
-                cooling_columns = [col for col in demand_df.columns if 'QC' in col]
-                for col in cooling_columns:
+                self.logger.info(f"Applying {self.cooling_reduction*100}% cooling demand reduction to building {building}")
+                # Space cooling related columns
+                cooling_patterns = ['QC', 'Qc', 'cs_', '_cs', 'cdata', 'cre']
+                cooling_columns = []
+                for pattern in cooling_patterns:
+                    pattern_columns = [col for col in demand_df.columns if pattern in col]
+                    cooling_columns.extend(pattern_columns)
+                    self.logger.debug(f"Found {len(pattern_columns)} columns matching pattern '{pattern}'")
+
+                # Apply reduction to all cooling columns
+                unique_cooling_columns = set(cooling_columns)
+                self.logger.info(f"Identified {len(unique_cooling_columns)} unique cooling columns to modify: {', '.join(sorted(unique_cooling_columns))}")
+                for col in set(cooling_columns):  # Use set to remove duplicates
                     demand_df[col] = demand_df[col] * (1 - self.cooling_reduction)
 
             if self.dhw_reduction > 0:
-                dhw_columns = [col for col in demand_df.columns if 'QHW' in col]
-                for col in dhw_columns:
+                self.logger.info(f"Applying {self.dhw_reduction*100}% DHW demand reduction to building {building}")
+                # DHW related columns
+                dhw_patterns = ['QHW', 'Qww', 'ww_', '_ww']
+                dhw_columns = []
+                for pattern in dhw_patterns:
+                    pattern_columns = [col for col in demand_df.columns if pattern in col]
+                    dhw_columns.extend(pattern_columns)
+                    self.logger.debug(f"Found {len(pattern_columns)} columns matching pattern '{pattern}'")
+
+                # Apply reduction to all DHW columns
+                unique_dhw_columns = set(dhw_columns)
+                self.logger.info(f"Identified {len(unique_dhw_columns)} unique DHW columns to modify: {', '.join(sorted(unique_dhw_columns))}")
+                for col in set(dhw_columns):  # Use set to remove duplicates
                     demand_df[col] = demand_df[col] * (1 - self.dhw_reduction)
 
             if self.electricity_reduction > 0:
-                elec_columns = [col for col in demand_df.columns if 'E' in col]
-                for col in elec_columns:
+                self.logger.info(f"Applying {self.electricity_reduction*100}% electricity demand reduction to building {building}")
+                # Electricity related columns
+                elec_patterns = ['E_', 'Ea', 'Eve', 'GRID']
+                elec_columns = []
+                for pattern in elec_patterns:
+                    pattern_columns = [col for col in demand_df.columns if pattern in col]
+                    elec_columns.extend(pattern_columns)
+                    self.logger.debug(f"Found {len(pattern_columns)} columns matching pattern '{pattern}'")
+
+                # Exclude PV generation columns
+                elec_columns = [col for col in elec_columns if 'PV' not in col]
+                unique_elec_columns = set(elec_columns)
+                self.logger.info(f"Identified {len(unique_elec_columns)} unique electricity columns to modify (excluding PV generation): {', '.join(sorted(unique_elec_columns))}")
+
+                # Apply reduction to all electricity columns
+                for col in set(elec_columns):  # Use set to remove duplicates
                     demand_df[col] = demand_df[col] * (1 - self.electricity_reduction)
 
             # Save the modified demand file
             modified_demand_file = modified_demand_dir / f"{building}.csv"
-            modified_demand_file_str = str(modified_demand_file).replace('\\', '/')
+            modified_demand_file_str = os.path.normpath(str(modified_demand_file))
             self.logger.info(f"Saving modified demand file to: {modified_demand_file_str}")
 
             try:
-                # Save the file using the string representation of the path
+                # Save the file using the normalized path
                 demand_df.to_csv(modified_demand_file_str, index=False)
+                self.logger.info(f"Successfully saved modified demand file for building {building}")
             except Exception as e:
                 self.logger.error(f"Error saving modified demand file for building {building}: {e}")
                 # Try alternative approach
@@ -294,6 +440,7 @@ class DynamicDTNOptimizer:
                 try:
                     with open(modified_demand_file_str, 'w') as f:
                         demand_df.to_csv(f, index=False)
+                    self.logger.info(f"Successfully saved modified demand file using alternative approach")
                 except Exception as e2:
                     self.logger.error(f"Alternative approach also failed: {e2}")
                     raise
@@ -303,9 +450,76 @@ class DynamicDTNOptimizer:
                 'original': original_demand_file_str,
                 'modified': modified_demand_file_str
             }
+            self.logger.debug(f"Added mapping for building {building} to modified_demand_files dictionary")
 
         self.modified_demand_files = modified_demand_files
+        self.logger.info(f"Completed demand modifications for all {len(buildings_to_modify)} buildings in the last clusters")
         return modified_demand_files
+
+    def _create_config_copy(self):
+        """
+        Create a new configuration object with the same settings as the existing one.
+
+        Returns:
+            A new Configuration object
+        """
+        # Get the state of the current config object
+        config_state = self.config.__getstate__()
+
+        # Create a new config object
+        new_config = cea.config.Configuration()
+
+        # Set the state of the new config object to match the current one
+        new_config.__setstate__(config_state)
+
+        return new_config
+
+    def _copy_thermal_network_results(self):
+        """
+        Copy thermal network results from the default locations to the dynamic DTN optimization folder.
+        """
+        self.logger.info("Copying thermal network results to dynamic DTN optimization folder")
+
+        # Create a directory for thermal network results
+        tn_results_dir = Path(self.locator.get_optimization_results_folder()) / "dynamic_dtn_optimization" / "thermal_network"
+        tn_results_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get the default thermal network folder
+        default_tn_folder = Path(self.locator.get_thermal_network_folder())
+
+        # Copy relevant files
+        # 1. Network costs file
+        costs_file = self.locator.get_network_layout_costs_file(self.network_type)
+        if os.path.exists(costs_file):
+            shutil.copy2(costs_file, tn_results_dir / f"{self.network_type}_costs.csv")
+
+        # 2. Edge mass flow file
+        edge_massflow_file = self.locator.get_thermal_network_layout_massflow_edges_file(self.network_type, '')
+        if os.path.exists(edge_massflow_file):
+            shutil.copy2(edge_massflow_file, tn_results_dir / os.path.basename(edge_massflow_file))
+
+        # 3. Node mass flow file
+        node_massflow_file = self.locator.get_thermal_network_layout_massflow_nodes_file(self.network_type, '')
+        if os.path.exists(node_massflow_file):
+            shutil.copy2(node_massflow_file, tn_results_dir / os.path.basename(node_massflow_file))
+
+        # 4. Edge list file
+        edge_list_file = self.locator.get_thermal_network_edge_list_file(self.network_type, '')
+        if os.path.exists(edge_list_file):
+            shutil.copy2(edge_list_file, tn_results_dir / os.path.basename(edge_list_file))
+
+        # 5. Node types file
+        node_types_file = self.locator.get_thermal_network_node_types_csv_file(self.network_type, '')
+        if os.path.exists(node_types_file):
+            shutil.copy2(node_types_file, tn_results_dir / os.path.basename(node_types_file))
+
+        # 6. Edge-node matrix file
+        edge_node_file = self.locator.get_thermal_network_edge_node_matrix_file(self.network_type, '')
+        if os.path.exists(edge_node_file):
+            shutil.copy2(edge_node_file, tn_results_dir / os.path.basename(edge_node_file))
+
+        self.logger.info(f"Thermal network results copied to {tn_results_dir}")
+        return tn_results_dir
 
     def rerun_thermal_network_simulation(self):
         """
@@ -314,23 +528,37 @@ class DynamicDTNOptimizer:
         self.logger.info("Rerunning thermal network simulation with modified demands")
 
         # Create a copy of the config for the thermal network simulation
-        tn_config = self.config.copy()
+        tn_config = self._create_config_copy()
         tn_config.thermal_network.network_type = self.network_type
+        self.logger.info(f"Created configuration copy for thermal network simulation with network type: {self.network_type}")
 
-        # Temporarily replace the original demand files with modified ones
-        self._replace_demand_files(use_modified=True)
+        # Create a custom locator that points to the modified demand files
+        # Note: This locator is not currently being used because the thermal_network_simulation_main and
+        # thermal_network_costs_main functions don't accept a locator parameter. Instead, they create
+        # their own locators from the config object.
+        self.logger.info("Creating custom locator that points to modified demand files")
+        modified_locator = ModifiedDemandsLocator(self.locator, self.modified_demand_files)
 
-        try:
-            # Run the thermal network simulation
-            thermal_network_simulation_main(tn_config)
+        # Run the thermal network simulation
+        self.logger.info("Starting thermal network simulation (Part 2)")
+        # Set the scenario in the config to use the modified demand files
+        tn_config.scenario = self.config.scenario
+        thermal_network_simulation_main(tn_config)
+        self.logger.info("Thermal network simulation (Part 2) completed successfully")
 
-            # Run the thermal network costs calculation
-            tnc_config = self.config.copy()
-            tnc_config.thermal_network_costs.network_type = self.network_type
-            thermal_network_costs_main(tnc_config)
-        finally:
-            # Restore the original demand files
-            self._replace_demand_files(use_modified=False)
+        # Run the thermal network costs calculation
+        self.logger.info("Starting thermal network costs calculation (Part 3)")
+        tnc_config = self._create_config_copy()
+        tnc_config.thermal_network_costs.network_type = self.network_type
+        # Set the scenario in the config to use the modified demand files
+        tnc_config.scenario = self.config.scenario
+        thermal_network_costs_main(tnc_config)
+        self.logger.info("Thermal network costs calculation (Part 3) completed successfully")
+
+        # Copy the thermal network results to the dynamic DTN optimization folder
+        self.logger.info("Copying thermal network results to dedicated folder")
+        self.tn_results_dir = self._copy_thermal_network_results()
+        self.logger.info(f"Thermal network results saved to: {self.tn_results_dir}")
 
     def rerun_dtn_optimization(self):
         """
@@ -342,52 +570,55 @@ class DynamicDTNOptimizer:
         self.logger.info("Rerunning DTN expansion optimization with modified demands")
 
         # Create a copy of the config for the new optimization
-        new_config = self.config.copy()
+        new_config = self._create_config_copy()
+        self.logger.info(f"Created configuration copy for DTN expansion optimization")
 
-        # Temporarily replace the original demand files with modified ones
-        self._replace_demand_files(use_modified=True)
+        # Create a custom locator that points to the modified demand files
+        self.logger.info("Creating custom locator that points to modified demand files")
+        modified_locator = ModifiedDemandsLocator(self.locator, self.modified_demand_files)
 
-        try:
-            # Run the new DTN optimization
-            optimizer = DTNExpansionOptimizer(
-                locator=self.locator,
-                network_type=self.network_type,
-                metrics_df=None,  # This will be loaded by the optimizer
-                num_phases=new_config.dtn_expansion_optimization.num_phases,
-                phase_durations=self._parse_list_param(new_config.dtn_expansion_optimization.phase_durations),
-                capex_budget_per_phase=self._parse_list_param(new_config.dtn_expansion_optimization.capex_budget_per_phase),
-                total_expenditure_budget_per_phase=self._parse_list_param(new_config.dtn_expansion_optimization.total_expenditure_budget_per_phase),
-                interest_rate=new_config.dtn_expansion_optimization.interest_rate,
-                cost_model=new_config.dtn_expansion_optimization.cost_model,
-                objective_function=new_config.dtn_expansion_optimization.objective_function,
-                diversity_factor=new_config.dtn_expansion_optimization.diversity_factor,
-                temperature_difference_dh=new_config.dtn_expansion_optimization.temperature_difference_dh,
-                temperature_difference_dc=new_config.dtn_expansion_optimization.temperature_difference_dc,
-                pressure_loss_pa_per_m=new_config.dtn_expansion_optimization.pressure_loss_pa_per_m,
-                pump_operation_hours=new_config.dtn_expansion_optimization.pump_operation_hours,
-                pump_efficiency=new_config.dtn_expansion_optimization.pump_efficiency,
-                pump_load_factor=new_config.dtn_expansion_optimization.pump_load_factor,
-                pump_capex_a=new_config.dtn_expansion_optimization.pump_capex_a,
-                pump_capex_b=new_config.dtn_expansion_optimization.pump_capex_b,
-                cooling_cop=new_config.dtn_expansion_optimization.cooling_cop,
-                ghg_budget_per_phase=self._parse_list_param(new_config.dtn_expansion_optimization.ghg_budget_per_phase),
-                multi_objective_mode=new_config.dtn_expansion_optimization.multi_objective_mode,
-                multi_objective_functions=new_config.dtn_expansion_optimization.multi_objective_functions
-            )
+        # Run the new DTN optimization with the modified locator
+        self.logger.info("Initializing DTN expansion optimizer with modified demands")
+        optimizer = DTNExpansionOptimizer(
+            locator=modified_locator,
+            network_type=self.network_type,
+            metrics_df=None,  # This will be loaded by the optimizer
+            num_phases=new_config.dtn_expansion_optimization.num_phases,
+            phase_durations=self._parse_list_param(new_config.dtn_expansion_optimization.phase_durations),
+            capex_budget_per_phase=self._parse_list_param(new_config.dtn_expansion_optimization.capex_budget_per_phase),
+            total_expenditure_budget_per_phase=self._parse_list_param(new_config.dtn_expansion_optimization.total_expenditure_budget_per_phase),
+            interest_rate=new_config.dtn_expansion_optimization.interest_rate,
+            cost_model=new_config.dtn_expansion_optimization.cost_model,
+            objective_function=new_config.dtn_expansion_optimization.objective_function,
+            diversity_factor=new_config.dtn_expansion_optimization.diversity_factor,
+            temperature_difference_dh=new_config.dtn_expansion_optimization.temperature_difference_dh,
+            temperature_difference_dc=new_config.dtn_expansion_optimization.temperature_difference_dc,
+            pressure_loss_pa_per_m=new_config.dtn_expansion_optimization.pressure_loss_pa_per_m,
+            pump_operation_hours=new_config.dtn_expansion_optimization.pump_operation_hours,
+            pump_efficiency=new_config.dtn_expansion_optimization.pump_efficiency,
+            pump_load_factor=new_config.dtn_expansion_optimization.pump_load_factor,
+            pump_capex_a=new_config.dtn_expansion_optimization.pump_capex_a,
+            pump_capex_b=new_config.dtn_expansion_optimization.pump_capex_b,
+            cooling_cop=new_config.dtn_expansion_optimization.cooling_cop,
+            ghg_budget_per_phase=self._parse_list_param(new_config.dtn_expansion_optimization.ghg_budget_per_phase),
+            multi_objective_mode=new_config.dtn_expansion_optimization.multi_objective_mode,
+            multi_objective_functions=new_config.dtn_expansion_optimization.multi_objective_functions
+        )
+        self.logger.info(f"DTN expansion optimizer initialized with {new_config.dtn_expansion_optimization.num_phases} phases")
 
-            # Run the optimization
-            population_size = new_config.dtn_expansion_optimization.population_size
-            num_generations = new_config.dtn_expansion_optimization.num_generations
-            new_results = optimizer.optimize(population_size=population_size, num_generations=num_generations)
+        # Run the optimization
+        population_size = new_config.dtn_expansion_optimization.population_size
+        num_generations = new_config.dtn_expansion_optimization.num_generations
+        self.logger.info(f"Starting DTN expansion optimization with population size {population_size} and {num_generations} generations")
+        new_results = optimizer.optimize(population_size=population_size, num_generations=num_generations)
+        self.logger.info("DTN expansion optimization completed successfully")
 
-            # Save the new results
-            self.new_optimizer = optimizer
-            self.new_results = new_results
+        # Save the new results
+        self.new_optimizer = optimizer
+        self.new_results = new_results
+        self.logger.info(f"New optimization results saved with {len(new_results['genome'] if isinstance(new_results, dict) else new_results)} clusters")
 
-            return new_results
-        finally:
-            # Restore the original demand files
-            self._replace_demand_files(use_modified=False)
+        return new_results
 
     def compare_results(self):
         """
@@ -401,18 +632,27 @@ class DynamicDTNOptimizer:
         # Create a directory for comparison results
         comparison_dir = Path(self.locator.get_optimization_results_folder()) / "dynamic_dtn_optimization" / "comparison"
         comparison_dir.mkdir(parents=True, exist_ok=True)
+        self.logger.info(f"Created comparison results directory: {comparison_dir}")
 
         # Extract connection sequences
+        self.logger.info("Extracting connection sequences from original and new optimization results")
         original_sequence = self._extract_connection_sequence(self.original_results)
         new_sequence = self._extract_connection_sequence(self.new_results)
+        self.logger.info(f"Original sequence has {len(original_sequence['flat'])} clusters")
+        self.logger.info(f"New sequence has {len(new_sequence['flat'])} clusters")
 
         # Compare the sequences
+        self.logger.info("Comparing connection sequences")
         sequence_changes = self._compare_sequences(original_sequence, new_sequence)
+        self.logger.info(f"Sequence comparison result: {sequence_changes}")
 
         # Compare objective values
+        self.logger.info("Comparing objective values")
         objective_changes = self._compare_objectives(self.original_results, self.new_results)
+        self.logger.info(f"Objective comparison result: {objective_changes}")
 
         # Create a summary DataFrame
+        self.logger.info("Creating summary of comparison results")
         summary = {
             'parameter': ['Heating Demand Reduction', 'Cooling Demand Reduction', 'DHW Demand Reduction', 'Electricity Demand Reduction',
                          'Number of Last Clusters Modified', 'Sequence Changes', 'Objective Value Changes'],
@@ -424,9 +664,11 @@ class DynamicDTNOptimizer:
 
         # Save the summary
         summary_file = comparison_dir / "summary.csv"
+        self.logger.info(f"Saving summary to: {summary_file}")
         summary_df.to_csv(str(summary_file), index=False)
 
         # Create detailed comparison of connection sequences
+        self.logger.info("Creating detailed comparison of connection sequences")
         sequence_comparison = {
             'cluster_id': list(range(len(original_sequence['flat']))),
             'original_phase': original_sequence['flat'],
@@ -435,11 +677,17 @@ class DynamicDTNOptimizer:
         sequence_df = pd.DataFrame(sequence_comparison)
         sequence_df['phase_change'] = sequence_df['new_phase'] - sequence_df['original_phase']
 
+        # Count clusters that changed phases
+        changed_clusters = sequence_df[sequence_df['phase_change'] != 0]
+        self.logger.info(f"Found {len(changed_clusters)} clusters that changed phases")
+
         # Save the sequence comparison
         sequence_file = comparison_dir / "sequence_comparison.csv"
+        self.logger.info(f"Saving sequence comparison to: {sequence_file}")
         sequence_df.to_csv(str(sequence_file), index=False)
 
         # Create visualizations
+        self.logger.info("Creating visualizations of comparison results")
         self._create_visualizations(sequence_df, comparison_dir)
 
         self.logger.info(f"Comparison results saved to {comparison_dir}")
@@ -450,46 +698,6 @@ class DynamicDTNOptimizer:
         if not param_str or param_str.strip() == '':
             return None
         return [float(x) for x in param_str.split(',')]
-
-    def _replace_demand_files(self, use_modified=True):
-        """
-        Replace original demand files with modified ones or vice versa.
-
-        Args:
-            use_modified: If True, replace original with modified. If False, restore original.
-        """
-        for building, files in self.modified_demand_files.items():
-            if use_modified:
-                # Backup the original file
-                backup_file = files['original'] + '.bak'
-                self.logger.info(f"Creating backup of original file: {backup_file}")
-
-                try:
-                    if not os.path.exists(backup_file):
-                        shutil.copy2(files['original'], backup_file)
-                except Exception as e:
-                    self.logger.error(f"Error creating backup file for building {building}: {e}")
-                    continue
-
-                # Replace with modified file
-                self.logger.info(f"Replacing original file with modified file: {files['original']} <- {files['modified']}")
-                try:
-                    shutil.copy2(files['modified'], files['original'])
-                except Exception as e:
-                    self.logger.error(f"Error replacing original file with modified file for building {building}: {e}")
-                    continue
-            else:
-                # Restore the original file
-                backup_file = files['original'] + '.bak'
-                self.logger.info(f"Restoring original file from backup: {files['original']} <- {backup_file}")
-
-                try:
-                    if os.path.exists(backup_file):
-                        shutil.copy2(backup_file, files['original'])
-                        os.remove(backup_file)
-                except Exception as e:
-                    self.logger.error(f"Error restoring original file from backup for building {building}: {e}")
-                    continue
 
     def _extract_connection_sequence(self, results):
         """
@@ -649,8 +857,12 @@ class DynamicDTNOptimizer:
             Summary DataFrame with comparison results
         """
         self.logger.info("Starting Dynamic DTN Optimization workflow")
+        self.logger.info(f"Network type: {self.network_type}")
+        self.logger.info(f"Demand reduction parameters: Heating={self.heating_reduction*100}%, Cooling={self.cooling_reduction*100}%, DHW={self.dhw_reduction*100}%, Electricity={self.electricity_reduction*100}%")
+        self.logger.info(f"Number of last clusters to modify: {self.num_last_clusters}")
 
         # Step 1: Check if DTN optimization results exist
+        self.logger.info("STEP 1: Checking if DTN optimization results exist")
         results_exist, results_file = self.check_dtn_optimization_results()
         if not results_exist:
             error_msg = (
@@ -661,24 +873,33 @@ class DynamicDTNOptimizer:
             raise FileNotFoundError(error_msg)
 
         # Step 2: Load the original DTN optimization results
+        self.logger.info("STEP 2: Loading original DTN optimization results")
         original_results = self.load_original_optimization_results(results_file)
+        self.logger.info(f"Original optimization results loaded with {len(original_results['genome'])} clusters")
 
         # Step 3: Identify the last clusters to be connected
+        self.logger.info("STEP 3: Identifying the last clusters to be connected")
         last_clusters = self.identify_last_clusters(original_results)
+        self.logger.info(f"Identified {len(last_clusters)} clusters to modify: {last_clusters}")
 
         # Step 4: Modify the demand of buildings in the last clusters
+        self.logger.info("STEP 4: Modifying the demand of buildings in the last clusters")
         self.modify_building_demands(last_clusters)
 
         # Step 5: Rerun the thermal network simulation with modified demands
+        self.logger.info("STEP 5: Rerunning the thermal network simulation with modified demands")
         self.rerun_thermal_network_simulation()
 
         # Step 6: Rerun the DTN optimization with updated thermal network results
+        self.logger.info("STEP 6: Rerunning the DTN optimization with updated thermal network results")
         new_results = self.rerun_dtn_optimization()
 
         # Step 7: Compare the results to assess sensitivity
+        self.logger.info("STEP 7: Comparing the results to assess sensitivity")
         summary = self.compare_results()
 
-        self.logger.info("Dynamic DTN Optimization workflow completed")
+        self.logger.info("Dynamic DTN Optimization workflow completed successfully")
+        self.logger.info(f"Results saved to: {Path(self.locator.get_optimization_results_folder()) / 'dynamic_dtn_optimization'}")
         return summary
 
 def main(config):
@@ -688,13 +909,38 @@ def main(config):
     Args:
         config: CEA Configuration object
     """
+    # Set up logging
+    logger = log()
+    logger.info("="*80)
+    logger.info("Starting Dynamic DTN Optimization module")
+    logger.info(f"Scenario: {config.scenario}")
+    logger.info(f"Network type: {config.dynamic_dtn_optimization.network_type}")
+    logger.info("="*80)
+
+    start_time = time.time()
+
     locator = cea.inputlocator.InputLocator(config.scenario)
 
     # Create and run the Dynamic DTN Optimizer
+    logger.info("Initializing Dynamic DTN Optimizer")
     optimizer = DynamicDTNOptimizer(locator, config)
+
+    # Run the optimization
     summary = optimizer.run()
 
+    # Calculate elapsed time
+    elapsed_time = time.time() - start_time
+    hours, remainder = divmod(elapsed_time, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    time_str = f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
+
+    logger.info("="*80)
+    logger.info(f"Dynamic DTN Optimization completed successfully in {time_str}")
+    logger.info(f"Results saved to: {Path(locator.get_optimization_results_folder()) / 'dynamic_dtn_optimization'}")
+    logger.info("="*80)
+
     print("Dynamic DTN Optimization completed successfully.")
+    print(f"Total runtime: {time_str}")
     print(summary)
 
     return summary

@@ -3469,6 +3469,17 @@ class DTNExpansionOptimizer:
         if self.ghg_budget_per_phase:
             metadata['ghg_budget_per_phase [tonCO2]'] = ','.join(map(str, self.ghg_budget_per_phase))
 
+        # Add testing_clusters if specified
+        if self.testing_clusters:
+            if isinstance(self.testing_clusters, list):
+                metadata['testing_clusters'] = ','.join(map(str, self.testing_clusters))
+            else:
+                metadata['testing_clusters'] = str(self.testing_clusters)
+        else:
+            # If no testing clusters specified, include all clusters found in building clustering
+            all_clusters = sorted([c for c in self.cluster_nodes['cluster'].unique() if c > 0])
+            metadata['testing_clusters'] = ','.join(map(str, all_clusters))
+
         # Save metadata to a separate CSV
         metadata_df = pd.DataFrame([metadata])
         metadata_file = output_dir / "optimization_settings.csv"
@@ -3726,7 +3737,7 @@ class PipeLayoutGenerator:
 
         # Calculate total annual demand
         if self.network_type == 'DH':
-            # For district heating, use Qhs_sys_MWhyr
+            # For district heating, use Qhs_sys_MWhyr + Qww_sys_MWhyr
             total_annual_demand = self.total_demand[
                 self.total_demand['name'].isin(buildings_in_clusters)
             ]['Qhs_sys_MWhyr'].sum() + self.total_demand[
@@ -3734,7 +3745,7 @@ class PipeLayoutGenerator:
             ]['Qww_sys_MWhyr'].sum()
             demand_type = 'Qh'
         else:
-            # For district cooling, use Qcs_sys_MWhyr
+            # For district cooling, use Qcs_sys_MWhyr + Qcre_sys_MWhyr + Qcdata_sys_MWhyr
             total_annual_demand = self.total_demand[
                 self.total_demand['name'].isin(buildings_in_clusters)
             ]['Qcs_sys_MWhyr'].sum() + self.total_demand[

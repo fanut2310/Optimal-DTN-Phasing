@@ -360,7 +360,7 @@ Energy Supply System Optimisation:
       - [get_weather_file]
 
   - name: dynamic-dtn-optimization
-    label: Dynamic DTN Optimization with Retrofit Analysis
+    label: "Dynamic DTN Optimization Part 1: Urban Metric Modifications"
     description: |
       Analyzes how strategic modifications to building demands (retrofits) affect the optimal 
       connection sequence in district thermal networks. This module takes the results from 
@@ -411,6 +411,19 @@ Energy Supply System Optimisation:
       - [get_weather_file]
       - [get_dtn_expansion_optimization_results_folder]
       - [get_dtn_cluster_assignment_file]
+
+  - name: dynamic-dtn-result-comparison
+    label: "Dynamic DTN Optimization Part 2: Result Comparisons"
+    description: |
+      Compares and visualizes results from Dynamic DTN Optimization without rerunning 
+      the thermal network simulation or DTN optimization.
+    interfaces: [ cli, dashboard ]
+    module: cea.optimization_new.dynamic_dtn_result_comparison
+    parameters: [ 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free',
+                  'dynamic-dtn-optimization:network-type' ]
+    input-files:
+      - [get_optimization_results_folder]
+      - [get_dtn_expansion_optimization_results_folder]
 
   - name: decentralized
     label: "Supply System Part 1: decentralised"

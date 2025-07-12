@@ -425,6 +425,41 @@ Energy Supply System Optimisation:
       - [get_optimization_results_folder]
       - [get_dtn_expansion_optimization_results_folder]
 
+  - name: dynamic-dtn-rerun-optimization
+    label: "Dynamic DTN Optimization Part 3: Rerun Optimization"
+    description: |
+      Reruns the DTN optimization with modified demand files from Dynamic DTN Optimization Part 1.
+      This module implements step 6 of the dynamic DTN optimization process.
+    interfaces: [ cli, dashboard ]
+    module: cea.optimization_new.dynamic_dtn_rerun_optimization
+    parameters: [ 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free',
+                  'dynamic-dtn-optimization:network-type',
+                  'dtn-expansion-optimization:num-phases',
+                  'dtn-expansion-optimization:phase-durations',
+                  'dtn-expansion-optimization:capex-budget-per-phase',
+                  'dtn-expansion-optimization:total-expenditure-budget-per-phase',
+                  'dtn-expansion-optimization:interest-rate',
+                  'dtn-expansion-optimization:cost-model',
+                  'dtn-expansion-optimization:objective-function',
+                  'dtn-expansion-optimization:diversity-factor',
+                  'dtn-expansion-optimization:temperature-difference-dh',
+                  'dtn-expansion-optimization:temperature-difference-dc',
+                  'dtn-expansion-optimization:pressure-loss-pa-per-m',
+                  'dtn-expansion-optimization:pump-operation-hours',
+                  'dtn-expansion-optimization:pump-efficiency',
+                  'dtn-expansion-optimization:pump-load-factor',
+                  'dtn-expansion-optimization:pump-capex-a',
+                  'dtn-expansion-optimization:pump-capex-b',
+                  'dtn-expansion-optimization:cooling-cop',
+                  'dtn-expansion-optimization:ghg-budget-per-phase',
+                  'dtn-expansion-optimization:multi-objective-mode',
+                  'dtn-expansion-optimization:multi-objective-functions',
+                  'dtn-expansion-optimization:population-size',
+                  'dtn-expansion-optimization:num-generations' ]
+    input-files:
+      - [get_optimization_results_folder]
+      - [get_dtn_expansion_optimization_results_folder]
+
   - name: decentralized
     label: "Supply System Part 1: decentralised"
     description: This Feature optimises energy supply systems for decentralised operation.

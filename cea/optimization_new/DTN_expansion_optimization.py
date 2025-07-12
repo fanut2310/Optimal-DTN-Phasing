@@ -442,7 +442,7 @@ class DTNExpansionOptimizer:
         if self.testing_clusters:
             log().info(f"Filtering to include only testing clusters: {self.testing_clusters}")
             self.all_clusters = sorted(self.testing_clusters)
-        else:
+        elif self.metrics_df is not None:
             # Extract unique clusters from the metrics DataFrame
             unique_clusters = set()
             for cluster_str in self.metrics_df['clusters']:
@@ -456,6 +456,11 @@ class DTNExpansionOptimizer:
 
             # Sort the clusters to maintain the same order as before
             self.all_clusters = sorted(list(unique_clusters))
+        else:
+            # Fallback: Extract unique clusters from cluster_nodes
+            log().info("No metrics_df provided, extracting clusters from cluster_nodes")
+            all_clusters = sorted([c for c in self.cluster_nodes['cluster'].unique() if c > 0])
+            self.all_clusters = all_clusters
 
         log().info(f"Using {len(self.all_clusters)} clusters: {self.all_clusters}")
 
@@ -481,14 +486,18 @@ class DTNExpansionOptimizer:
     def _create_cluster_metrics_mapping(self):
         """Create a mapping from cluster combinations to their metrics."""
         cluster_metrics = {}
-        for _, row in self.metrics_df.iterrows():
-            key = row['clusters']
-            cluster_metrics[key] = row.to_dict()
 
-            # also register an alias without the leading "0+"
-            if key.startswith('0+'):
-                alias = key[2:]  # e.g. "0+2+4" → "2+4"
-                cluster_metrics[alias] = row.to_dict()
+        if self.metrics_df is not None:
+            for _, row in self.metrics_df.iterrows():
+                key = row['clusters']
+                cluster_metrics[key] = row.to_dict()
+
+                # also register an alias without the leading "0+"
+                if key.startswith('0+'):
+                    alias = key[2:]  # e.g. "0+2+4" → "2+4"
+                    cluster_metrics[alias] = row.to_dict()
+        else:
+            log().warning("No metrics_df provided, cluster_metrics will be empty")
 
         return cluster_metrics
 

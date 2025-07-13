@@ -20,6 +20,9 @@ class DynamicDTNExpansionOptimizer(DTNExpansionOptimizer):
     """
 
     def __init__(self, *args, **kwargs):
+        # Create a module-specific logger
+        self.logger = logging.getLogger("cea.dynamic_dtn_rerun_optimization.optimizer")
+
         # Extract dynamic_dtn_folder from kwargs if provided
         self.dynamic_dtn_folder = kwargs.pop('dynamic_dtn_folder', None)
 
@@ -159,23 +162,44 @@ class DynamicDTNExpansionOptimizer(DTNExpansionOptimizer):
         return result
 
     def _evaluate_individual(self, individual):
-        """Override to track constraint violations"""
-        # Call the parent method
-        fitness = super()._evaluate_individual(individual)
+        """Override to ensure consistent fitness tuple handling and proper genome usage."""
+        # Set the current individual for emissions calculation
+        self.current_individual = individual
 
-        # Check if this individual violated any constraints
-        if isinstance(fitness, tuple):
-            # Multi-objective mode
-            if fitness[0] == -1000 or fitness[1] == -1000000:
-                # This individual violated a constraint
-                self._track_constraint_violation(individual)
-        else:
-            # Single-objective mode
-            if fitness == -1000 or fitness == -1000000:
-                # This individual violated a constraint
-                self._track_constraint_violation(individual)
+        try:
+            # Call the parent method
+            fitness = super()._evaluate_individual(individual)
 
-        return fitness
+            # Ensure fitness is returned as a tuple for DEAP
+            if not isinstance(fitness, tuple):
+                fitness = (fitness,)
+
+            # For single-objective mode, ensure only one fitness value
+            if not self.multi_objective_mode and len(fitness) > 1:
+                # Use only the first objective (NPV)
+                fitness = (fitness[0],)
+
+            # Check if this individual violated any constraints
+            if isinstance(fitness, tuple):
+                # Multi-objective mode
+                if fitness[0] == -1000 or (len(fitness) > 1 and fitness[1] == -1000000):
+                    # This individual violated a constraint
+                    self._track_constraint_violation(individual)
+            else:
+                # Single-objective mode
+                if fitness == -1000 or fitness == -1000000:
+                    # This individual violated a constraint
+                    self._track_constraint_violation(individual)
+
+            return fitness
+
+        except Exception as e:
+            self.logger.error(f"Error evaluating individual {individual}: {e}")
+            # Return a penalty fitness value
+            return (-1000000.0,)
+        finally:
+            # Clear the current individual
+            self.current_individual = None
 
     def _track_constraint_violation(self, individual):
         """Track which constraint was violated"""
@@ -234,6 +258,20 @@ class DynamicDTNRerunOptimization:
     Module for rerunning DTN optimization with modified demand files.
     This module implements step 6 of the dynamic DTN optimization process.
     """
+
+    def load_metrics_df(self):
+        """Load the original metrics_df from the DTN expansion optimization results."""
+        # Path to the original metrics file
+        metrics_file = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "phase_1" / "clusters_metrics.csv"
+
+        if not metrics_file.exists():
+            self.logger.error(f"Original metrics file not found: {metrics_file}")
+            raise FileNotFoundError(f"Original metrics file not found: {metrics_file}")
+
+        self.logger.info(f"Loading original metrics from: {metrics_file}")
+        metrics_df = pd.read_csv(metrics_file)
+
+        return metrics_df
 
     def _log_constraint_parameters(self, optimizer):
         """Log constraint parameters to help diagnose constraint violations"""
@@ -449,6 +487,13 @@ class DynamicDTNRerunOptimization:
 
         # Create a copy of the config for the new optimization
         new_config = self._create_config_copy()
+
+        # IMPORTANT: Ensure consistent objective handling
+        if not new_config.dtn_expansion_optimization.multi_objective_mode:
+            # In single-objective mode, force multi_objective_functions to be a single-element list
+            new_config.dtn_expansion_optimization.multi_objective_functions = [new_config.dtn_expansion_optimization.objective_function]
+            self.logger.info(f"Single-objective mode: Setting multi_objective_functions to [{new_config.dtn_expansion_optimization.objective_function}]")
+
         self.logger.info(f"Created configuration copy for DTN expansion optimization")
 
         # Create a custom locator that points to the modified demand files
@@ -458,12 +503,15 @@ class DynamicDTNRerunOptimization:
         # Define the dynamic DTN folder
         dynamic_dtn_folder = Path(self.locator.get_optimization_results_folder()) / "dynamic_dtn_optimization"
 
+        # Load the original metrics_df
+        metrics_df = self.load_metrics_df()
+
         # Run the new DTN optimization with the modified locator and custom output folder
         self.logger.info("Initializing DTN expansion optimizer with modified demands")
         optimizer = DynamicDTNExpansionOptimizer(
             locator=modified_locator,
             network_type=self.network_type,
-            metrics_df=None,  # This will be loaded by the optimizer
+            metrics_df=metrics_df,  # Use the loaded metrics
             num_phases=new_config.dtn_expansion_optimization.num_phases,
             phase_durations=self._parse_list_param(new_config.dtn_expansion_optimization.phase_durations),
             capex_budget_per_phase=self._parse_list_param(new_config.dtn_expansion_optimization.capex_budget_per_phase),

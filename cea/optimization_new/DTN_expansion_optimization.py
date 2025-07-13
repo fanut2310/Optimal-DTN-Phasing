@@ -115,6 +115,7 @@ def setup_creator(multi_objective=False, objective_function='NPV', multi_objecti
         creator.create("Individual", list, fitness=creator.FitnessMulti)
     else:
         # For single-objective: maximize NPV/ROI only
+        # IMPORTANT: In single-objective mode, we ignore multi_objective_functions completely
         creator.create("FitnessMax", base.Fitness, weights=(1.0,))
         creator.create("Individual", list, fitness=creator.FitnessMax)
 

@@ -851,10 +851,15 @@ class DynamicDTNOptimizer:
 
     def run(self):
         """
-        Run the complete Dynamic DTN Optimization workflow.
+        Run the Dynamic DTN Optimization workflow up to thermal network simulation.
+
+        This method stops after completing the thermal network simulation (Part 2 and 3)
+        and does not proceed to rerun DTN optimization or results comparison.
+        Those steps will be handled separately by dynamic_dtn_rerun_optimization.py
+        and dynamic_dtn_result_comparison.py.
 
         Returns:
-            Summary DataFrame with comparison results
+            None
         """
         self.logger.info("Starting Dynamic DTN Optimization workflow")
         self.logger.info(f"Network type: {self.network_type}")
@@ -890,21 +895,20 @@ class DynamicDTNOptimizer:
         self.logger.info("STEP 5: Rerunning the thermal network simulation with modified demands")
         self.rerun_thermal_network_simulation()
 
-        # Step 6: Rerun the DTN optimization with updated thermal network results
-        self.logger.info("STEP 6: Rerunning the DTN optimization with updated thermal network results")
-        new_results = self.rerun_dtn_optimization()
-
-        # Step 7: Compare the results to assess sensitivity
-        self.logger.info("STEP 7: Comparing the results to assess sensitivity")
-        summary = self.compare_results()
-
-        self.logger.info("Dynamic DTN Optimization workflow completed successfully")
+        # Workflow stops here - DTN optimization rerunning and results comparison
+        # will be handled separately by dynamic_dtn_rerun_optimization.py and dynamic_dtn_result_comparison.py
+        self.logger.info("Dynamic DTN Optimization workflow completed successfully (up to thermal network simulation)")
         self.logger.info(f"Results saved to: {Path(self.locator.get_optimization_results_folder()) / 'dynamic_dtn_optimization'}")
-        return summary
+        return None
 
 def main(config):
     """
     Run the Dynamic DTN Optimization module.
+
+    This function runs the Dynamic DTN Optimization workflow up to thermal network simulation
+    (Part 2 and 3) and does not proceed to rerun DTN optimization or results comparison.
+    Those steps will be handled separately by dynamic_dtn_rerun_optimization.py
+    and dynamic_dtn_result_comparison.py.
 
     Args:
         config: CEA Configuration object
@@ -925,8 +929,8 @@ def main(config):
     logger.info("Initializing Dynamic DTN Optimizer")
     optimizer = DynamicDTNOptimizer(locator, config)
 
-    # Run the optimization
-    summary = optimizer.run()
+    # Run the optimization up to thermal network simulation
+    optimizer.run()
 
     # Calculate elapsed time
     elapsed_time = time.time() - start_time
@@ -935,15 +939,16 @@ def main(config):
     time_str = f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
 
     logger.info("="*80)
-    logger.info(f"Dynamic DTN Optimization completed successfully in {time_str}")
+    logger.info(f"Dynamic DTN Optimization completed successfully (up to thermal network simulation) in {time_str}")
     logger.info(f"Results saved to: {Path(locator.get_optimization_results_folder()) / 'dynamic_dtn_optimization'}")
     logger.info("="*80)
 
-    print("Dynamic DTN Optimization completed successfully.")
+    print("Dynamic DTN Optimization completed successfully (up to thermal network simulation).")
     print(f"Total runtime: {time_str}")
-    print(summary)
+    print("To continue with DTN optimization rerunning, use dynamic_dtn_rerun_optimization.py")
+    print("To compare results, use dynamic_dtn_result_comparison.py")
 
-    return summary
+    return None
 
 if __name__ == '__main__':
     args = parse_args()

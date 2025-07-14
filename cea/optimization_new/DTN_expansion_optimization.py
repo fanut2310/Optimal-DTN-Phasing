@@ -1367,15 +1367,21 @@ class DTNExpansionOptimizer:
         }
 
         # Get cluster assignments from current individual
-        if hasattr(self, 'current_individual') and self.current_individual is not None:
+        if hasattr(self, 'current_individual') and self.current_individual:
             # Use the current individual's phase assignments
             cluster_phase_map = {cluster: p for cluster, p in zip(self.all_clusters, self.current_individual)}
             clusters_by_phase = {}
             for phase in range(1, self.num_phases + 1):
                 clusters_by_phase[phase] = [cluster for cluster, p in cluster_phase_map.items() if p == phase]
+        elif self.solution and 'genome' in self.solution:
+            # Use the solution's genome if available
+            cluster_phase_map = {cluster: p for cluster, p in zip(self.all_clusters, self.solution['genome'])}
+            clusters_by_phase = {}
+            for phase in range(1, self.num_phases + 1):
+                clusters_by_phase[phase] = [cluster for cluster, p in cluster_phase_map.items() if p == phase]
         else:
             # Fallback: distribute all_clusters evenly across phases
-            log().warning("No current_individual found, using fallback cluster distribution")
+            log().warning("No current_individual or solution genome found, using fallback cluster distribution")
             clusters_by_phase = {}
             clusters_per_phase = max(1, len(self.all_clusters) // self.num_phases)
             for phase in range(1, self.num_phases + 1):
@@ -1768,6 +1774,9 @@ class DTNExpansionOptimizer:
         tuple
             Fitness value(s) - single objective (NPV or ROI) or multi-objective (NPV/ROI and emissions)
         """
+        # NEW: enforce integer genome
+        individual[:] = [int(round(g)) for g in individual]
+
         # Set current individual for use in emissions calculation
         self.current_individual = individual
 

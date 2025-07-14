@@ -474,52 +474,289 @@ class DynamicDTNOptimizer:
 
         return new_config
 
-    def _copy_thermal_network_results(self):
+    def _create_temp_scenario_with_modified_demands(self):
         """
-        Copy thermal network results from the default locations to the dynamic DTN optimization folder.
+        Create a temporary scenario with modified demand files.
+
+        Returns:
+            str: Path to the temporary scenario directory
         """
-        self.logger.info("Copying thermal network results to dynamic DTN optimization folder")
+        self.logger.info("Creating temporary scenario with modified demand files")
+
+        # Create a temporary directory
+        temp_dir = Path(self.locator.get_optimization_results_folder()) / "dynamic_dtn_optimization" / "temp_scenario"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        self.logger.info(f"Created temporary scenario directory: {temp_dir}")
+
+        # Create necessary subdirectories
+        temp_demand_dir = temp_dir / "outputs" / "data" / "demand"
+        temp_demand_dir.mkdir(parents=True, exist_ok=True)
+
+        # Copy necessary files from original scenario
+        self._copy_scenario_files(self.config.scenario, str(temp_dir))
+
+        # Copy modified demand files to the demand folder in temp scenario
+        for building, files in self.modified_demand_files.items():
+            self.logger.info(f"Copying modified demand file for building {building}")
+            shutil.copy2(files['modified'], temp_demand_dir / f"{building}.csv")
+
+        self.logger.info(f"Temporary scenario created at: {temp_dir}")
+        return str(temp_dir)
+
+    def _copy_scenario_files(self, source_scenario, target_scenario):
+        """
+        Copy necessary files from source scenario to target scenario.
+
+        Args:
+            source_scenario (str): Path to the source scenario
+            target_scenario (str): Path to the target scenario
+        """
+        self.logger.info(f"Copying necessary files from {source_scenario} to {target_scenario}")
+
+        # Create a source locator
+        source_locator = cea.inputlocator.InputLocator(source_scenario)
+
+        # Create target directories
+        target_path = Path(target_scenario)
+        (target_path / "inputs").mkdir(parents=True, exist_ok=True)
+        (target_path / "inputs" / "building-geometry").mkdir(parents=True, exist_ok=True)
+        (target_path / "inputs" / "networks").mkdir(parents=True, exist_ok=True)
+        (target_path / "outputs" / "data" / "demand").mkdir(parents=True, exist_ok=True)
+
+        # Copy building geometry files
+        zone_file = source_locator.get_zone_geometry()
+        if os.path.exists(zone_file):
+            shutil.copy2(zone_file, target_path / "inputs" / "building-geometry" / "zone.shp")
+            # Copy related files (.dbf, .shx, etc.)
+            for ext in ['.dbf', '.shx', '.prj', '.cpg']:
+                related_file = zone_file.replace('.shp', ext)
+                if os.path.exists(related_file):
+                    shutil.copy2(related_file, target_path / "inputs" / "building-geometry" / f"zone{ext}")
+
+        # Copy network files
+        network_file = source_locator.get_network_layout_edges_shapefile(self.network_type)
+        if os.path.exists(network_file):
+            target_network_dir = target_path / "inputs" / "networks"
+            shutil.copy2(network_file, target_network_dir / f"{self.network_type}.shp")
+            # Copy related files (.dbf, .shx, etc.)
+            for ext in ['.dbf', '.shx', '.prj', '.cpg']:
+                related_file = network_file.replace('.shp', ext)
+                if os.path.exists(related_file):
+                    shutil.copy2(related_file, target_network_dir / f"{self.network_type}{ext}")
+
+        # Copy Total_demand.csv file which is required for thermal network simulation
+        total_demand_file = source_locator.get_total_demand()
+        if os.path.exists(total_demand_file):
+            self.logger.info(f"Copying Total_demand.csv file from {total_demand_file}")
+            shutil.copy2(total_demand_file, target_path / "outputs" / "data" / "demand" / "Total_demand.csv")
+        else:
+            self.logger.warning(f"Total_demand.csv file not found at {total_demand_file}")
+
+        # Copy other necessary files for thermal network simulation
+        # (e.g., network nodes, supply systems, etc.)
+
+        self.logger.info("Necessary files copied to temporary scenario")
+
+    def _copy_results_from_temp_scenario(self, temp_scenario_dir):
+        """
+        Copy thermal network results from temporary scenario to dynamic DTN folder.
+
+        Args:
+            temp_scenario_dir (str): Path to the temporary scenario directory
+        """
+        self.logger.info("Copying thermal network results from temporary scenario to dynamic DTN folder")
 
         # Create a directory for thermal network results
         tn_results_dir = Path(self.locator.get_optimization_results_folder()) / "dynamic_dtn_optimization" / "thermal_network"
         tn_results_dir.mkdir(parents=True, exist_ok=True)
 
-        # Get the default thermal network folder
-        default_tn_folder = Path(self.locator.get_thermal_network_folder())
+        # Create a temporary locator
+        temp_locator = cea.inputlocator.InputLocator(temp_scenario_dir)
 
-        # Copy relevant files
+        # Copy all files from Thermal Network Part 2 and Part 3
+
+        # Part 3 (Costs) - 1 file
         # 1. Network costs file
-        costs_file = self.locator.get_network_layout_costs_file(self.network_type)
+        costs_file = temp_locator.get_network_layout_costs_file(self.network_type)
         if os.path.exists(costs_file):
             shutil.copy2(costs_file, tn_results_dir / f"{self.network_type}_costs.csv")
+            self.logger.info(f"Copied network costs file: {os.path.basename(costs_file)}")
+        else:
+            self.logger.warning(f"Network costs file not found: {costs_file}")
 
+        # Part 2 (Simulation) - 16 files
         # 2. Edge mass flow file
-        edge_massflow_file = self.locator.get_thermal_network_layout_massflow_edges_file(self.network_type, '')
+        edge_massflow_file = temp_locator.get_thermal_network_layout_massflow_edges_file(self.network_type, '')
         if os.path.exists(edge_massflow_file):
             shutil.copy2(edge_massflow_file, tn_results_dir / os.path.basename(edge_massflow_file))
+            self.logger.info(f"Copied edge mass flow file: {os.path.basename(edge_massflow_file)}")
+        else:
+            self.logger.warning(f"Edge mass flow file not found: {edge_massflow_file}")
 
         # 3. Node mass flow file
-        node_massflow_file = self.locator.get_thermal_network_layout_massflow_nodes_file(self.network_type, '')
+        node_massflow_file = temp_locator.get_thermal_network_layout_massflow_nodes_file(self.network_type, '')
         if os.path.exists(node_massflow_file):
             shutil.copy2(node_massflow_file, tn_results_dir / os.path.basename(node_massflow_file))
+            self.logger.info(f"Copied node mass flow file: {os.path.basename(node_massflow_file)}")
+        else:
+            self.logger.warning(f"Node mass flow file not found: {node_massflow_file}")
 
-        # 4. Edge list file
-        edge_list_file = self.locator.get_thermal_network_edge_list_file(self.network_type, '')
+        # 4. Edge velocities file
+        edge_velocity_file = temp_locator.get_thermal_network_layout_velocity_edges_file(self.network_type, '')
+        if os.path.exists(edge_velocity_file):
+            shutil.copy2(edge_velocity_file, tn_results_dir / os.path.basename(edge_velocity_file))
+            self.logger.info(f"Copied edge velocities file: {os.path.basename(edge_velocity_file)}")
+        else:
+            self.logger.warning(f"Edge velocities file not found: {edge_velocity_file}")
+
+        # 5. Node pressures file
+        node_pressure_file = temp_locator.get_thermal_network_layout_pressure_at_nodes_file(self.network_type, '')
+        if os.path.exists(node_pressure_file):
+            shutil.copy2(node_pressure_file, tn_results_dir / os.path.basename(node_pressure_file))
+            self.logger.info(f"Copied node pressures file: {os.path.basename(node_pressure_file)}")
+        else:
+            self.logger.warning(f"Node pressures file not found: {node_pressure_file}")
+
+        # 6. Total pressure drops file
+        pressure_loss_system_file = temp_locator.get_thermal_network_layout_pressure_loss_system_file(self.network_type, '')
+        if os.path.exists(pressure_loss_system_file):
+            shutil.copy2(pressure_loss_system_file, tn_results_dir / os.path.basename(pressure_loss_system_file))
+            self.logger.info(f"Copied total pressure drops file: {os.path.basename(pressure_loss_system_file)}")
+        else:
+            self.logger.warning(f"Total pressure drops file not found: {pressure_loss_system_file}")
+
+        # 7. Pumping energy requirements file
+        pumping_energy_file = temp_locator.get_thermal_network_layout_pumping_energy_file(self.network_type, '')
+        if os.path.exists(pumping_energy_file):
+            shutil.copy2(pumping_energy_file, tn_results_dir / os.path.basename(pumping_energy_file))
+            self.logger.info(f"Copied pumping energy requirements file: {os.path.basename(pumping_energy_file)}")
+        else:
+            self.logger.warning(f"Pumping energy requirements file not found: {pumping_energy_file}")
+
+        # 8. Substation pressure losses file
+        substation_ploss_file = temp_locator.get_thermal_network_substation_ploss_file(self.network_type, '')
+        if os.path.exists(substation_ploss_file):
+            shutil.copy2(substation_ploss_file, tn_results_dir / os.path.basename(substation_ploss_file))
+            self.logger.info(f"Copied substation pressure losses file: {os.path.basename(substation_ploss_file)}")
+        else:
+            self.logger.warning(f"Substation pressure losses file not found: {substation_ploss_file}")
+
+        # 9. Linear pressure drops in edges file
+        linear_pressure_drop_file = temp_locator.get_thermal_network_linear_pressure_drop_edges_file(self.network_type, '')
+        if os.path.exists(linear_pressure_drop_file):
+            shutil.copy2(linear_pressure_drop_file, tn_results_dir / os.path.basename(linear_pressure_drop_file))
+            self.logger.info(f"Copied linear pressure drops file: {os.path.basename(linear_pressure_drop_file)}")
+        else:
+            self.logger.warning(f"Linear pressure drops file not found: {linear_pressure_drop_file}")
+
+        # 10. Total thermal losses file
+        thermal_loss_system_file = temp_locator.get_thermal_network_layout_thermal_loss_system_file(self.network_type, '')
+        if os.path.exists(thermal_loss_system_file):
+            shutil.copy2(thermal_loss_system_file, tn_results_dir / os.path.basename(thermal_loss_system_file))
+            self.logger.info(f"Copied total thermal losses file: {os.path.basename(thermal_loss_system_file)}")
+        else:
+            self.logger.warning(f"Total thermal losses file not found: {thermal_loss_system_file}")
+
+        # 11. Edge thermal losses file
+        thermal_loss_edges_file = temp_locator.get_thermal_network_layout_thermal_loss_edges_file(self.network_type, '')
+        if os.path.exists(thermal_loss_edges_file):
+            shutil.copy2(thermal_loss_edges_file, tn_results_dir / os.path.basename(thermal_loss_edges_file))
+            self.logger.info(f"Copied edge thermal losses file: {os.path.basename(thermal_loss_edges_file)}")
+        else:
+            self.logger.warning(f"Edge thermal losses file not found: {thermal_loss_edges_file}")
+
+        # 12. Linear thermal losses in edges file
+        linear_thermal_loss_edges_file = temp_locator.get_thermal_network_linear_thermal_loss_edges_file(self.network_type, '')
+        if os.path.exists(linear_thermal_loss_edges_file):
+            shutil.copy2(linear_thermal_loss_edges_file, tn_results_dir / os.path.basename(linear_thermal_loss_edges_file))
+            self.logger.info(f"Copied linear thermal losses file: {os.path.basename(linear_thermal_loss_edges_file)}")
+        else:
+            self.logger.warning(f"Linear thermal losses file not found: {linear_thermal_loss_edges_file}")
+
+        # 13. Edge pressure losses file
+        pressure_loss_edges_file = temp_locator.get_thermal_network_layout_pressure_loss_edges_file(self.network_type, '')
+        if os.path.exists(pressure_loss_edges_file):
+            shutil.copy2(pressure_loss_edges_file, tn_results_dir / os.path.basename(pressure_loss_edges_file))
+            self.logger.info(f"Copied edge pressure losses file: {os.path.basename(pressure_loss_edges_file)}")
+        else:
+            self.logger.warning(f"Edge pressure losses file not found: {pressure_loss_edges_file}")
+
+        # 14. Plant heat requirements file
+        plant_heat_req_file = temp_locator.get_thermal_network_plant_heat_requirement_file(self.network_type, '')
+        if os.path.exists(plant_heat_req_file):
+            shutil.copy2(plant_heat_req_file, tn_results_dir / os.path.basename(plant_heat_req_file))
+            self.logger.info(f"Copied plant heat requirements file: {os.path.basename(plant_heat_req_file)}")
+        else:
+            self.logger.warning(f"Plant heat requirements file not found: {plant_heat_req_file}")
+
+        # 15. Supply node temperatures file
+        supply_temp_file = temp_locator.get_thermal_network_layout_supply_temperature_file(self.network_type, '')
+        if os.path.exists(supply_temp_file):
+            shutil.copy2(supply_temp_file, tn_results_dir / os.path.basename(supply_temp_file))
+            self.logger.info(f"Copied supply node temperatures file: {os.path.basename(supply_temp_file)}")
+        else:
+            self.logger.warning(f"Supply node temperatures file not found: {supply_temp_file}")
+
+        # 16. Return node temperatures file
+        return_temp_file = temp_locator.get_thermal_network_layout_return_temperature_file(self.network_type, '')
+        if os.path.exists(return_temp_file):
+            shutil.copy2(return_temp_file, tn_results_dir / os.path.basename(return_temp_file))
+            self.logger.info(f"Copied return node temperatures file: {os.path.basename(return_temp_file)}")
+        else:
+            self.logger.warning(f"Return node temperatures file not found: {return_temp_file}")
+
+        # 17. Plant temperatures file
+        plant_temp_file = temp_locator.get_thermal_network_layout_plant_temp_file(self.network_type, '')
+        if os.path.exists(plant_temp_file):
+            shutil.copy2(plant_temp_file, tn_results_dir / os.path.basename(plant_temp_file))
+            self.logger.info(f"Copied plant temperatures file: {os.path.basename(plant_temp_file)}")
+        else:
+            self.logger.warning(f"Plant temperatures file not found: {plant_temp_file}")
+
+        # Additional files needed for DTN expansion optimization
+        # Edge list file
+        edge_list_file = temp_locator.get_thermal_network_edge_list_file(self.network_type, '')
         if os.path.exists(edge_list_file):
             shutil.copy2(edge_list_file, tn_results_dir / os.path.basename(edge_list_file))
+            self.logger.info(f"Copied edge list file: {os.path.basename(edge_list_file)}")
+        else:
+            self.logger.warning(f"Edge list file not found: {edge_list_file}")
 
-        # 5. Node types file
-        node_types_file = self.locator.get_thermal_network_node_types_csv_file(self.network_type, '')
+        # Node types file
+        node_types_file = temp_locator.get_thermal_network_node_types_csv_file(self.network_type, '')
         if os.path.exists(node_types_file):
             shutil.copy2(node_types_file, tn_results_dir / os.path.basename(node_types_file))
+            self.logger.info(f"Copied node types file: {os.path.basename(node_types_file)}")
+        else:
+            self.logger.warning(f"Node types file not found: {node_types_file}")
 
-        # 6. Edge-node matrix file
-        edge_node_file = self.locator.get_thermal_network_edge_node_matrix_file(self.network_type, '')
+        # Edge-node matrix file
+        edge_node_file = temp_locator.get_thermal_network_edge_node_matrix_file(self.network_type, '')
         if os.path.exists(edge_node_file):
             shutil.copy2(edge_node_file, tn_results_dir / os.path.basename(edge_node_file))
+            self.logger.info(f"Copied edge-node matrix file: {os.path.basename(edge_node_file)}")
+        else:
+            self.logger.warning(f"Edge-node matrix file not found: {edge_node_file}")
 
-        self.logger.info(f"Thermal network results copied to {tn_results_dir}")
-        return tn_results_dir
+        self.logger.info(f"All thermal network results copied to {tn_results_dir}")
+        self.tn_results_dir = tn_results_dir
+
+    def _cleanup_temp_scenario(self, temp_scenario_dir):
+        """
+        Clean up the temporary scenario directory.
+
+        Args:
+            temp_scenario_dir (str): Path to the temporary scenario directory
+        """
+        self.logger.info(f"Cleaning up temporary scenario directory: {temp_scenario_dir}")
+
+        try:
+            # Use shutil.rmtree to remove the directory and all its contents
+            shutil.rmtree(temp_scenario_dir, ignore_errors=True)
+            self.logger.info("Temporary scenario directory cleaned up successfully")
+        except Exception as e:
+            self.logger.warning(f"Error cleaning up temporary scenario directory: {e}")
+            self.logger.warning("Temporary files may remain on disk")
 
     def rerun_thermal_network_simulation(self):
         """
@@ -527,38 +764,33 @@ class DynamicDTNOptimizer:
         """
         self.logger.info("Rerunning thermal network simulation with modified demands")
 
-        # Create a copy of the config for the thermal network simulation
+        # Create a temporary scenario directory with modified demand files
+        temp_scenario_dir = self._create_temp_scenario_with_modified_demands()
+
+        # Create configs that point to the temporary scenario
         tn_config = self._create_config_copy()
+        tn_config.scenario = temp_scenario_dir
         tn_config.thermal_network.network_type = self.network_type
-        self.logger.info(f"Created configuration copy for thermal network simulation with network type: {self.network_type}")
 
-        # Create a custom locator that points to the modified demand files
-        # Note: This locator is not currently being used because the thermal_network_simulation_main and
-        # thermal_network_costs_main functions don't accept a locator parameter. Instead, they create
-        # their own locators from the config object.
-        self.logger.info("Creating custom locator that points to modified demand files")
-        modified_locator = ModifiedDemandsLocator(self.locator, self.modified_demand_files)
-
-        # Run the thermal network simulation
+        # Run thermal network simulation on the temporary scenario
         self.logger.info("Starting thermal network simulation (Part 2)")
-        # Set the scenario in the config to use the modified demand files
-        tn_config.scenario = self.config.scenario
         thermal_network_simulation_main(tn_config)
         self.logger.info("Thermal network simulation (Part 2) completed successfully")
 
-        # Run the thermal network costs calculation
+        # Run thermal network costs calculation
         self.logger.info("Starting thermal network costs calculation (Part 3)")
         tnc_config = self._create_config_copy()
+        tnc_config.scenario = temp_scenario_dir
         tnc_config.thermal_network_costs.network_type = self.network_type
-        # Set the scenario in the config to use the modified demand files
-        tnc_config.scenario = self.config.scenario
         thermal_network_costs_main(tnc_config)
         self.logger.info("Thermal network costs calculation (Part 3) completed successfully")
 
-        # Copy the thermal network results to the dynamic DTN optimization folder
+        # Copy results back to the dynamic DTN folder
         self.logger.info("Copying thermal network results to dedicated folder")
-        self.tn_results_dir = self._copy_thermal_network_results()
-        self.logger.info(f"Thermal network results saved to: {self.tn_results_dir}")
+        self._copy_results_from_temp_scenario(temp_scenario_dir)
+
+        # Clean up temporary scenario
+        self._cleanup_temp_scenario(temp_scenario_dir)
 
     def rerun_dtn_optimization(self):
         """

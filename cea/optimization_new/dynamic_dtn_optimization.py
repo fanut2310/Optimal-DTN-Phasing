@@ -36,6 +36,7 @@ class ModifiedDemandsLocator(cea.inputlocator.InputLocator):
             locator: The original InputLocator
             modified_demand_files: Dictionary mapping building names to modified file paths
         """
+        super().__init__(locator.scenario)
         # Copy all attributes from the original locator
         self.__dict__.update(locator.__dict__)
         self.original_locator = locator
@@ -493,12 +494,13 @@ class DynamicDTNOptimizer:
         temp_demand_dir.mkdir(parents=True, exist_ok=True)
 
         # Copy necessary files from original scenario
-        self._copy_scenario_files(self.config.scenario, str(temp_dir))
+        self._copy_scenario_files(str(self.config.scenario), str(temp_dir))
 
-        # Copy modified demand files to the demand folder in temp scenario
-        for building, files in self.modified_demand_files.items():
-            self.logger.info(f"Copying modified demand file for building {building}")
-            shutil.copy2(files['modified'], temp_demand_dir / f"{building}.csv")
+        # Copy all building demand files (modified and original)
+        self._copy_all_building_demand_files(temp_demand_dir)
+
+        # Generate updated Total_demand.csv and Total_demand_hourly.csv
+        self._update_total_demand_files(temp_demand_dir)
 
         self.logger.info(f"Temporary scenario created at: {temp_dir}")
         return str(temp_dir)
@@ -521,7 +523,12 @@ class DynamicDTNOptimizer:
         (target_path / "inputs").mkdir(parents=True, exist_ok=True)
         (target_path / "inputs" / "building-geometry").mkdir(parents=True, exist_ok=True)
         (target_path / "inputs" / "networks").mkdir(parents=True, exist_ok=True)
+        (target_path / "inputs" / "weather").mkdir(parents=True, exist_ok=True)
         (target_path / "outputs" / "data" / "demand").mkdir(parents=True, exist_ok=True)
+
+        # Create thermal network directory structure
+        thermal_network_dir = target_path / "outputs" / "data" / "thermal-network" / self.network_type
+        thermal_network_dir.mkdir(parents=True, exist_ok=True)
 
         # Copy building geometry files
         zone_file = source_locator.get_zone_geometry()
@@ -552,8 +559,109 @@ class DynamicDTNOptimizer:
         else:
             self.logger.warning(f"Total_demand.csv file not found at {total_demand_file}")
 
-        # Copy other necessary files for thermal network simulation
-        # (e.g., network nodes, supply systems, etc.)
+        # Copy weather.epw file which is required for thermal network simulation
+        weather_file = source_locator.get_weather_file()
+        if os.path.exists(weather_file):
+            self.logger.info(f"Copying weather.epw file from {weather_file}")
+            shutil.copy2(weather_file, target_path / "inputs" / "weather" / "weather.epw")
+        else:
+            self.logger.warning(f"Weather file not found at {weather_file}")
+
+        # Create complete database directory structure
+        (target_path / "inputs" / "database" / "COMPONENTS" / "CONVERSION").mkdir(parents=True, exist_ok=True)
+        (target_path / "inputs" / "database" / "COMPONENTS" / "DISTRIBUTION").mkdir(parents=True, exist_ok=True)
+        (target_path / "inputs" / "database" / "COMPONENTS" / "FEEDSTOCKS").mkdir(parents=True, exist_ok=True)
+        (target_path / "inputs" / "database" / "COMPONENTS" / "FEEDSTOCKS" / "FEEDSTOCKS_LIBRARY").mkdir(parents=True, exist_ok=True)
+
+        # Copy all CONVERSION files (including HEAT_EXCHANGERS.csv, HYDRAULICS.csv, VAPOR_COMPRESSION.csv, COOLING_TOWER.csv)
+        conversion_folder = source_locator.get_db4_components_conversion_folder()
+        if os.path.exists(conversion_folder):
+            self.logger.info(f"Copying all conversion files from {conversion_folder}")
+            for file in os.listdir(conversion_folder):
+                if file.endswith('.csv'):
+                    source_file = os.path.join(conversion_folder, file)
+                    target_file = target_path / "inputs" / "database" / "COMPONENTS" / "CONVERSION" / file
+                    shutil.copy2(source_file, target_file)
+                    self.logger.info(f"Copied {file} from {source_file}")
+        else:
+            self.logger.warning(f"Conversion folder not found at {conversion_folder}")
+
+        # Copy all DISTRIBUTION files (including THERMAL_GRID.csv)
+        distribution_folder = source_locator.get_db4_components_distribution_folder()
+        if os.path.exists(distribution_folder):
+            self.logger.info(f"Copying all distribution files from {distribution_folder}")
+            for file in os.listdir(distribution_folder):
+                if file.endswith('.csv'):
+                    source_file = os.path.join(distribution_folder, file)
+                    target_file = target_path / "inputs" / "database" / "COMPONENTS" / "DISTRIBUTION" / file
+                    shutil.copy2(source_file, target_file)
+                    self.logger.info(f"Copied {file} from {source_file}")
+        else:
+            self.logger.warning(f"Distribution folder not found at {distribution_folder}")
+
+        # Copy all FEEDSTOCKS files
+        feedstocks_folder = source_locator.get_db4_components_feedstocks_folder()
+        if os.path.exists(feedstocks_folder):
+            self.logger.info(f"Copying all feedstocks files from {feedstocks_folder}")
+            for file in os.listdir(feedstocks_folder):
+                if file.endswith('.csv'):
+                    source_file = os.path.join(feedstocks_folder, file)
+                    target_file = target_path / "inputs" / "database" / "COMPONENTS" / "FEEDSTOCKS" / file
+                    shutil.copy2(source_file, target_file)
+                    self.logger.info(f"Copied {file} from {source_file}")
+        else:
+            self.logger.warning(f"Feedstocks folder not found at {feedstocks_folder}")
+
+        # Copy all FEEDSTOCKS_LIBRARY files
+        feedstocks_library_folder = source_locator.get_db4_components_feedstocks_library_folder()
+        if os.path.exists(feedstocks_library_folder):
+            self.logger.info(f"Copying all feedstocks library files from {feedstocks_library_folder}")
+            for file in os.listdir(feedstocks_library_folder):
+                if file.endswith('.csv'):
+                    source_file = os.path.join(feedstocks_library_folder, file)
+                    target_file = target_path / "inputs" / "database" / "COMPONENTS" / "FEEDSTOCKS" / "FEEDSTOCKS_LIBRARY" / file
+                    shutil.copy2(source_file, target_file)
+                    self.logger.info(f"Copied {file} from {source_file}")
+        else:
+            self.logger.warning(f"Feedstocks library folder not found at {feedstocks_library_folder}")
+
+        # Copy thermal network files from the original scenario
+        source_thermal_network_dir = Path(source_locator.get_thermal_network_folder()) / self.network_type
+        if source_thermal_network_dir.exists():
+            self.logger.info(f"Copying thermal network files from {source_thermal_network_dir}")
+
+            # Copy edges.shp and related files
+            edges_shp = source_thermal_network_dir / "edges.shp"
+            if edges_shp.exists():
+                self.logger.info(f"Copying edges.shp file from {edges_shp}")
+                shutil.copy2(edges_shp, thermal_network_dir / "edges.shp")
+                # Copy related files (.dbf, .shx, etc.)
+                for ext in ['.dbf', '.shx', '.prj', '.cpg']:
+                    related_file = str(edges_shp).replace('.shp', ext)
+                    if os.path.exists(related_file):
+                        shutil.copy2(related_file, thermal_network_dir / f"edges{ext}")
+            else:
+                self.logger.warning(f"edges.shp file not found at {edges_shp}")
+
+            # Copy nodes.shp and related files
+            nodes_shp = source_thermal_network_dir / "nodes.shp"
+            if nodes_shp.exists():
+                self.logger.info(f"Copying nodes.shp file from {nodes_shp}")
+                shutil.copy2(nodes_shp, thermal_network_dir / "nodes.shp")
+                # Copy related files (.dbf, .shx, etc.)
+                for ext in ['.dbf', '.shx', '.prj', '.cpg']:
+                    related_file = str(nodes_shp).replace('.shp', ext)
+                    if os.path.exists(related_file):
+                        shutil.copy2(related_file, thermal_network_dir / f"nodes{ext}")
+            else:
+                self.logger.warning(f"nodes.shp file not found at {nodes_shp}")
+
+            # Copy other thermal network files (CSV files, etc.)
+            for file in source_thermal_network_dir.glob("*.csv"):
+                self.logger.info(f"Copying {file.name} file from {file}")
+                shutil.copy2(file, thermal_network_dir / file.name)
+        else:
+            self.logger.warning(f"Thermal network directory not found at {source_thermal_network_dir}")
 
         self.logger.info("Necessary files copied to temporary scenario")
 
@@ -602,7 +710,7 @@ class DynamicDTNOptimizer:
             self.logger.warning(f"Node mass flow file not found: {node_massflow_file}")
 
         # 4. Edge velocities file
-        edge_velocity_file = temp_locator.get_thermal_network_layout_velocity_edges_file(self.network_type, '')
+        edge_velocity_file = temp_locator.get_thermal_network_velocity_edges_file(self.network_type, '')
         if os.path.exists(edge_velocity_file):
             shutil.copy2(edge_velocity_file, tn_results_dir / os.path.basename(edge_velocity_file))
             self.logger.info(f"Copied edge velocities file: {os.path.basename(edge_velocity_file)}")
@@ -610,7 +718,7 @@ class DynamicDTNOptimizer:
             self.logger.warning(f"Edge velocities file not found: {edge_velocity_file}")
 
         # 5. Node pressures file
-        node_pressure_file = temp_locator.get_thermal_network_layout_pressure_at_nodes_file(self.network_type, '')
+        node_pressure_file = temp_locator.get_network_pressure_at_nodes(self.network_type, '')
         if os.path.exists(node_pressure_file):
             shutil.copy2(node_pressure_file, tn_results_dir / os.path.basename(node_pressure_file))
             self.logger.info(f"Copied node pressures file: {os.path.basename(node_pressure_file)}")
@@ -618,7 +726,7 @@ class DynamicDTNOptimizer:
             self.logger.warning(f"Node pressures file not found: {node_pressure_file}")
 
         # 6. Total pressure drops file
-        pressure_loss_system_file = temp_locator.get_thermal_network_layout_pressure_loss_system_file(self.network_type, '')
+        pressure_loss_system_file = temp_locator.get_network_total_pressure_drop_file(self.network_type, '')
         if os.path.exists(pressure_loss_system_file):
             shutil.copy2(pressure_loss_system_file, tn_results_dir / os.path.basename(pressure_loss_system_file))
             self.logger.info(f"Copied total pressure drops file: {os.path.basename(pressure_loss_system_file)}")
@@ -626,7 +734,7 @@ class DynamicDTNOptimizer:
             self.logger.warning(f"Total pressure drops file not found: {pressure_loss_system_file}")
 
         # 7. Pumping energy requirements file
-        pumping_energy_file = temp_locator.get_thermal_network_layout_pumping_energy_file(self.network_type, '')
+        pumping_energy_file = temp_locator.get_network_energy_pumping_requirements_file(self.network_type, '')
         if os.path.exists(pumping_energy_file):
             shutil.copy2(pumping_energy_file, tn_results_dir / os.path.basename(pumping_energy_file))
             self.logger.info(f"Copied pumping energy requirements file: {os.path.basename(pumping_energy_file)}")
@@ -642,7 +750,7 @@ class DynamicDTNOptimizer:
             self.logger.warning(f"Substation pressure losses file not found: {substation_ploss_file}")
 
         # 9. Linear pressure drops in edges file
-        linear_pressure_drop_file = temp_locator.get_thermal_network_linear_pressure_drop_edges_file(self.network_type, '')
+        linear_pressure_drop_file = temp_locator.get_network_linear_pressure_drop_edges(self.network_type, '')
         if os.path.exists(linear_pressure_drop_file):
             shutil.copy2(linear_pressure_drop_file, tn_results_dir / os.path.basename(linear_pressure_drop_file))
             self.logger.info(f"Copied linear pressure drops file: {os.path.basename(linear_pressure_drop_file)}")
@@ -650,7 +758,7 @@ class DynamicDTNOptimizer:
             self.logger.warning(f"Linear pressure drops file not found: {linear_pressure_drop_file}")
 
         # 10. Total thermal losses file
-        thermal_loss_system_file = temp_locator.get_thermal_network_layout_thermal_loss_system_file(self.network_type, '')
+        thermal_loss_system_file = temp_locator.get_network_total_thermal_loss_file(self.network_type, '')
         if os.path.exists(thermal_loss_system_file):
             shutil.copy2(thermal_loss_system_file, tn_results_dir / os.path.basename(thermal_loss_system_file))
             self.logger.info(f"Copied total thermal losses file: {os.path.basename(thermal_loss_system_file)}")
@@ -658,7 +766,7 @@ class DynamicDTNOptimizer:
             self.logger.warning(f"Total thermal losses file not found: {thermal_loss_system_file}")
 
         # 11. Edge thermal losses file
-        thermal_loss_edges_file = temp_locator.get_thermal_network_layout_thermal_loss_edges_file(self.network_type, '')
+        thermal_loss_edges_file = temp_locator.get_network_thermal_loss_edges_file(self.network_type, '')
         if os.path.exists(thermal_loss_edges_file):
             shutil.copy2(thermal_loss_edges_file, tn_results_dir / os.path.basename(thermal_loss_edges_file))
             self.logger.info(f"Copied edge thermal losses file: {os.path.basename(thermal_loss_edges_file)}")
@@ -666,7 +774,7 @@ class DynamicDTNOptimizer:
             self.logger.warning(f"Edge thermal losses file not found: {thermal_loss_edges_file}")
 
         # 12. Linear thermal losses in edges file
-        linear_thermal_loss_edges_file = temp_locator.get_thermal_network_linear_thermal_loss_edges_file(self.network_type, '')
+        linear_thermal_loss_edges_file = temp_locator.get_network_linear_thermal_loss_edges_file(self.network_type, '')
         if os.path.exists(linear_thermal_loss_edges_file):
             shutil.copy2(linear_thermal_loss_edges_file, tn_results_dir / os.path.basename(linear_thermal_loss_edges_file))
             self.logger.info(f"Copied linear thermal losses file: {os.path.basename(linear_thermal_loss_edges_file)}")
@@ -674,7 +782,7 @@ class DynamicDTNOptimizer:
             self.logger.warning(f"Linear thermal losses file not found: {linear_thermal_loss_edges_file}")
 
         # 13. Edge pressure losses file
-        pressure_loss_edges_file = temp_locator.get_thermal_network_layout_pressure_loss_edges_file(self.network_type, '')
+        pressure_loss_edges_file = temp_locator.get_thermal_network_pressure_losses_edges_file(self.network_type, '')
         if os.path.exists(pressure_loss_edges_file):
             shutil.copy2(pressure_loss_edges_file, tn_results_dir / os.path.basename(pressure_loss_edges_file))
             self.logger.info(f"Copied edge pressure losses file: {os.path.basename(pressure_loss_edges_file)}")
@@ -690,7 +798,7 @@ class DynamicDTNOptimizer:
             self.logger.warning(f"Plant heat requirements file not found: {plant_heat_req_file}")
 
         # 15. Supply node temperatures file
-        supply_temp_file = temp_locator.get_thermal_network_layout_supply_temperature_file(self.network_type, '')
+        supply_temp_file = temp_locator.get_network_temperature_supply_nodes_file(self.network_type, '')
         if os.path.exists(supply_temp_file):
             shutil.copy2(supply_temp_file, tn_results_dir / os.path.basename(supply_temp_file))
             self.logger.info(f"Copied supply node temperatures file: {os.path.basename(supply_temp_file)}")
@@ -698,7 +806,7 @@ class DynamicDTNOptimizer:
             self.logger.warning(f"Supply node temperatures file not found: {supply_temp_file}")
 
         # 16. Return node temperatures file
-        return_temp_file = temp_locator.get_thermal_network_layout_return_temperature_file(self.network_type, '')
+        return_temp_file = temp_locator.get_network_temperature_return_nodes_file(self.network_type, '')
         if os.path.exists(return_temp_file):
             shutil.copy2(return_temp_file, tn_results_dir / os.path.basename(return_temp_file))
             self.logger.info(f"Copied return node temperatures file: {os.path.basename(return_temp_file)}")
@@ -706,7 +814,7 @@ class DynamicDTNOptimizer:
             self.logger.warning(f"Return node temperatures file not found: {return_temp_file}")
 
         # 17. Plant temperatures file
-        plant_temp_file = temp_locator.get_thermal_network_layout_plant_temp_file(self.network_type, '')
+        plant_temp_file = temp_locator.get_network_temperature_plant(self.network_type, '')
         if os.path.exists(plant_temp_file):
             shutil.copy2(plant_temp_file, tn_results_dir / os.path.basename(plant_temp_file))
             self.logger.info(f"Copied plant temperatures file: {os.path.basename(plant_temp_file)}")
@@ -741,6 +849,144 @@ class DynamicDTNOptimizer:
         self.logger.info(f"All thermal network results copied to {tn_results_dir}")
         self.tn_results_dir = tn_results_dir
 
+    def _copy_all_building_demand_files(self, temp_demand_dir):
+        """
+        Copy all building demand files to the temporary scenario.
+
+        Args:
+            temp_demand_dir: Path to the demand directory in the temporary scenario
+        """
+        self.logger.info("Copying all building demand files to temporary scenario")
+
+        # Get all buildings in the scenario
+        total_demand = pd.read_csv(self.locator.get_total_demand())
+        all_buildings = total_demand['name'].values
+
+        # Copy modified demand files for buildings in the last cluster
+        for building, files in self.modified_demand_files.items():
+            self.logger.info(f"Copying modified demand file for building {building}")
+            shutil.copy2(files['modified'], temp_demand_dir / f"{building}.csv")
+
+        # Copy original demand files for all other buildings
+        modified_buildings = set(self.modified_demand_files.keys())
+        for building in all_buildings:
+            if building not in modified_buildings:
+                original_file = self.locator.get_demand_results_file(building)
+                if os.path.exists(original_file):
+                    self.logger.info(f"Copying original demand file for building {building}")
+                    shutil.copy2(original_file, temp_demand_dir / f"{building}.csv")
+                else:
+                    self.logger.warning(f"Original demand file not found for building {building}")
+
+    def _update_total_demand_files(self, temp_demand_dir):
+        """
+        Generate updated Total_demand.csv and Total_demand_hourly.csv based on all building demand files.
+
+        This method ensures that the Total_demand.csv file contains all required columns,
+        including QH_sys_MWhyr which is needed by the thermal network simulation.
+
+        Args:
+            temp_demand_dir: Path to the demand directory in the temporary scenario
+        """
+        self.logger.info("Generating updated Total_demand.csv and Total_demand_hourly.csv")
+
+        # Get all building demand files in the temporary scenario
+        building_files = list(temp_demand_dir.glob("*.csv"))
+        building_names = [f.stem for f in building_files if
+                          f.stem != "Total_demand" and f.stem != "Total_demand_hourly"]
+
+        # Generate updated Total_demand.csv
+        self.logger.info("Generating updated Total_demand.csv")
+
+        # Create a DataFrame to store the yearly aggregated values
+        total_demand_df = pd.DataFrame()
+
+        # Process each building file
+        for building in building_names:
+            building_file = temp_demand_dir / f"{building}.csv"
+            building_df = pd.read_csv(building_file)
+
+            # Create a row for this building in the total_demand_df
+            building_row = {'name': building}
+
+            # Add metadata columns if they exist
+            for col in ['Af_m2', 'Aroof_m2', 'GFA_m2', 'Aocc_m2', 'people0']:
+                if col in building_df.columns:
+                    building_row[col] = building_df[col].iloc[0]
+
+            # Calculate yearly sums for hourly values and convert to MWh/yr
+            # Look for columns ending with _kWh and convert to _MWhyr
+            for col in building_df.columns:
+                if col.endswith('_kWh'):
+                    base_col = col[:-4]  # Remove _kWh suffix
+                    yearly_sum = building_df[col].sum() / 1000  # Convert kWh to MWh
+                    building_row[f"{base_col}_MWhyr"] = yearly_sum
+
+                # Also include peak values (columns ending with 0_kW)
+                elif col.endswith('0_kW'):
+                    building_row[col] = building_df[col].iloc[0]
+
+            # Add the row to the total demand DataFrame
+            total_demand_df = pd.concat([total_demand_df, pd.DataFrame([building_row])], ignore_index=True)
+
+        # Ensure QH_sys_MWhyr column exists (required by thermal network simulation)
+        if 'QH_sys_MWhyr' not in total_demand_df.columns:
+            # If QH_sys_kWh was not in the building files, try to calculate it from components
+            if 'Qhs_sys_MWhyr' in total_demand_df.columns and 'Qww_sys_MWhyr' in total_demand_df.columns:
+                total_demand_df['QH_sys_MWhyr'] = total_demand_df['Qhs_sys_MWhyr'] + total_demand_df['Qww_sys_MWhyr']
+                self.logger.info("Created QH_sys_MWhyr column from Qhs_sys_MWhyr and Qww_sys_MWhyr")
+            else:
+                # If we can't calculate it, add a column with zeros (better than missing)
+                total_demand_df['QH_sys_MWhyr'] = 0.0
+                self.logger.warning("Could not calculate QH_sys_MWhyr, adding column with zeros")
+
+        # Ensure QC_sys_MWhyr column exists (required by thermal network simulation)
+        if 'QC_sys_MWhyr' not in total_demand_df.columns:
+            # If QC_sys_kWh was not in the building files, try to calculate it from components
+            if 'Qcs_sys_MWhyr' in total_demand_df.columns:
+                # For cooling, we might also have data center and refrigeration cooling
+                cooling_cols = ['Qcs_sys_MWhyr']
+                if 'Qcdata_sys_MWhyr' in total_demand_df.columns:
+                    cooling_cols.append('Qcdata_sys_MWhyr')
+                if 'Qcre_sys_MWhyr' in total_demand_df.columns:
+                    cooling_cols.append('Qcre_sys_MWhyr')
+
+                total_demand_df['QC_sys_MWhyr'] = total_demand_df[cooling_cols].sum(axis=1)
+                self.logger.info(f"Created QC_sys_MWhyr column from {cooling_cols}")
+            else:
+                # If we can't calculate it, add a column with zeros (better than missing)
+                total_demand_df['QC_sys_MWhyr'] = 0.0
+                self.logger.warning("Could not calculate QC_sys_MWhyr, adding column with zeros")
+
+        # Save updated Total_demand.csv
+        total_demand_df.to_csv(temp_demand_dir / "Total_demand.csv", index=False, float_format='%.3f', na_rep='nan')
+        self.logger.info("Updated Total_demand.csv generated successfully")
+
+        # Generate updated Total_demand_hourly.csv
+        self.logger.info("Generating updated Total_demand_hourly.csv")
+
+        # This approach follows the same logic as in cea.demand.demand_writers.YearlyDemandWriter.write_aggregate_hourly
+        aggregated_hourly_results_df = pd.DataFrame()
+
+        for i, building in enumerate(building_names):
+            building_file = temp_demand_dir / f"{building}.csv"
+            hourly_results_per_building = pd.read_csv(building_file).set_index('date')
+            if i == 0:
+                aggregated_hourly_results_df = hourly_results_per_building
+            else:
+                aggregated_hourly_results_df += hourly_results_per_building
+
+        # Remove columns that shouldn't be summed
+        if 'name' in aggregated_hourly_results_df.columns:
+            aggregated_hourly_results_df = aggregated_hourly_results_df.drop(columns=['name'])
+        if 'x_int' in aggregated_hourly_results_df.columns:
+            aggregated_hourly_results_df = aggregated_hourly_results_df.drop(columns=['x_int'])
+
+        # Save updated Total_demand_hourly.csv
+        aggregated_hourly_results_df.to_csv(temp_demand_dir / "Total_demand_hourly.csv",
+                                            index=True, float_format='%.3f', na_rep='nan')
+        self.logger.info("Updated Total_demand_hourly.csv generated successfully")
+
     def _cleanup_temp_scenario(self, temp_scenario_dir):
         """
         Clean up the temporary scenario directory.
@@ -758,6 +1004,86 @@ class DynamicDTNOptimizer:
             self.logger.warning(f"Error cleaning up temporary scenario directory: {e}")
             self.logger.warning("Temporary files may remain on disk")
 
+    def _check_required_files(self, temp_scenario_dir, check_part="both"):
+        """
+        Check if all required files for thermal network simulation are present in the temporary scenario.
+
+        Args:
+            temp_scenario_dir (str): Path to the temporary scenario directory
+            check_part (str): Which part to check for required files: "part2", "part3", or "both"
+
+        Returns:
+            bool: True if all required files are present, False otherwise
+        """
+        self.logger.info(f"Checking if all required files for thermal network simulation are present (checking {check_part})")
+
+        # Create a temporary locator for the temporary scenario
+        temp_locator = cea.inputlocator.InputLocator(temp_scenario_dir)
+
+        # Initialize list of required files
+        required_files = []
+
+        # Add required files for Part 2 (thermal network simulation)
+        if check_part == "part2" or check_part == "both":
+            part2_files = [
+                # Network layout files
+                (temp_locator.get_network_layout_edges_shapefile(self.network_type), "Network layout edges shapefile"),
+                (temp_locator.get_network_layout_nodes_shapefile(self.network_type), "Network layout nodes shapefile"),
+
+                # Database files
+                (temp_locator.get_database_components_distribution_thermal_grid(), "THERMAL_GRID.csv"),
+                (temp_locator.get_db4_components_conversion_conversion_technology_csv('HEAT_EXCHANGERS'), "HEAT_EXCHANGERS.csv"),
+                (temp_locator.get_db4_components_conversion_conversion_technology_csv('HYDRAULIC_PUMPS'), "HYDRAULIC_PUMPS.csv"),
+                (temp_locator.get_db4_components_conversion_conversion_technology_csv('VAPOR_COMPRESSION_CHILLERS'), "VAPOR_COMPRESSION_CHILLERS.csv"),
+                (temp_locator.get_db4_components_conversion_conversion_technology_csv('COOLING_TOWERS'), "COOLING_TOWERS.csv"),
+
+                # Weather file
+                (temp_locator.get_weather_file(), "Weather file"),
+
+                # Demand files
+                (temp_locator.get_total_demand(), "Total demand file"),
+
+                # Thermal network files
+                (os.path.join(temp_locator.get_thermal_network_folder(), self.network_type, "edges.shp"), "Thermal network edges shapefile"),
+                (os.path.join(temp_locator.get_thermal_network_folder(), self.network_type, "nodes.shp"), "Thermal network nodes shapefile")
+            ]
+            required_files.extend(part2_files)
+
+            # Check if all building demand files exist
+            if os.path.exists(temp_locator.get_total_demand()):
+                total_demand = pd.read_csv(temp_locator.get_total_demand())
+                all_buildings = total_demand['name'].values
+                for building in all_buildings:
+                    building_file = temp_locator.get_demand_results_file(building)
+                    required_files.append((building_file, f"Building demand file for {building}"))
+
+        # Add required files for Part 3 (thermal network costs)
+        if check_part == "part3" or check_part == "both":
+            # These files are created by Part 2 and required by Part 3
+            part3_files = [
+                (temp_locator.get_thermal_network_edge_list_file(self.network_type, ''), "Thermal network edge list file"),
+                (temp_locator.get_nominal_edge_mass_flow_csv_file(self.network_type, ''), "Nominal edge mass flow file"),
+                (temp_locator.get_thermal_network_layout_massflow_edges_file(self.network_type, ''), "Edge mass flow file"),
+                (temp_locator.get_thermal_network_layout_massflow_nodes_file(self.network_type, ''), "Node mass flow file"),
+                (temp_locator.get_thermal_network_node_types_csv_file(self.network_type, ''), "Node types file"),
+                (temp_locator.get_thermal_network_plant_heat_requirement_file(self.network_type, ''), "Plant heat requirement file")
+            ]
+            required_files.extend(part3_files)
+
+        # Check if all required files exist
+        missing_files = []
+        for file_path, file_description in required_files:
+            if not os.path.exists(file_path):
+                missing_files.append((file_path, file_description))
+                self.logger.warning(f"Required file not found: {file_path} ({file_description})")
+
+        if missing_files:
+            self.logger.error(f"Found {len(missing_files)} missing files required for thermal network simulation")
+            return False
+        else:
+            self.logger.info("All required files for thermal network simulation are present")
+            return True
+
     def rerun_thermal_network_simulation(self):
         """
         Rerun the thermal network simulation with modified demands.
@@ -767,6 +1093,13 @@ class DynamicDTNOptimizer:
         # Create a temporary scenario directory with modified demand files
         temp_scenario_dir = self._create_temp_scenario_with_modified_demands()
 
+        # Check if all required files for Part 2 are present before starting the simulation
+        self.logger.info("Checking required files for thermal network simulation (Part 2)")
+        if not self._check_required_files(temp_scenario_dir, check_part="part2"):
+            self.logger.error("Cannot proceed with thermal network simulation due to missing required files")
+            self.logger.error("Please check the logs for details on missing files")
+            return
+
         # Create configs that point to the temporary scenario
         tn_config = self._create_config_copy()
         tn_config.scenario = temp_scenario_dir
@@ -774,11 +1107,20 @@ class DynamicDTNOptimizer:
 
         # Run thermal network simulation on the temporary scenario
         self.logger.info("Starting thermal network simulation (Part 2)")
+        self.logger.info("Detailed progress messages will be displayed in the console")
         thermal_network_simulation_main(tn_config)
         self.logger.info("Thermal network simulation (Part 2) completed successfully")
 
+        # Check if all required files for Part 3 are present before starting the costs calculation
+        self.logger.info("Checking required files for thermal network costs calculation (Part 3)")
+        if not self._check_required_files(temp_scenario_dir, check_part="part3"):
+            self.logger.error("Cannot proceed with thermal network costs calculation due to missing required files")
+            self.logger.error("Please check the logs for details on missing files")
+            return
+
         # Run thermal network costs calculation
         self.logger.info("Starting thermal network costs calculation (Part 3)")
+        self.logger.info("Detailed progress messages will be displayed in the console")
         tnc_config = self._create_config_copy()
         tnc_config.scenario = temp_scenario_dir
         tnc_config.thermal_network_costs.network_type = self.network_type

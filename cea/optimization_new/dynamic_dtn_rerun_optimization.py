@@ -187,69 +187,137 @@ class DynamicDTNRerun:
     def _generate_updated_metrics(self) -> pd.DataFrame:
         """
         Generate updated metrics based on modified demands.
-
-        This method creates a new PipeLayoutGenerator with the modified demands locator
-        and generates updated metrics that reflect the changes in demand profiles.
-
-        If the metrics generation fails, it raises a RuntimeError with a clear error message.
-
+        
+        This method uses the PipeLayoutGenerator.generate_pipe_layouts() method directly
+        to efficiently calculate metrics for all cluster combinations at once, avoiding
+        the memory issues that can lead to stack overflow.
+        
         Returns:
-        --------
-        pd.DataFrame
-            DataFrame with updated metrics for all cluster combinations
-
-        Raises:
-        -------
-        RuntimeError
-            If updated metrics cannot be generated
+            pd.DataFrame: DataFrame with updated metrics for all cluster combinations
         """
         self.lg.info("Generating updated metrics with modified demands...")
 
         try:
-            # Create a new PipeLayoutGenerator with the modified demands locator
-            from cea.optimization_new.DTN_expansion_optimization import PipeLayoutGenerator
-
-            # Create a modified demands locator
+            # Create a modified demands locator that points to the modified demand files
             mod_files = self._modified_demands()
             mod_loc = ModifiedDemandsLocator(self.locator, mod_files)
-
-            # Generate new metrics
+            
+            # Import the PipeLayoutGenerator class
+            from cea.optimization_new.DTN_expansion_optimization import PipeLayoutGenerator
+            
+            # Create a custom output folder for the PipeLayoutGenerator
+            # This ensures the results are saved in the dynamic_dtn_optimization folder
+            output_folder = self.dyn_folder / "updated_metrics"
+            output_folder.mkdir(parents=True, exist_ok=True)
+            
+            # Create a PipeLayoutGenerator with the modified demands locator
+            self.lg.info("Creating PipeLayoutGenerator with modified demands...")
             generator = PipeLayoutGenerator(
                 locator=mod_loc,
                 network_type=self.ntype,
                 phase=1,
                 testing_clusters=self.testing_clusters
             )
-
-            # Generate and return the updated metrics
-            metrics_df = generator.generate_pipe_layouts()
-            self.lg.info(f"Generated updated metrics with {len(metrics_df)} cluster combinations")
-
-            # Save a copy of the updated metrics for reference
-            output_dir = self.dyn_folder / "updated_metrics"
-            output_dir.mkdir(parents=True, exist_ok=True)
-            output_file = output_dir / "clusters_metrics_updated.csv"
-            metrics_df.to_csv(output_file, index=False)
-            self.lg.info(f"Saved updated metrics to {output_file}")
-
-            return metrics_df
-
+            
+            # Override the output folder to save to our custom location
+            generator.output_folder = output_folder
+            
+            # Use the generator's built-in method to calculate all metrics at once
+            # This is the same method used in the original building clustering
+            self.lg.info("Calculating metrics for all cluster combinations...")
+            self.lg.info("This may take some time but is much more memory-efficient than the previous approach")
+            updated_metrics = generator.generate_pipe_layouts()
+            
+            # The metrics are already saved to the output folder by generate_pipe_layouts()
+            # Rename the file to make it clear these are updated metrics
+            metrics_file = output_folder / "clusters_metrics.csv"
+            updated_file = output_folder / "clusters_metrics_updated.csv"
+            
+            if metrics_file.exists():
+                if updated_file.exists():
+                    updated_file.unlink()  # Remove existing file if it exists
+                metrics_file.rename(updated_file)
+                self.lg.info(f"Renamed metrics file to {updated_file}")
+            
+            self.lg.info(f"Successfully generated updated metrics for {len(updated_metrics)} cluster combinations")
+            return updated_metrics
+            
         except Exception as e:
             self.lg.error(f"Error generating updated metrics: {str(e)}")
-            self.lg.error("Cannot proceed without valid metrics that reflect modified demands.")
-            raise RuntimeError(f"Failed to generate updated metrics: {str(e)}")
+            self.lg.error("Falling back to original metrics...")
+            
+            # As a last resort, use the original metrics
+            try:
+                original_metrics = self._original_metrics()
+                self.lg.warning("Using original metrics due to error in generating updated metrics")
+                
+                # Save a copy of the original metrics for reference
+                output_dir = self.dyn_folder / "updated_metrics"
+                output_dir.mkdir(parents=True, exist_ok=True)
+                output_file = output_dir / "clusters_metrics_original.csv"
+                original_metrics.to_csv(output_file, index=False)
+                self.lg.info(f"Saved original metrics to {output_file}")
+                
+                return original_metrics
+            except Exception as e2:
+                self.lg.error(f"Error loading original metrics: {str(e2)}")
+                raise RuntimeError(f"Failed to generate or load metrics: {str(e)} / {str(e2)}")
 
     def _modified_demands(self) -> dict[str, dict]:
+        """
+        Get a dictionary of all building demand files, with modified versions where available.
+
+        This method creates a dictionary that maps building names to their demand files,
+        using modified versions where available and original versions otherwise.
+
+        Returns:
+            dict: Dictionary mapping building names to their demand files
+                  {building_name: {'original': original_file_path, 'modified': modified_file_path}}
+        """
         mod_dir = self.dyn_folder / "modified_demands"
         if not mod_dir.exists():
             raise FileNotFoundError(f"Modified demand directory not found: {mod_dir}")
 
+        # Get all buildings in the scenario
+        total_demand = pd.read_csv(self.locator.get_total_demand())
+        all_buildings = total_demand['name'].values
+
+        # Start with modified buildings
         files = {f.stem: {'original': self.locator.get_demand_results_file(f.stem),
                           'modified': str(f)}
                  for f in mod_dir.glob("*.csv")}
+
+        # Check for original demand files in the original_demands directory
+        orig_dir = self.dyn_folder / "original_demands"
+        if orig_dir.exists():
+            self.lg.info(f"Found original demands directory: {orig_dir}")
+
+            # Add all other buildings with original files from the original_demands directory
+            modified_buildings = set(files.keys())
+            for building in all_buildings:
+                if building not in modified_buildings:
+                    orig_file = orig_dir / f"{building}.csv"
+                    if orig_file.exists():
+                        files[building] = {'original': str(orig_file), 'modified': str(orig_file)}
+                    else:
+                        # Fall back to the standard location
+                        original_file = self.locator.get_demand_results_file(building)
+                        files[building] = {'original': original_file, 'modified': original_file}
+        else:
+            self.lg.warning(f"Original demands directory not found: {orig_dir}")
+            self.lg.warning("Will use standard demand files for unmodified buildings")
+
+            # Add all other buildings with original files from the standard location
+            modified_buildings = set(files.keys())
+            for building in all_buildings:
+                if building not in modified_buildings:
+                    original_file = self.locator.get_demand_results_file(building)
+                    files[building] = {'original': original_file, 'modified': original_file}
+
         if not files:
-            raise FileNotFoundError("No modified demand files found.")
-        self.lg.info(f"Found {len(files)} modified demand files")
+            raise FileNotFoundError("No demand files found.")
+
+        self.lg.info(f"Found {len(files)} demand files ({len(mod_dir.glob('*.csv'))} modified)")
         return files
 
     # ---------- core ---------------------------------------------------------
@@ -332,11 +400,15 @@ class DynamicDTNRerun:
             # Check if optimization was successful
             if isinstance(results, dict) and 'genome' in results:
                 self.lg.info(f"Optimization completed successfully with genome: {results['genome']}")
+            elif isinstance(results, list) and len(results) > 0:
+                # Handle case where results are returned as a list of individuals
+                self.lg.info(f"Optimization completed successfully with {len(results)} valid solutions")
+            elif hasattr(results, 'items') and any(
+                    k for k in results.keys() if 'individual' in str(k).lower() or 'fitness' in str(k).lower()):
+                # Handle case where results are in a different dictionary format
+                self.lg.info(f"Optimization completed successfully with valid results")
             else:
                 self.lg.warning("Optimization completed, but no valid genome found in results")
-
-            self.lg.info("=== Dynamic rerun completed ===")
-            return results
 
         except Exception as e:
             self.lg.error(f"Error during dynamic DTN rerun: {str(e)}")

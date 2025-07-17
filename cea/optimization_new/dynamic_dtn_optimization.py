@@ -990,19 +990,13 @@ class DynamicDTNOptimizer:
     def _cleanup_temp_scenario(self, temp_scenario_dir):
         """
         Clean up the temporary scenario directory.
+        This function has been modified to NOT delete any files.
 
         Args:
             temp_scenario_dir (str): Path to the temporary scenario directory
         """
-        self.logger.info(f"Cleaning up temporary scenario directory: {temp_scenario_dir}")
-
-        try:
-            # Use shutil.rmtree to remove the directory and all its contents
-            shutil.rmtree(temp_scenario_dir, ignore_errors=True)
-            self.logger.info("Temporary scenario directory cleaned up successfully")
-        except Exception as e:
-            self.logger.warning(f"Error cleaning up temporary scenario directory: {e}")
-            self.logger.warning("Temporary files may remain on disk")
+        self.logger.info(f"Temporary scenario directory preserved (not cleaning up): {temp_scenario_dir}")
+        # No cleanup is performed to preserve all files
 
     def _check_required_files(self, temp_scenario_dir, check_part="both"):
         """

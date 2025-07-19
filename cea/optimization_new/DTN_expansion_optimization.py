@@ -78,7 +78,7 @@ def setup_creator(multi_objective=False, objective_function='NPV', multi_objecti
     multi_objective : bool
         Whether to use multi-objective optimization
     objective_function : str
-        The objective function to use for single-objective optimization ('NPV' or 'ROI')
+        The objective function to use for single-objective optimization ('NPV', 'ROI', or 'emissions')
     multi_objective_functions : list
         List of objectives to use for multi-objective optimization
     """
@@ -276,7 +276,7 @@ class DTNExpansionOptimizer:
         cost_model : str
             Method for calculating pipe costs ('simplified' or 'detailed')
         objective_function : str
-            Objective function to maximize ('NPV' or 'ROI')
+            Objective function to maximize ('NPV', 'ROI') or minimize ('emissions')
         diversity_factor : float
             Typical diversity factor for district energy systems (used to convert annual demand to peak demand)
         temperature_difference_dh : float
@@ -1747,15 +1747,180 @@ class DTNExpansionOptimizer:
         # Define genome representation: each gene is a phase number (1 to num_phases)
         # for each cluster (all clusters will be connected)
         self.toolbox.register("attr_phase", random.randint, 1, self.num_phases)
-        self.toolbox.register("individual", tools.initRepeat, creator.Individual,
-                             self.toolbox.attr_phase, n=len(self.all_clusters))
+        
+        # Define a custom individual creation function that ensures diversity
+        def custom_individual():
+            # Create individuals with more diverse phase assignments
+            ind = []
+            for _ in range(len(self.all_clusters)):
+                # Distribute phases more evenly
+                phase = random.randint(1, self.num_phases)
+                ind.append(phase)
+            return creator.Individual(ind)
+        
+        # Register the custom individual creation function
+        self.toolbox.register("individual", custom_individual)
         self.toolbox.register("population", tools.initRepeat, list, self.toolbox.individual)
+        
+        # Create a custom population initialization function
+        def custom_population(n):
+            pop = []
+            
+            # Add some individuals with all clusters in the last phase
+            # This ensures at least one solution that likely respects budget constraints
+            last_phase_ind = creator.Individual([self.num_phases] * len(self.all_clusters))
+            pop.append(last_phase_ind)
+            
+            # Add some individuals with clusters evenly distributed across phases
+            for i in range(min(n // 4, 5)):  # Add up to 5 or n/4, whichever is smaller
+                even_dist_ind = creator.Individual([])
+                for j in range(len(self.all_clusters)):
+                    # Distribute clusters evenly across phases
+                    phase = (j % self.num_phases) + 1
+                    even_dist_ind.append(phase)
+                pop.append(even_dist_ind)
+            
+            # Add some individuals with progressive phase assignments
+            # (earlier clusters in earlier phases)
+            prog_ind = creator.Individual([])
+            clusters_per_phase = len(self.all_clusters) // self.num_phases
+            for j in range(len(self.all_clusters)):
+                phase = min(j // clusters_per_phase + 1, self.num_phases)
+                prog_ind.append(phase)
+            pop.append(prog_ind)
+            
+            # Fill the rest with random individuals
+            while len(pop) < n:
+                pop.append(self.toolbox.individual())
+            
+            return pop
+        
+        # Override the population creation function
+        self.toolbox.register("population", custom_population)
 
+        # Define a repair function to fix budget constraint violations
+        def repair_individual(individual):
+            """
+            Repair function to fix individuals that violate budget constraints.
+            Moves clusters from earlier phases to later phases when budget is exceeded.
+            """
+            # Convert to cluster-phase mapping
+            cluster_phase_map = {cluster: phase for cluster, phase in zip(self.all_clusters, individual)}
+            
+            # Group clusters by phase
+            clusters_by_phase = {}
+            for cluster, phase in cluster_phase_map.items():
+                if phase > 0:  # Skip unconnected clusters (phase 0)
+                    if phase not in clusters_by_phase:
+                        clusters_by_phase[phase] = []
+                    clusters_by_phase[phase].append(cluster)
+            
+            # Check budget constraints for each phase, starting from phase 1
+            for phase in range(1, self.num_phases + 1):
+                if phase not in clusters_by_phase:
+                    continue
+                
+                clusters = clusters_by_phase[phase]
+                
+                # Calculate CAPEX for this phase
+                capex, _ = self._calculate_phase_capex(clusters, phase)
+                
+                # Check if CAPEX budget is exceeded
+                if self.capex_budget_per_phase and phase-1 < len(self.capex_budget_per_phase) and capex > self.capex_budget_per_phase[phase-1]:
+                    # Sort clusters by ROI (lower ROI first to be moved)
+                    sorted_clusters = sorted(clusters, key=lambda c: self.calculate_roi((c,), phase))
+                    
+                    # Move clusters to later phases until budget is satisfied
+                    for cluster in sorted_clusters:
+                        # Don't move if we're already in the last phase
+                        if phase == self.num_phases:
+                            break
+                        
+                        # Move this cluster to the next phase
+                        idx = self.all_clusters.index(cluster)
+                        individual[idx] = phase + 1
+                        
+                        # Update clusters_by_phase
+                        clusters_by_phase[phase].remove(cluster)
+                        if phase + 1 not in clusters_by_phase:
+                            clusters_by_phase[phase + 1] = []
+                        clusters_by_phase[phase + 1].append(cluster)
+                        
+                        # Recalculate CAPEX
+                        capex, _ = self._calculate_phase_capex(clusters_by_phase[phase], phase)
+                        
+                        # Check if we're now under budget
+                        if capex <= self.capex_budget_per_phase[phase-1]:
+                            break
+                
+                # Also check total expenditure budget
+                if phase in clusters_by_phase:
+                    clusters = clusters_by_phase[phase]
+                    total_expenditure = self._calculate_phase_total_expenditure(clusters, phase)
+                    
+                    # Check if total expenditure budget is exceeded
+                    if self.total_expenditure_budget_per_phase and phase-1 < len(self.total_expenditure_budget_per_phase) and total_expenditure > self.total_expenditure_budget_per_phase[phase-1]:
+                        # Sort clusters by ROI (lower ROI first to be moved)
+                        sorted_clusters = sorted(clusters, key=lambda c: self.calculate_roi((c,), phase))
+                        
+                        # Move clusters to later phases until budget is satisfied
+                        for cluster in sorted_clusters:
+                            # Don't move if we're already in the last phase
+                            if phase == self.num_phases:
+                                break
+                            
+                            # Move this cluster to the next phase
+                            idx = self.all_clusters.index(cluster)
+                            individual[idx] = phase + 1
+                            
+                            # Update clusters_by_phase
+                            clusters_by_phase[phase].remove(cluster)
+                            if phase + 1 not in clusters_by_phase:
+                                clusters_by_phase[phase + 1] = []
+                            clusters_by_phase[phase + 1].append(cluster)
+                            
+                            # Recalculate total expenditure
+                            total_expenditure = self._calculate_phase_total_expenditure(clusters_by_phase[phase], phase)
+                            
+                            # Check if we're now under budget
+                            if total_expenditure <= self.total_expenditure_budget_per_phase[phase-1]:
+                                break
+            
+            return individual
+        
         # Register genetic operators
         self.toolbox.register("evaluate", self._evaluate_individual)
         self.toolbox.register("mate", tools.cxTwoPoint)
-        self.toolbox.register("mutate", tools.mutUniformInt, low=1, up=self.num_phases, indpb=0.2)
+        self.toolbox.register("mutate", tools.mutUniformInt, low=1, up=self.num_phases, indpb=0.4)  # Increased mutation rate
         self.toolbox.register("select", tools.selTournament, tournsize=3)
+        
+        # Define a repair decorator that wraps the genetic operators
+        def repair_decorator(func):
+            def wrapper(*args, **kwargs):
+                result = func(*args, **kwargs)
+                # Handle both mutation (returns tuple) and crossover (returns list)
+                if isinstance(result, tuple):
+                    # For mutation: result is (individual,)
+                    individual = result[0]
+                    # Apply repair to the individual
+                    repaired = repair_individual(individual)
+                    # Copy the repaired values back to the original individual
+                    individual[:] = repaired
+                    return result
+                else:
+                    # For crossover: result is a list of individuals
+                    for ind in result:
+                        repaired = repair_individual(ind)
+                        ind[:] = repaired
+                    return result
+            return wrapper
+
+        # Register the repair function normally (for direct use if needed)
+        self.toolbox.register("repair", repair_individual)
+
+        # Apply the decorator to mate and mutate
+        self.toolbox.decorate("mate", repair_decorator)
+        self.toolbox.decorate("mutate", repair_decorator)
 
         # Register the map function (use the built-in map function)
         self.toolbox.register("map", map)
@@ -1847,22 +2012,34 @@ class DTNExpansionOptimizer:
             total_npv += npv
 
         # Check CAPEX budget constraints
+        budget_violated = False
+        violation_amount = 0
+        
         for phase in range(self.num_phases):
             if phase < len(phase_capex) and self.capex_budget_per_phase and phase_capex[phase] > self.capex_budget_per_phase[phase]:
                 # Apply penalty for exceeding CAPEX budget
+                violation_amount += phase_capex[phase] - self.capex_budget_per_phase[phase]
                 log().info(f"Individual {ind_tuple} exceeds CAPEX budget in phase {phase+1}: {phase_capex[phase]} > {self.capex_budget_per_phase[phase]}")
-                total_roi = -1000
-                total_npv = -1000000
-                break
-
+                budget_violated = True
+        
         # Check total expenditure budget constraints
         for phase in range(self.num_phases):
             if phase < len(phase_total_expenditure) and self.total_expenditure_budget_per_phase and phase_total_expenditure[phase] > self.total_expenditure_budget_per_phase[phase]:
                 # Apply penalty for exceeding total expenditure budget
+                violation_amount += phase_total_expenditure[phase] - self.total_expenditure_budget_per_phase[phase]
                 log().info(f"Individual {ind_tuple} exceeds total expenditure budget in phase {phase+1}: {phase_total_expenditure[phase]} > {self.total_expenditure_budget_per_phase[phase]}")
-                total_roi = -1000
-                total_npv = -1000000
-                break
+                budget_violated = True
+        
+        # Apply penalties if budget is violated
+        if budget_violated:
+            # Base penalty
+            total_roi = -1000
+            total_npv = -1000000
+            
+            # For emissions objective, use a much larger penalty
+            # Make penalty proportional to the violation amount
+            penalty_factor = max(1, violation_amount / 1000000)  # Scale based on violation amount
+            weighted_emissions = 10000000 * penalty_factor  # Much larger penalty for emissions
 
         # Check GHG budget constraints if specified (apply in both single and multi-objective modes)
         if self.ghg_budget_per_phase:
@@ -1914,6 +2091,10 @@ class DTNExpansionOptimizer:
             obj_func_lower = self.objective_function.lower() if isinstance(self.objective_function, str) else self.objective_function
             if obj_func_lower == 'roi':
                 return (total_roi,)
+            elif obj_func_lower == 'emissions':
+                # Return negative emissions since we want to minimize emissions
+                # but the single-objective mode is set up for maximization
+                return (-weighted_emissions,)
             else:  # Default to NPV
                 return (total_npv,)
 
@@ -2173,17 +2354,26 @@ class DTNExpansionOptimizer:
             }
 
             # Add fitness values
-            objectives = self.multi_objective_functions
-            if not objectives or len(objectives) == 0:
-                objectives = ['NPV', 'emissions']
-
-            # Limit to 3 objectives maximum
-            objectives = objectives[:3]
+            if self.multi_objective_mode:
+                objectives = self.multi_objective_functions
+                if not objectives or len(objectives) == 0:
+                    objectives = ['NPV', 'emissions']
+                
+                # Limit to 3 objectives maximum
+                objectives = objectives[:3]
+            else:
+                # For single-objective mode, use the specified objective function
+                objectives = [self.objective_function]
 
             # Add fitness values to metrics
             for j, obj in enumerate(objectives):
                 if j < len(ind.fitness.values):
-                    metrics[f'fitness_{obj}'] = ind.fitness.values[j]
+                    # For emissions in single-objective mode, we need to negate the value
+                    # since we store it as negative for maximization
+                    if not self.multi_objective_mode and obj.lower() == 'emissions':
+                        metrics[f'fitness_{obj}'] = -ind.fitness.values[j]
+                    else:
+                        metrics[f'fitness_{obj}'] = ind.fitness.values[j]
 
             # Convert individual to cluster-phase mapping
             cluster_phase_map = {cluster: phase for cluster, phase in zip(self.all_clusters, ind)}

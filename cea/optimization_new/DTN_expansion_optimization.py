@@ -2113,6 +2113,7 @@ class DTNExpansionOptimizer:
 
             # Convert to cluster-phase mapping
             solution = {
+                'genome': list(best_individual),
                 'cluster_phase_map': {cluster: phase for cluster, phase in
                                      zip(self.all_clusters, best_individual) if phase > 0},
                 'fitness': best_individual.fitness.values[0],

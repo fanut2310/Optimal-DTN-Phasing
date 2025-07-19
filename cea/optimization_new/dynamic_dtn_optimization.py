@@ -29,34 +29,41 @@ class ModifiedDemandsLocator(cea.inputlocator.InputLocator):
     """A custom InputLocator that redirects demand file requests to modified versions."""
 
     def __init__(self, locator, modified_demand_files):
-        """
-        Initialize with the original locator and a mapping of modified files.
-
-        Args:
-            locator: The original InputLocator
-            modified_demand_files: Dictionary mapping building names to modified file paths
-        """
         super().__init__(locator.scenario)
-        # Copy all attributes from the original locator
-        self.__dict__.update(locator.__dict__)
         self.original_locator = locator
         self.modified_demand_files = modified_demand_files
+        self.__dict__.update(locator.__dict__)
+        self._demand_cache = {} # Add cache to prevent issues
 
     def get_demand_results_file(self, building, format='csv'):
         """
         Override to return the path to the modified demand file if available.
-
-        Args:
-            building: Building name
-            format: File format (default: 'csv')
-
-        Returns:
-            Path to the modified demand file if available, otherwise the original path
         """
-        if building in self.modified_demand_files:
-            return self.modified_demand_files[building]['modified']
+        key = building
+        if key in self.modified_demand_files:
+            modified_path = self.modified_demand_files[key]['modified']
+            # Normalize the path for consistent comparison
+            modified_path = os.path.normpath(modified_path)
+            # Verify the file exists
+            if not os.path.exists(modified_path):
+                raise FileNotFoundError(f"Modified demand file not found: {modified_path}")
+            # Add debug print
+            print(f"DEBUG: Using modified demand file for {building}: {modified_path}")
+            return modified_path
         else:
-            return self.original_locator.get_demand_results_file(building, format)
+            # Pass the original building name to maintain case consistency
+            original_path = self.original_locator.get_demand_results_file(building, format)
+            # Normalize the path for consistent comparison
+            original_path = os.path.normpath(original_path)
+            print(f"DEBUG: Using original demand file for {building}: {original_path}")
+            return original_path
+
+    def get_total_demand(self):
+        """
+        Override to potentially return modified total demand if needed.
+        For now, return the original total demand file.
+        """
+        return self.original_locator.get_total_demand()
 
 __author__ = "Fan Ut Chang"
 __copyright__ = "Copyright 2025, City Energy Analyst"

@@ -1167,120 +1167,6 @@ class DTNExpansionOptimizer:
                 shutil.copy(self.backup_file, self.supply_file)
                 os.remove(self.backup_file)
 
-    def calculate_emissions_for_genome(self, cluster_phase_map):
-        """
-        Calculate emissions for a specific genome by creating phase-specific supply files
-        and running the LCA operation module for each phase with its specific supply file.
-
-        Parameters:
-        -----------
-        cluster_phase_map : dict
-            Dictionary mapping cluster IDs to phases
-
-        Returns:
-        --------
-        tuple
-            (dict, bool) - Dictionary with emissions per phase and a flag indicating if cluster 0 has non-DISTRICT scale systems
-        """
-
-        # Initialize results dictionary - only track operation emissions
-        phase_emissions = {phase: {'operation': 0}
-                          for phase in range(1, self.num_phases + 1)}
-
-        # Get original supply file
-        supply_file = self.locator.get_building_supply()
-        original_supply_df = pd.read_csv(supply_file)
-
-        # Get district supply systems from cluster 0 buildings
-        cluster0_buildings = self._get_buildings_in_specific_cluster(0)
-        if not cluster0_buildings:
-            log().warning("No buildings found in cluster 0 (existing DTN)")
-            return phase_emissions, False
-
-        # Get supply systems used by cluster 0 (existing DTN)
-        district_supply_systems = original_supply_df[original_supply_df['name'].isin(cluster0_buildings)]
-
-        # Extract district supply types
-        district_heating_system = district_supply_systems['supply_type_hs'].iloc[0]
-        district_cooling_system = district_supply_systems['supply_type_cs'].iloc[0]
-        district_dhw_system = district_supply_systems['supply_type_dhw'].iloc[0]
-
-        # Verify these are DISTRICT scale systems
-        heating_df = pd.read_csv(self.locator.get_database_assemblies_supply_heating())
-        cooling_df = pd.read_csv(self.locator.get_database_assemblies_supply_cooling())
-        dhw_df = pd.read_csv(self.locator.get_database_assemblies_supply_hot_water())
-
-        # Check if district systems are actually DISTRICT scale
-        is_district_heating = heating_df[heating_df['code'] == district_heating_system]['scale'].iloc[0] == 'DISTRICT'
-        is_district_cooling = cooling_df[cooling_df['code'] == district_cooling_system]['scale'].iloc[0] == 'DISTRICT'
-        is_district_dhw = dhw_df[dhw_df['code'] == district_dhw_system]['scale'].iloc[0] == 'DISTRICT'
-
-        has_non_district_scale = not (is_district_heating and is_district_cooling and is_district_dhw)
-        if has_non_district_scale:
-            log().warning("Cluster 0 buildings are not using DISTRICT scale supply systems. This will result in penalties for the optimization results.")
-
-        # Create directory for phase-specific supply files
-        phase_files_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "phase_supply_files"
-        phase_files_dir.mkdir(parents=True, exist_ok=True)
-
-        # Create phase 0 supply file (original)
-        phase0_supply_path = phase_files_dir / "phase0_supply.csv"
-        original_supply_df.to_csv(phase0_supply_path, index=False)
-        log().info(f"Created phase 0 supply file: {phase0_supply_path}")
-
-        # Process each phase separately
-        connected_clusters_by_phase = {}
-        for phase in range(1, self.num_phases + 1):
-            # Get clusters connected in this phase
-            newly_connected_clusters = [cluster for cluster, p in cluster_phase_map.items() if p == phase]
-            connected_clusters_by_phase[phase] = newly_connected_clusters
-
-            # Make a copy of the original supply file for this phase
-            phase_supply_df = original_supply_df.copy()
-
-            # Get all clusters connected up to this phase
-            all_connected_clusters = [0]  # Start with cluster 0
-            for p in range(1, phase + 1):
-                all_connected_clusters.extend(connected_clusters_by_phase.get(p, []))
-
-            log().info(f"Phase {phase}: Connected clusters {all_connected_clusters}")
-
-            # Get all buildings in connected clusters
-            all_connected_buildings = []
-            for cluster in all_connected_clusters:
-                buildings = self._get_buildings_in_specific_cluster(cluster)
-                all_connected_buildings.extend(buildings)
-
-            # Update supply systems for connected buildings
-            for building in all_connected_buildings:
-                building_idx = phase_supply_df[phase_supply_df['name'] == building].index
-                if len(building_idx) > 0:
-                    phase_supply_df.loc[building_idx, 'supply_type_hs'] = district_heating_system
-                    phase_supply_df.loc[building_idx, 'supply_type_cs'] = district_cooling_system
-                    phase_supply_df.loc[building_idx, 'supply_type_dhw'] = district_dhw_system
-
-            # Save the phase-specific supply file
-            phase_supply_path = phase_files_dir / f"phase{phase}_supply.csv"
-            phase_supply_df.to_csv(phase_supply_path, index=False)
-            log().info(f"Created phase {phase} supply file: {phase_supply_path}")
-
-            # Run LCA operation module with the phase-specific supply file
-            from cea.analysis.lca.operation import lca_operation
-            lca_operation(self.locator, custom_supply_path=str(phase_supply_path))
-
-            # Load LCA results
-            lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
-
-            # Filter LCA results to only include buildings in testing clusters if specified
-            if hasattr(self, 'testing_clusters') and self.testing_clusters:
-                lca_operation_results = lca_operation_results[lca_operation_results['name'].isin(self.buildings_in_testing_clusters)]
-
-            # Calculate total emissions for all buildings in testing clusters
-            phase_emissions[phase]['operation'] = lca_operation_results['GHG_sys_tonCO2'].sum()
-
-            log().info(f"Phase {phase}: Emissions = {phase_emissions[phase]['operation']:.2f} t CO2eq/yr")
-
-        return phase_emissions, has_non_district_scale
 
     def _cache_emissions_for_individual(self, individual, emissions, has_non_district_scale):
         """Store emissions results and non-district scale flag for an individual in the cache"""
@@ -1420,7 +1306,7 @@ class DTNExpansionOptimizer:
                     phase_supply_df.loc[building_idx, 'supply_type_dhw'] = district_dhw_system
 
             # Save the phase-specific supply file
-            phase_supply_path = phase_files_dir / f"phase{phase}_supply_new.csv"
+            phase_supply_path = phase_files_dir / f"phase{phase}_supply.csv"
             phase_supply_df.to_csv(phase_supply_path, index=False)
             log().info(f"Created phase {phase} supply file: {phase_supply_path}")
 
@@ -1728,19 +1614,40 @@ class DTNExpansionOptimizer:
         """
         # Special case for phase 0: calculate emissions for the whole district
         if cluster_set == (0,):
-            # Create a cluster-phase mapping where all clusters are assigned to phase 1
-            # This will make calculate_emissions_for_genome calculate emissions for the whole district
-            # with cluster 0 using district systems and other clusters using building-scale systems
-            cluster_phase_map = {cluster: 1 for cluster in self.all_clusters}
+            # For phase 0, we can use calculate_district_emissions_new directly
+            # It will calculate emissions for the whole district with cluster 0 using district systems
+            # and all other clusters using building-scale systems
+            district_emissions = self.calculate_district_emissions_new()
+            
+            # Return the operational emissions for phase 0
+            if 0 in district_emissions:
+                return district_emissions[0]['district_operation_emission [t CO2eq/yr]']
+            else:
+                return 0
         else:
-            # Normal case: create a simple cluster-phase mapping where all clusters in the set are in phase 1
-            cluster_phase_map = {cluster: 1 for cluster in cluster_set}
-
-        # Calculate emissions using the new approach
-        emissions, _ = self.calculate_emissions_for_genome(cluster_phase_map)
-
-        # Return the operational emissions for phase 1
-        return emissions[1]['operation']
+            # For other cluster sets, we need to create a temporary individual
+            # that assigns the specified clusters to phase 1
+            temp_individual = [0] * len(self.all_clusters)
+            
+            # Map cluster IDs to indices in self.all_clusters
+            cluster_indices = {cluster: i for i, cluster in enumerate(self.all_clusters)}
+            
+            # Set phase 1 for the specified clusters
+            for cluster in cluster_set:
+                if cluster in cluster_indices:
+                    temp_individual[cluster_indices[cluster]] = 1
+            
+            # Set current_individual for use in calculate_district_emissions_new
+            self.current_individual = temp_individual
+            
+            # Calculate emissions
+            district_emissions = self.calculate_district_emissions_new()
+            
+            # Return the operational emissions for phase 1
+            if 1 in district_emissions:
+                return district_emissions[1]['district_operation_emission [t CO2eq/yr]']
+            else:
+                return 0
 
     def _setup_genetic_algorithm(self):
         """Set up the genetic algorithm using DEAP."""
@@ -1956,15 +1863,33 @@ class DTNExpansionOptimizer:
         phase_capex = [0] * self.num_phases
         phase_total_expenditure = [0] * self.num_phases
 
-        # Calculate emissions using the new approach
+        # Calculate emissions using calculate_district_emissions_new
         ind_tuple = tuple(individual)
         if ind_tuple in self.emissions_cache:
             # Use cached emissions results if available
             phase_emissions, has_non_district_scale = self.emissions_cache[ind_tuple]
             log().debug(f"Using cached emissions for individual {ind_tuple}")
         else:
-            # Calculate emissions and cache the results
-            phase_emissions, has_non_district_scale = self.calculate_emissions_for_genome(cluster_phase_map)
+            # Set current_individual for use in calculate_district_emissions_new
+            self.current_individual = individual
+            
+            # Calculate emissions using calculate_district_emissions_new
+            district_emissions = self.calculate_district_emissions_new()
+            
+            # Convert district_emissions to the format expected by the rest of the code
+            phase_emissions = {}
+            for phase in range(1, self.num_phases + 1):
+                if phase in district_emissions:
+                    phase_emissions[phase] = {
+                        'operation': district_emissions[phase]['district_operation_emission [t CO2eq/yr]']
+                    }
+            
+            # Check if cluster 0 has non-DISTRICT scale systems
+            # This check is already done inside calculate_district_emissions_new
+            # but we need to extract the result for the rest of the evaluation
+            has_non_district_scale = False
+            
+            # Cache the results
             self._cache_emissions_for_individual(ind_tuple, phase_emissions, has_non_district_scale)
             log().debug(f"Calculated and cached emissions for individual {ind_tuple}")
 

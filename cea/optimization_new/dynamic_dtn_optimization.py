@@ -21,6 +21,43 @@ from cea.optimization_new.DTN_expansion_optimization import DTNExpansionOptimize
 from cea.technologies.thermal_network.thermal_network import main as thermal_network_simulation_main
 from cea.technologies.thermal_network_costs.thermal_network_costs_new import main as thermal_network_costs_main
 
+
+# TempScenarioLocator class for redirecting file requests to the temporary scenario
+class TempScenarioLocator(cea.inputlocator.InputLocator):
+    """
+    A locator that redirects file requests to the temporary scenario.
+    
+    This locator inherits from InputLocator and is initialized with the path to the 
+    temporary scenario created by dynamic_dtn_optimization.py. It overrides methods
+    to ensure that file requests are directed to the temporary scenario instead of
+    the original scenario.
+    """
+    
+    def __init__(self, original_locator, temp_scenario_path):
+        """
+        Initialize the locator with the path to the temporary scenario.
+        
+        Parameters:
+        -----------
+        original_locator : cea.inputlocator.InputLocator
+            The original locator
+        temp_scenario_path : str or Path
+            Path to the temporary scenario
+        """
+        # Initialize with the temp scenario path
+        super().__init__(str(temp_scenario_path))
+        
+        # Store the original locator for reference
+        self.original_locator = original_locator
+        
+        # Copy attributes from original locator that might be needed
+        self.__dict__.update({k: v for k, v in original_locator.__dict__.items() 
+                             if k not in ['scenario', '_scenario', '_temp_directory']})
+        
+        # Clear any cache
+        if hasattr(self, '_demand_cache'):
+            self._demand_cache = {}
+
 ###############################################################################
 # 2) CUSTOM INPUTLOCATOR                                                     #
 ###############################################################################
@@ -511,6 +548,33 @@ class DynamicDTNOptimizer:
 
         self.logger.info(f"Temporary scenario created at: {temp_dir}")
         return str(temp_dir)
+        
+    def get_temp_locator(self):
+        """
+        Get a locator for the temporary scenario.
+        
+        This method creates the temporary scenario if it doesn't exist,
+        and returns a TempScenarioLocator instance for the temporary scenario.
+        
+        Returns:
+            TempScenarioLocator: A locator for the temporary scenario
+        """
+        self.logger.info("Getting locator for temporary scenario")
+        
+        # Check if the temporary scenario exists
+        temp_dir = Path(self.locator.get_optimization_results_folder()) / "dynamic_dtn_optimization" / "temp_scenario"
+        if not temp_dir.exists():
+            self.logger.info("Temporary scenario doesn't exist, creating it")
+            temp_scenario_dir = self._create_temp_scenario_with_modified_demands()
+        else:
+            self.logger.info(f"Using existing temporary scenario at: {temp_dir}")
+            temp_scenario_dir = str(temp_dir)
+            
+        # Create a TempScenarioLocator for the temporary scenario
+        temp_locator = TempScenarioLocator(self.locator, temp_scenario_dir)
+        self.logger.info(f"Created TempScenarioLocator for: {temp_scenario_dir}")
+        
+        return temp_locator
 
     def _copy_scenario_files(self, source_scenario, target_scenario):
         """

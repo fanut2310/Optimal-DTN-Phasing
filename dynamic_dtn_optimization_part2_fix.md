@@ -1,79 +1,112 @@
-# Dynamic DTN Optimization Part 2 Fix
+# Dynamic DTN Optimization Part 2 - Fix Summary
 
-## Issue Description
+## Issues Addressed
 
-The Dynamic DTN Rerun Optimization Part 2 script was failing with the following error:
+1. **File Location Issues**: Script was looking for input files in original locations instead of the temporary scenario.
+2. **Worksheet Not Found**: Error when trying to read 'ENERGY_PRICE' worksheet which doesn't exist.
+3. **Column Not Found**: Error when trying to filter by 'type_mat' column which doesn't exist in some files.
 
-```
-Parameter not configured to work with this script: dtn-expansion-optimization:population-size
-Traceback: Traceback (most recent call last):
-  File "D:\changf\CityEnergyAnalyst\cea\optimization_new\dynamic_dtn_optimization_part2.py", line 1268, in run
-    population_size=self.config.dtn_expansion_optimization.population_size,
-  File "D:\changf\CityEnergyAnalyst\cea\config.py", line 329, in __getattr__
-    raise AttributeError(
-AttributeError: Parameter not configured to work with this script: dtn-expansion-optimization:population-size
-```
+## Solution Implemented
 
-This error occurred because the script was trying to access the `population-size` parameter from the `dtn-expansion-optimization` section of the configuration, but this parameter was not properly configured to work with the `dynamic_dtn_optimization_part2.py` script.
+### 1. Created TempScenarioLocator Class
 
-## Analysis
-
-After examining the code and configuration files, we found:
-
-1. The `population-size` parameter is defined in the `dtn-expansion-optimization` section of the `default.config` file.
-2. The `dynamic-dtn-optimization` section exists but doesn't have its own `population-size` parameter.
-3. There's a comment in the config file suggesting that some parameters are shared between sections:
-   ```
-   # Note: This parameter is defined in the dtn-expansion-optimization section and referenced from there
-   ```
-4. The error occurs when the script tries to access `self.config.dtn_expansion_optimization.population_size` in the `run` method.
-
-## Solution
-
-We modified the code to make it more robust by adding try-except blocks to handle the case when the parameters can't be accessed from the configuration. If an AttributeError occurs, the code now falls back to using default values.
-
-### Changes Made
+Created a class that inherits from `InputLocator` and redirects file requests to the temporary scenario:
 
 ```python
-# Before
-solution = self.run_optimization(
-    population_size=self.config.dtn_expansion_optimization.population_size,
-    num_generations=self.config.dtn_expansion_optimization.num_generations
-)
+class TempScenarioLocator(cea.inputlocator.InputLocator):
+    def __init__(self, original_locator, temp_scenario_path):
+        super().__init__(str(temp_scenario_path))
+        self.original_locator = original_locator
+        # Copy necessary attributes
+```
 
-# After
-# Try to get parameters from dtn-expansion-optimization section, or use defaults if not available
-try:
-    population_size = self.config.dtn_expansion_optimization.population_size
-except AttributeError:
-    population_size = 50  # Default value
-    log("Using default population size: 50")
-    
-try:
-    num_generations = self.config.dtn_expansion_optimization.num_generations
-except AttributeError:
-    num_generations = 30  # Default value
-    log("Using default number of generations: 30")
-    
-solution = self.run_optimization(
-    population_size=population_size,
-    num_generations=num_generations
+The class overrides methods to return paths in the temporary scenario with clear error messages.
+
+### 2. Modified Main Function
+
+Updated to:
+- Check for the temp scenario folder
+- Create a `TempScenarioLocator` instance
+- Verify necessary files exist
+- Pass the temp locator to the optimizer
+
+```python
+temp_scenario_path = Path(locator.get_dynamic_dtn_optimization_folder()) / "temp_scenario"
+if not temp_scenario_path.exists():
+    log().error(f"Temporary scenario folder not found: {temp_scenario_path}")
+    return
+
+temp_locator = TempScenarioLocator(locator, temp_scenario_path)
+
+optimizer = DTNExpansionOptimizer(
+    locator=temp_locator,  # Use temp locator instead of original
+    # ... other parameters ...
 )
 ```
 
-## Benefits of This Approach
+### 3. Updated _get_energy_price Method
 
-1. **Robustness**: The script now gracefully handles the case when the parameters are not available in the configuration.
-2. **Transparency**: The script logs a message when it's using default values, making it clear to the user what's happening.
-3. **Flexibility**: The script still tries to use the parameters from the configuration first, maintaining the intended behavior when the parameters are properly configured.
-4. **Minimal Changes**: We made minimal changes to the code, focusing only on the specific issue at hand.
+Modified to:
+- Try 'ENERGY_PRICE' worksheet first
+- Fall back to 'FEEDSTOCKS' worksheet if needed
+- Map column names appropriately
+- Provide clear error messages
 
-## Alternative Solutions Considered
+### 4. Updated _load_cost_data Method
 
-1. **Add the parameters to the dynamic-dtn-optimization section**: This would require modifying the configuration file, which might not be desirable or possible in all environments.
-2. **Always use default values**: This would be simpler but would ignore the configuration even when it's properly set up.
-3. **Modify the configuration system**: This would be a more complex solution that might have unintended consequences for other parts of the system.
+Modified to:
+- Try 'THERMAL_GRID' worksheet first
+- Try CSV format if needed
+- Check for 'type_mat' column
+- Try alternative column names if needed
+- Create default pump data if necessary
+- Provide clear error messages
 
-## Conclusion
+## Benefits
 
-The implemented solution addresses the immediate issue while maintaining the intended behavior of the script. It makes the code more robust by gracefully handling the case when the parameters are not available in the configuration, and it provides clear feedback to the user about what's happening.
+1. **Robustness**: Handles edge cases gracefully with clear error messages
+2. **Correctness**: Uses correct input files with modified demands
+3. **Clarity**: More informative error messages
+4. **Maintainability**: Better separation of concerns and error handling
+
+## Testing Recommendations
+
+1. Run `dynamic_dtn_optimization.py` first to create the temporary scenario
+2. Run `dynamic_dtn_optimization_part2.py` and verify it accesses correct files
+3. Check that it handles missing worksheets/columns gracefully
+4. Verify results are correctly saved
+
+## Usage Instructions
+
+1. **Prerequisite**: Always run `dynamic_dtn_optimization.py` first to create the temporary scenario with modified demands
+   ```
+   cea dynamic-dtn-optimization --scenario YOUR_SCENARIO --network-type DH
+   ```
+
+2. **Run the updated script**: Use the same parameters as you would for the original script
+   ```
+   cea dynamic-dtn-optimization-part2 --scenario YOUR_SCENARIO --network-type DH
+   ```
+
+3. **Check the logs**: The script now provides detailed logging about which files it's accessing and any issues it encounters
+
+4. **Review results**: Results will be saved in:
+   ```
+   outputs/data/optimization/dynamic_dtn_optimization/rerun_results/
+   ```
+
+## Troubleshooting
+
+If you encounter errors:
+
+1. **Missing temporary scenario**: Ensure `dynamic_dtn_optimization.py` completed successfully
+2. **File format issues**: Check that the database files in the temporary scenario have the expected format
+3. **Missing columns**: If you see errors about missing columns, check the structure of your database files
+4. **Worksheet errors**: If you see errors about missing worksheets, check that your database files have the expected worksheets
+
+## Future Improvements
+
+1. Add more robust error handling for other potential issues
+2. Implement a validation step to check the structure of all input files before starting the optimization
+3. Add an option to regenerate the temporary scenario if it's missing or incomplete
+4. Improve logging to provide more context about the optimization process

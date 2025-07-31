@@ -2,93 +2,81 @@
 
 ## Issue Description
 
-The Dynamic DTN Rerun Optimization Part 2 script was failing with errors like:
+When running the `dynamic-dtn-optimization-part2` script, the following error occurred:
 
 ```
-Parameter not configured to work with this script: dtn-expansion-optimization:population-size
-Parameter not configured to work with this script: dtn-expansion-optimization:num-phases
+AttributeError: Parameter not configured to work with this script: dynamic-dtn-optimization:heating-demand-reduction
 ```
 
-These errors occurred because the script was trying to access parameters from the `dtn-expansion-optimization` section of the configuration, but these parameters were not properly configured to work with the `dynamic_dtn_optimization_part2.py` script.
+This error occurred because the script was trying to access configuration parameters that were not registered for the script in the `scripts.yml` file.
 
-## Analysis
+## Root Cause
 
-After examining the code in `dynamic_dtn_optimization_part2.py`, I found that the `run_optimization` method was accessing several parameters from the `dtn_expansion_optimization` section:
+The `dynamic_dtn_optimization_part2.py` script creates an instance of the `DynamicDTNOptimizer` class from `dynamic_dtn_optimization.py`:
 
 ```python
-# Set up parameters for optimization
-self.num_phases = self.config.dtn_expansion_optimization.num_phases
-
-# Parse phase durations from config
-phase_durations_str = self.config.dtn_expansion_optimization.phase_durations
-
-# Set interest rate
-self.interest_rate = self.config.dtn_expansion_optimization.interest_rate
-
-# Set energy price
-self.energy_price = self.config.dtn_expansion_optimization.energy_price
-
-# Set objective function
-self.objective_function = self.config.dtn_expansion_optimization.objective_function
-
-# Set multi-objective mode
-self.multi_objective_mode = self.config.dtn_expansion_optimization.multi_objective_mode
-
-# Parse multi-objective functions from config
-multi_objective_functions_str = self.config.dtn_expansion_optimization.multi_objective_functions
+# Create a DynamicDTNOptimizer instance
+dynamic_optimizer = DynamicDTNOptimizer(locator, config)
 ```
 
-Additionally, in the `run` method, it was trying to access:
-- `population_size`
-- `num_generations`
+The `DynamicDTNOptimizer` class initializes several parameters from the `dynamic_dtn_optimization` section of the configuration:
 
-However, in the `scripts.yml` file, the `dynamic-dtn-optimization-part2` module was only configured to use a few parameters:
-
-```yaml
-parameters: [ 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free',
-              'dynamic-dtn-optimization:network-type', 'dtn-expansion-optimization:testing-clusters' ]
+```python
+self.network_type = config.dynamic_dtn_optimization.network_type
+self.heating_reduction = config.dynamic_dtn_optimization.heating_demand_reduction / 100.0
+self.cooling_reduction = config.dynamic_dtn_optimization.cooling_demand_reduction / 100.0
+self.dhw_reduction = config.dynamic_dtn_optimization.dhw_demand_reduction / 100.0
+self.electricity_reduction = config.dynamic_dtn_optimization.electricity_demand_reduction / 100.0
+self.num_last_clusters = config.dynamic_dtn_optimization.num_last_clusters
 ```
 
-This mismatch between the parameters being accessed in the code and the parameters configured in `scripts.yml` was causing the AttributeError exceptions.
+However, only the `network-type` parameter was registered for the `dynamic-dtn-optimization-part2` script in the `scripts.yml` file, causing the error when trying to access the other parameters.
 
 ## Solution
 
-I updated the `scripts.yml` file to include all the necessary parameters from the `dtn-expansion-optimization` section for the `dynamic-dtn-optimization-part2` module:
+The solution was to update the `scripts.yml` file to register all the missing parameters for the `dynamic-dtn-optimization-part2` script. The following parameters were added:
+
+- `dynamic-dtn-optimization:heating-demand-reduction`
+- `dynamic-dtn-optimization:cooling-demand-reduction`
+- `dynamic-dtn-optimization:dhw-demand-reduction`
+- `dynamic-dtn-optimization:electricity-demand-reduction`
+- `dynamic-dtn-optimization:num-last-clusters`
+
+These parameters were already registered for the `dynamic-dtn-optimization` script, so they just needed to be added to the `dynamic-dtn-optimization-part2` script as well.
+
+## Changes Made
+
+The `scripts.yml` file was updated to add the missing parameters to the `dynamic-dtn-optimization-part2` script:
 
 ```yaml
-parameters: [ 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free',
-              'dynamic-dtn-optimization:network-type', 'dtn-expansion-optimization:testing-clusters',
-              'dtn-expansion-optimization:num-phases',
-              'dtn-expansion-optimization:phase-durations',
-              'dtn-expansion-optimization:interest-rate',
-              'dtn-expansion-optimization:energy-price',
-              'dtn-expansion-optimization:objective-function',
-              'dtn-expansion-optimization:multi-objective-mode',
-              'dtn-expansion-optimization:multi-objective-functions',
-              'dtn-expansion-optimization:population-size',
-              'dtn-expansion-optimization:num-generations' ]
+  - name: dynamic-dtn-optimization-part2
+    label: "Dynamic DTN Optimization Part 2: Rerun Optimization"
+    description: |
+      Alternative implementation of Dynamic DTN Optimization Part 2 that directly uses files in the temp scenario folder
+      without relying on complex redirection mechanisms or inheritance from other modules. This implementation
+      avoids path handling issues that may occur with the standard implementation.
+      
+      **IMPORTANT**: This module requires results from Dynamic DTN Optimization Part 1.
+      Please run Dynamic DTN Optimization Part 1 with the same network type before running this module.
+    interfaces: [ cli, dashboard ]
+    module: cea.optimization_new.dynamic_dtn_optimization_part2
+    parameters: [ 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free',
+                  'dynamic-dtn-optimization:network-type', 'dtn-expansion-optimization:testing-clusters',
+                  'dynamic-dtn-optimization:heating-demand-reduction',
+                  'dynamic-dtn-optimization:cooling-demand-reduction',
+                  'dynamic-dtn-optimization:dhw-demand-reduction',
+                  'dynamic-dtn-optimization:electricity-demand-reduction',
+                  'dynamic-dtn-optimization:num-last-clusters',
+                  'dtn-expansion-optimization:num-phases',
+                  ... (other parameters) ... ]
 ```
 
-This ensures that all the required parameters are properly configured to work with the module, which should resolve the AttributeError exceptions.
+## Testing
 
-## Benefits of This Approach
+After making these changes, the `dynamic-dtn-optimization-part2` script should run without the AttributeError. The script will now be able to access all the required parameters from the `dynamic_dtn_optimization` section of the configuration.
 
-1. **Comprehensive Solution**: By adding all the necessary parameters to the configuration, we ensure that all parts of the code can access the parameters they need.
+## Recommendations for Future Development
 
-2. **Consistency with Other Modules**: The `dynamic-dtn-optimization` module (Part 1) already uses these parameters, so it makes sense for the Part 2 module to use them as well.
+When creating scripts that use classes or functions from other scripts, make sure to register all the configuration parameters that are used by those classes or functions in the `scripts.yml` file. This will prevent similar errors in the future.
 
-3. **Maintainability**: This approach makes the code more maintainable by ensuring that the configuration accurately reflects the parameters used by the code.
-
-4. **Robustness**: While the code already had some error handling for missing parameters (using try-except blocks), this solution is more robust because it ensures that the parameters are properly configured in the first place.
-
-## Alternative Approaches Considered
-
-1. **Add try-except blocks for all parameter accesses**: This would involve modifying the `run_optimization` method to handle the case when parameters are not available, similar to what's done in the `run` method. However, this would be more complex and would still require the parameters to be properly configured for optimal functionality.
-
-2. **Use parameters from the dynamic-dtn-optimization section**: Another approach would be to modify the code to use parameters from the `dynamic-dtn-optimization` section instead of the `dtn-expansion-optimization` section. However, this would require more extensive code changes and might not be consistent with how the parameters are used in other parts of the codebase.
-
-3. **Create a shared parameter section**: We could create a new section in the configuration file for parameters shared between different optimization modules. However, this would require more extensive changes to the configuration system.
-
-## Conclusion
-
-The implemented solution addresses the immediate issue while maintaining the intended behavior of the script. By adding the necessary parameters to the configuration, we ensure that the script can access all the parameters it needs without errors.
+It's also a good practice to check for other potentially missing parameters when fixing issues like this, to ensure that all required parameters are properly registered.

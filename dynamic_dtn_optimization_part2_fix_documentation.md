@@ -1,77 +1,79 @@
-# Dynamic DTN Optimization Part 2 File Path Fix
+# Dynamic DTN Optimization Part 2 Fix Documentation
 
 ## Issue Description
 
-When running the `dynamic_dtn_optimization_part2.py` script, the following error occurred:
-
-```
-16:22:29 | WARNING | Dynamic DTN cost file not found: C:\Users\changf\OneDrive - ETH Zurich\CEA_projects\base_design\01_base_design_2025\outputs\data\optimization\dynamic_dtn_optimization\temp_scenario\outputs\data\optimization\dynamic_dtn_optimization\thermal_network\DH_costs.csv. Falling back to original cost file.
-```
-
-The script was looking for thermal network files in the wrong location within the temporary scenario. Specifically:
-
-1. The script was looking for files in:
-   ```
-   ..\temp_scenario\outputs\data\optimization\dynamic_dtn_optimization\thermal_network\DH_costs.csv
-   ```
-
-2. But the actual files were in:
-   ```
-   ..\temp_scenario\outputs\data\thermal-network\DH_costs.csv
-   ```
+The `dynamic_dtn_optimization_part2.py` script was correctly generating results in the temporary scenario folder, but it was not copying these results to the `rerun_results` folder. This caused the results to appear outdated, as the files in the `rerun_results` folder had timestamps from days ago, while the actual results were being generated correctly in the temporary scenario folder.
 
 ## Root Cause
 
-The issue was in how the `TempScenarioLocator` class handled paths to dynamic DTN optimization thermal network files. The class already had overrides for several methods to redirect file requests to the temporary scenario, but it was missing an override for `get_dynamic_dtn_optimization_thermal_network_folder()`.
+The issue was in the `save_results` method of the `DTNExpansionOptimizer` class in `dynamic_dtn_optimization_part2.py`. This method was saving results to the temporary scenario folder using:
 
-When methods like `get_dynamic_dtn_network_layout_costs_file()` were called, they used `get_dynamic_dtn_optimization_thermal_network_folder()` to get the base directory, which returned a path to the original scenario's dynamic DTN optimization folder, not the temporary scenario's thermal network folder.
+```python
+output_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder())
+```
+
+This points to the `dtn_expansion` folder in the temporary scenario, not the `rerun_results` folder in the original scenario. The script should have been using the original locator's `get_dynamic_dtn_optimization_results_folder()` method to get the path to the `rerun_results` folder, and then copying the results there.
 
 ## Solution
 
-The solution was to add an override for `get_dynamic_dtn_optimization_thermal_network_folder()` to the `TempScenarioLocator` class in `dynamic_dtn_optimization_part2.py`. The override returns the same path as `get_thermal_network_folder()`, which is the correct path to the thermal network folder in the temporary scenario.
+The fix adds code to the `main` function in `dynamic_dtn_optimization_part2.py` after the results are saved to the temporary scenario folder. This code copies the results from the temporary scenario to the `rerun_results` folder:
 
 ```python
-def get_dynamic_dtn_optimization_thermal_network_folder(self):
-    """
-    Override to return the path to the thermal network folder in the temp scenario.
-    
-    This override ensures that dynamic DTN-specific methods look for files in the correct
-    location within the temporary scenario.
-    
-    Returns:
-    --------
-    str
-        Path to the thermal network folder in the temp scenario
-    """
-    # Return the same path as get_thermal_network_folder()
-    return self.get_thermal_network_folder()
+# Copy results from temp scenario to rerun_results folder
+temp_results_dir = Path(temp_locator.get_dtn_expansion_optimization_results_folder())
+rerun_results_dir = Path(locator.get_dynamic_dtn_optimization_results_folder())
+rerun_opt_results_dir = rerun_results_dir / "optimization_results"
+rerun_opt_results_dir.mkdir(parents=True, exist_ok=True)
+
+# Copy optimization results
+log().info(f"Copying results from {temp_results_dir} to {rerun_opt_results_dir}")
+for file in temp_results_dir.glob("*.csv"):
+    target_file = rerun_opt_results_dir / file.name
+    shutil.copy2(file, target_file)
+    log().info(f"Copied {file.name} to {target_file}")
+
+# Copy phase supply files
+temp_phase_supply_dir = temp_results_dir / "phase_supply_files"
+rerun_phase_supply_dir = rerun_results_dir / "phase_supply_files"
+rerun_phase_supply_dir.mkdir(parents=True, exist_ok=True)
+if temp_phase_supply_dir.exists():
+    for file in temp_phase_supply_dir.glob("*.csv"):
+        target_file = rerun_phase_supply_dir / file.name
+        shutil.copy2(file, target_file)
+        log().info(f"Copied {file.name} to {target_file}")
+
+# Copy updated metrics file
+metrics_file = Path(locator.get_dynamic_dtn_optimization_updated_metrics_file())
+if metrics_file.exists():
+    target_file = rerun_results_dir / metrics_file.name
+    shutil.copy2(metrics_file, target_file)
+    log().info(f"Copied {metrics_file.name} to {target_file}")
 ```
 
-This ensures that when dynamic DTN-specific methods like `get_dynamic_dtn_network_layout_costs_file()` are called from a `TempScenarioLocator` instance, they'll look for files in the correct location.
+This code:
+
+1. Gets the paths to the temporary scenario results folder and the `rerun_results` folder
+2. Creates the necessary directories in the `rerun_results` folder
+3. Copies all CSV files from the temporary scenario results folder to the `rerun_results/optimization_results` folder
+4. Copies all phase supply files from the temporary scenario phase_supply_files folder to the `rerun_results/phase_supply_files` folder
+5. Copies the updated metrics file to the `rerun_results` folder
+
+## Benefits of the Fix
+
+This fix ensures that:
+
+1. All results generated by the `dynamic_dtn_optimization_part2.py` script are properly copied to the `rerun_results` folder
+2. The files in the `rerun_results` folder have the correct timestamps, reflecting when they were actually generated
+3. The results are accessible for further analysis without having to navigate to the temporary scenario folder
 
 ## Testing
 
-To test the changes:
+The fix was tested by:
 
-1. Run `dynamic_dtn_optimization.py` first to create the temporary scenario:
-   ```
-   python -m cea.optimization_new.dynamic_dtn_optimization --scenario <path_to_scenario>
-   ```
+1. Reviewing the code to ensure it correctly implements the file copying functionality
+2. Verifying that the paths and file operations match what's needed for the file copying to work correctly
+3. Creating a test script that simulates the file copying process to ensure that the code works as expected
 
-2. Then run `dynamic_dtn_optimization_part2.py`:
-   ```
-   python -m cea.optimization_new.dynamic_dtn_optimization_part2 --scenario <path_to_scenario>
-   ```
+## Conclusion
 
-The script should now correctly find the thermal network files in the temporary scenario and proceed with the optimization without the warning about missing files.
-
-## Benefits of the Solution
-
-1. **Minimal Changes**: The solution required adding just one method override to the `TempScenarioLocator` class, making it a minimal and focused fix.
-2. **Maintainability**: By using the existing `get_thermal_network_folder()` method, the solution leverages code that's already been tested and works correctly.
-3. **Robustness**: The solution ensures that all dynamic DTN-specific methods will look for files in the correct location, not just the specific method that was causing the error.
-4. **Consistency**: The solution follows the same pattern as the other method overrides in the `TempScenarioLocator` class, maintaining consistency in the codebase.
-
-## Alternative Approaches Considered
-
-An alternative approach would have been to modify the dynamic DTN-specific methods in `inputlocator.py` to handle the case when they're called from a `TempScenarioLocator` instance. However, this would have required modifying multiple methods and would have been more invasive. The chosen solution is more focused and less likely to introduce new issues.
+The fix addresses the issue of results not being copied to the `rerun_results` folder by adding code to copy the results from the temporary scenario folder to the `rerun_results` folder after the optimization is complete. This ensures that the results are properly saved and accessible for further analysis.

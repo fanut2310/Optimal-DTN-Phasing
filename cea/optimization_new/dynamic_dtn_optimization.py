@@ -57,6 +57,43 @@ class TempScenarioLocator(cea.inputlocator.InputLocator):
         # Clear any cache
         if hasattr(self, '_demand_cache'):
             self._demand_cache = {}
+            
+    def get_thermal_network_folder(self):
+        """
+        Get the path to the thermal network folder in the temp scenario.
+        
+        Returns:
+        --------
+        str
+            Path to the thermal network folder
+        """
+        path = os.path.join(self.scenario, 'outputs', 'data', 'thermal-network')
+        
+        if not os.path.exists(path):
+            logging.error(f"Thermal network folder not found in temp scenario: {path}")
+            raise FileNotFoundError(f"Thermal network folder not found in temp scenario: {path}")
+        
+        return path
+        
+    def get_dynamic_dtn_network_layout_costs_file(self, network_type, network_name=""):
+        """
+        Override to return the path to the network layout costs file in the temp scenario.
+        
+        Parameters:
+        -----------
+        network_type : str
+            Type of the network (e.g., 'DH', 'DC')
+        network_name : str, optional
+            Name of the network
+            
+        Returns:
+        --------
+        str
+            Path to the network layout costs file in the temp scenario
+        """
+        # Use get_thermal_network_folder() directly
+        file_name = f"{network_type}_costs.csv"
+        return os.path.join(self.get_thermal_network_folder(), file_name)
 
 ###############################################################################
 # 2) CUSTOM INPUTLOCATOR                                                     #

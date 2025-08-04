@@ -31,6 +31,11 @@ class TempScenarioLocator(cea.inputlocator.InputLocator):
     temporary scenario created by dynamic_dtn_optimization.py. It overrides methods
     to ensure that file requests are directed to the temporary scenario instead of
     the original scenario.
+    
+    The TempScenarioLocator overrides key methods like get_total_demand() and 
+    get_total_demand_hourly() to ensure they return paths to files in the temporary 
+    scenario rather than the original scenario. This is essential for the dynamic DTN 
+    optimization workflow, which needs to use modified demand files for its calculations.
     """
     
     def __init__(self, original_locator, temp_scenario_path):
@@ -132,12 +137,39 @@ class ModifiedDemandsLocator(cea.inputlocator.InputLocator):
             print(f"DEBUG: Using original demand file for {building}: {original_path}")
             return original_path
 
-    def get_total_demand(self):
+    def get_total_demand(self, format='csv'):
         """
-        Override to potentially return modified total demand if needed.
-        For now, return the original total demand file.
+        Override to return the path to the total demand file in the temp scenario.
+        
+        Parameters:
+        -----------
+        format : str, optional
+            File format (default: 'csv')
+            
+        Returns:
+        --------
+        str
+            Path to the total demand file in the temp scenario
         """
-        return self.original_locator.get_total_demand()
+        demand_folder = os.path.join(self.scenario, 'outputs', 'data', 'demand')
+        return os.path.join(demand_folder, f'Total_demand.{format}')
+        
+    def get_total_demand_hourly(self, format='csv'):
+        """
+        Override to return the path to the hourly total demand file in the temp scenario.
+        
+        Parameters:
+        -----------
+        format : str, optional
+            File format (default: 'csv')
+            
+        Returns:
+        --------
+        str
+            Path to the hourly total demand file in the temp scenario
+        """
+        demand_folder = os.path.join(self.scenario, 'outputs', 'data', 'demand')
+        return os.path.join(demand_folder, f'Total_demand_hourly.{format}')
 
 __author__ = "Fan Ut Chang"
 __copyright__ = "Copyright 2025, City Energy Analyst"
@@ -566,12 +598,12 @@ class DynamicDTNOptimizer:
         self.logger.info("Creating temporary scenario with modified demand files")
 
         # Create a temporary directory
-        temp_dir = Path(self.locator.get_optimization_results_folder()) / "dynamic_dtn_optimization" / "temp_scenario"
+        temp_dir = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_folder())
         temp_dir.mkdir(parents=True, exist_ok=True)
         self.logger.info(f"Created temporary scenario directory: {temp_dir}")
 
         # Create necessary subdirectories
-        temp_demand_dir = temp_dir / "outputs" / "data" / "demand"
+        temp_demand_dir = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_demand_folder())
         temp_demand_dir.mkdir(parents=True, exist_ok=True)
 
         # Copy necessary files from original scenario
@@ -599,7 +631,7 @@ class DynamicDTNOptimizer:
         self.logger.info("Getting locator for temporary scenario")
         
         # Check if the temporary scenario exists
-        temp_dir = Path(self.locator.get_optimization_results_folder()) / "dynamic_dtn_optimization" / "temp_scenario"
+        temp_dir = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_folder())
         if not temp_dir.exists():
             self.logger.info("Temporary scenario doesn't exist, creating it")
             temp_scenario_dir = self._create_temp_scenario_with_modified_demands()

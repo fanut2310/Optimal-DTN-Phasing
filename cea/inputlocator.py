@@ -370,6 +370,49 @@ class InputLocator(object):
             Path to the temporary scenario folder
         """
         return self._ensure_folder(self.get_dynamic_dtn_optimization_folder(), 'temp_scenario')
+        
+    def get_dynamic_dtn_optimization_temp_scenario_demand_folder(self):
+        """
+        Returns the folder containing the demand files for the temporary scenario in dynamic DTN optimization
+        
+        Returns:
+        --------
+        str
+            Path to the temporary scenario's demand folder
+        """
+        return self._ensure_folder(self.get_dynamic_dtn_optimization_temp_scenario_folder(), 'outputs', 'data', 'demand')
+        
+    def get_dynamic_dtn_optimization_temp_scenario_total_demand(self, format='csv'):
+        """
+        Returns the path to the total demand file in the temporary scenario for dynamic DTN optimization
+        
+        Parameters:
+        -----------
+        format : str, optional
+            File format (default: 'csv')
+            
+        Returns:
+        --------
+        str
+            Path to the total demand file in the temporary scenario
+        """
+        return os.path.join(self.get_dynamic_dtn_optimization_temp_scenario_demand_folder(), f'Total_demand.{format}')
+        
+    def get_dynamic_dtn_optimization_temp_scenario_total_demand_hourly(self, format='csv'):
+        """
+        Returns the path to the hourly total demand file in the temporary scenario for dynamic DTN optimization
+        
+        Parameters:
+        -----------
+        format : str, optional
+            File format (default: 'csv')
+            
+        Returns:
+        --------
+        str
+            Path to the hourly total demand file in the temporary scenario
+        """
+        return os.path.join(self.get_dynamic_dtn_optimization_temp_scenario_demand_folder(), f'Total_demand_hourly.{format}')
 
     def get_dynamic_dtn_optimization_modified_demands_folder(self):
         """

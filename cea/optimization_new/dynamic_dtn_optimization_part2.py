@@ -119,16 +119,21 @@ class TempScenarioLocator(cea.inputlocator.InputLocator):
         
         return path
     
-    def get_total_demand(self):
+    def get_total_demand(self, format='csv'):
         """
         Get the path to the total demand file in the temp scenario.
         
+        Parameters:
+        -----------
+        format : str, optional
+            Format of the file (default: 'csv')
+            
         Returns:
         --------
         str
             Path to the total demand file
         """
-        path = os.path.join(self.scenario, 'outputs', 'data', 'demand', 'Total_demand.csv')
+        path = os.path.join(self.scenario, 'outputs', 'data', 'demand', f'Total_demand.{format}')
         
         if not os.path.exists(path):
             log().error(f"Total demand file not found in temp scenario: {path}")
@@ -592,7 +597,7 @@ class DTNExpansionOptimizer:
         cluster_edges_path = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "cluster_edges.csv"
         self.cluster_edges = pd.read_csv(cluster_edges_path)
 
-        cluster_nodes_path = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "cluster_nodes.csv"
+        cluster_nodes_path = Path(self.locator.get_dtn_cluster_nodes_file())
         self.cluster_nodes = pd.read_csv(cluster_nodes_path)
 
         # Load total demand
@@ -3816,6 +3821,429 @@ class DTNExpansionOptimizer:
 
         return results_file
 
+class PipeLayoutGenerator:
+    """Generate pipe layouts for different sets of clusters and calculate metrics."""
+
+    def __init__(self, locator: cea.inputlocator.InputLocator, network_type: str, phase: int = 1, testing_clusters=None, chosen_buildings=None):
+        """
+        Initialize the PipeLayoutGenerator.
+        
+        Parameters:
+        -----------
+        locator : InputLocator
+            CEA InputLocator object (should be the temp_locator)
+        network_type : str
+            'DH' for district heating or 'DC' for district cooling
+        phase : int
+            The phase number for the expansion
+        testing_clusters : list, optional
+            List of cluster IDs to include (if None, all clusters are included)
+        chosen_buildings : list, optional
+            List of building names to include (if None, all buildings are included)
+        """
+        self.locator = locator
+        self.network_type = network_type
+        self.phase = phase
+        self.testing_clusters = testing_clusters
+        self.chosen_buildings = chosen_buildings
+        self.output_folder = Path(locator.get_dtn_expansion_optimization_results_folder()) / f"phase_{phase}"
+        self.output_folder.mkdir(parents=True, exist_ok=True)
+
+        # Load input data
+        self._load_inputs()
+
+    def _load_inputs(self):
+        """Load all necessary input data."""
+        # Load cluster assignments
+        cluster_edges_path = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "cluster_edges.csv"
+        self.cluster_edges = pd.read_csv(cluster_edges_path)
+        
+        cluster_nodes_path = Path(self.locator.get_dtn_cluster_nodes_file())
+        self.cluster_nodes = pd.read_csv(cluster_nodes_path)
+        
+        # Load edge-node matrix
+        edge_node_path = Path(self.locator.get_thermal_network_edge_node_matrix_file(self.network_type))
+        self.edge_node_matrix = pd.read_csv(edge_node_path, index_col=0)
+        
+        # Load total demand - THIS IS THE KEY CHANGE
+        # Explicitly log that we're using the temp_locator's total demand
+        total_demand_path = Path(self.locator.get_total_demand())
+        log().info(f"Loading total demand from: {total_demand_path}")
+        self.total_demand = pd.read_csv(total_demand_path)
+        
+        # Get unique clusters (excluding 0 and -1)
+        all_clusters = sorted([c for c in self.cluster_edges['cluster'].unique() if c > 0])
+        
+        # If testing_clusters is specified, use it directly
+        if self.testing_clusters:
+            # Convert to list if it's a string
+            if isinstance(self.testing_clusters, str):
+                self.testing_clusters = [int(c.strip()) for c in self.testing_clusters.split(',') if c.strip()]
+            
+            # No need to use chosen_buildings if testing_clusters is specified
+            log().info(f"Using specified testing clusters: {self.testing_clusters}")
+        # Otherwise, try to derive clusters from chosen buildings if specified
+        elif self.chosen_buildings:
+            # Convert to list if it's a string
+            if isinstance(self.chosen_buildings, str):
+                self.chosen_buildings = [b.strip() for b in self.chosen_buildings.split(',') if b.strip()]
+            
+            log().info(f"Filtering to include only {len(self.chosen_buildings)} chosen buildings")
+            
+            # Get clusters that contain the chosen buildings
+            building_clusters = self.cluster_nodes[
+                (self.cluster_nodes['type'] == 'CONSUMER') &
+                (self.cluster_nodes['building'].isin(self.chosen_buildings))
+            ]['cluster'].unique()
+            
+            # Use the clusters from chosen buildings
+            self.testing_clusters = sorted([c for c in building_clusters if c > 0])
+            log().info(f"Derived clusters from chosen buildings: {self.testing_clusters}")
+        
+        # Ensure all testing clusters exist
+        if self.testing_clusters:
+            valid_clusters = [c for c in self.testing_clusters if c in all_clusters]
+            if len(valid_clusters) != len(self.testing_clusters):
+                missing = set(self.testing_clusters) - set(valid_clusters)
+                log().warning(f"Some testing clusters do not exist: {missing}")
+            
+            self.clusters = sorted(valid_clusters)
+            log().info(f"Using {len(self.clusters)} testing clusters: {self.clusters}")
+        else:
+            self.clusters = all_clusters
+            log().info(f"Using all {len(self.clusters)} clusters (excluding existing DTN and main roads)")
+
+    def generate_all_cluster_combinations(self):
+        """
+        Generate all possible combinations of clusters.
+
+        Returns:
+        --------
+        list
+            List of all possible cluster combinations
+        """
+        all_combinations = []
+        for r in range(1, len(self.clusters) + 1):
+            combinations = list(itertools.combinations(self.clusters, r))
+            all_combinations.extend(combinations)
+
+        log().info(f"Generated {len(all_combinations)} possible cluster combinations")
+        return all_combinations
+
+    def get_required_pipes_for_clusters(self, cluster_set):
+        """
+        Determine the minimum required pipes for a set of clusters.
+
+        Parameters:
+        -----------
+        cluster_set : tuple
+            Tuple of cluster IDs to connect
+
+        Returns:
+        --------
+        pd.DataFrame
+            DataFrame of required pipes
+        """
+        # Include cluster 0 (existing DTN) in the set
+        clusters_to_connect = set(cluster_set).union({0})
+
+        # Ensure cluster, from_C, and to_C columns are numeric for comparison
+        try:
+            # Make a copy to avoid SettingWithCopyWarning
+            cluster_edges_df = self.cluster_edges.copy()
+            # Convert columns to numeric, errors='coerce' will convert non-numeric values to NaN
+            for col in ['cluster', 'from_C', 'to_C']:
+                if col in cluster_edges_df.columns:
+                    cluster_edges_df[col] = pd.to_numeric(cluster_edges_df[col], errors='coerce')
+                    # Fill NaN with a value that won't match our filters
+                    cluster_edges_df[col] = cluster_edges_df[col].fillna(-999)
+        except Exception as e:
+            log().warning(f"Error converting columns to numeric: {e}. Using original dataframe.")
+            cluster_edges_df = self.cluster_edges
+
+        # Get edges that belong to the clusters in the set
+        cluster_edges = cluster_edges_df[cluster_edges_df['cluster'].isin(clusters_to_connect)]
+
+        # Get main road edges (-1) that connect the clusters
+        main_road_edges = cluster_edges_df[
+            (cluster_edges_df['cluster'] == -1) &
+            (cluster_edges_df['from_C'].isin(clusters_to_connect)) &
+            (cluster_edges_df['to_C'].isin(clusters_to_connect))
+        ]
+
+        # Combine the edges with error handling
+        try:
+            # First, try to concatenate with default settings
+            required_pipes = pd.concat([cluster_edges, main_road_edges])
+        except Exception as e:
+            log().warning(f"Error during dataframe concatenation: {e}")
+
+            # If that fails, try with more explicit settings
+            try:
+                # Reset index to avoid index-related issues
+                cluster_edges_reset = cluster_edges.reset_index(drop=True)
+                main_road_edges_reset = main_road_edges.reset_index(drop=True)
+
+                # Try concatenation with ignore_index=True
+                required_pipes = pd.concat([cluster_edges_reset, main_road_edges_reset], ignore_index=True)
+            except Exception as e2:
+                log().error(f"Failed to concatenate dataframes even with reset_index: {e2}")
+
+                # As a last resort, if one of the dataframes is empty, return the other
+                if len(cluster_edges) == 0:
+                    required_pipes = main_road_edges
+                elif len(main_road_edges) == 0:
+                    required_pipes = cluster_edges
+                else:
+                    # If both have data but can't be concatenated, try to create a new dataframe with common columns
+                    common_columns = set(cluster_edges.columns).intersection(set(main_road_edges.columns))
+                    if common_columns:
+                        log().warning(f"Using only common columns for concatenation: {common_columns}")
+                        required_pipes = pd.concat([
+                            cluster_edges[list(common_columns)],
+                            main_road_edges[list(common_columns)]
+                        ], ignore_index=True)
+                    else:
+                        # If no solution works, raise an error
+                        raise ValueError("Cannot concatenate dataframes - no common columns found")
+
+        return required_pipes
+
+    def calculate_metrics(self, cluster_set, required_pipes):
+        """
+        Calculate metrics for a set of clusters.
+
+        Parameters:
+        -----------
+        cluster_set : tuple
+            Tuple of cluster IDs to connect
+        required_pipes : pd.DataFrame
+            DataFrame of required pipes
+
+        Returns:
+        --------
+        dict
+            Dictionary of metrics
+        """
+        # Include cluster 0 (existing DTN) in the set
+        clusters_to_connect = set(cluster_set).union({0})
+
+        # Calculate total pipe length
+        total_pipe_length = required_pipes['length_m'].sum()
+
+        # Get buildings in the clusters (using unique to avoid duplicates)
+        buildings_in_clusters = self.cluster_nodes[
+            (self.cluster_nodes['cluster'].isin(clusters_to_connect)) &
+            (self.cluster_nodes['type'] == 'CONSUMER')
+        ]['building'].unique().tolist()
+
+        # Calculate total annual demand
+        if self.network_type == 'DH':
+            # For district heating, use Qhs_sys_MWhyr + Qww_sys_MWhyr
+            total_annual_demand = self.total_demand[
+                self.total_demand['name'].isin(buildings_in_clusters)
+            ]['Qhs_sys_MWhyr'].sum() + self.total_demand[
+                self.total_demand['name'].isin(buildings_in_clusters)
+            ]['Qww_sys_MWhyr'].sum()
+            demand_type = 'Qh'
+        else:
+            # For district cooling, use Qcs_sys_MWhyr + Qcre_sys_MWhyr + Qcdata_sys_MWhyr
+            total_annual_demand = self.total_demand[
+                self.total_demand['name'].isin(buildings_in_clusters)
+            ]['Qcs_sys_MWhyr'].sum() + self.total_demand[
+                self.total_demand['name'].isin(buildings_in_clusters)
+            ]['Qcre_sys_MWhyr'].sum() + self.total_demand[
+                self.total_demand['name'].isin(buildings_in_clusters)
+            ]['Qcdata_sys_MWhyr'].sum()
+            demand_type = 'Qc'
+
+        # Calculate linear heat density (LHD)
+        if total_pipe_length > 0:
+            linear_heat_density = total_annual_demand / total_pipe_length * 1000  # MWh/km
+        else:
+            linear_heat_density = 0
+
+        # Create metrics dictionary
+        metrics = {
+            'clusters': '+'.join(map(str, sorted(clusters_to_connect))),
+            f'total_annual_{demand_type}_MWh': total_annual_demand,
+            'total_pipe_length_m': total_pipe_length,
+            f'linear_{demand_type}_density_MWh_per_km': linear_heat_density
+        }
+
+        return metrics
+
+    def generate_pipe_layouts(self):
+        """
+        Generate pipe layouts for all possible combinations of clusters.
+
+        Returns:
+        --------
+        pd.DataFrame
+            DataFrame with metrics for all cluster combinations
+        """
+        # Generate all possible combinations of clusters
+        all_combinations = self.generate_all_cluster_combinations()
+
+        # Calculate metrics for each combination
+        all_metrics = []
+
+        # Calculate metrics for cluster 0 alone first
+        cluster0_pipes = self.get_required_pipes_for_clusters((0,))
+        cluster0_metrics = self.calculate_metrics((0,), cluster0_pipes)
+        all_metrics.append(cluster0_metrics)
+        log().info(f"Calculated metrics for cluster 0 (existing DTN)")
+
+        for i, cluster_set in enumerate(all_combinations):
+            if i % 100 == 0 and i > 0:
+                log().info(f"Processed {i}/{len(all_combinations)} cluster combinations")
+
+            # Get required pipes for this set of clusters
+            required_pipes = self.get_required_pipes_for_clusters(cluster_set)
+
+            # Calculate metrics
+            metrics = self.calculate_metrics(cluster_set, required_pipes)
+            all_metrics.append(metrics)
+
+        # Convert to DataFrame
+        metrics_df = pd.DataFrame(all_metrics)
+
+        # Save to CSV
+        output_file = self.output_folder / "clusters_metrics.csv"
+        metrics_df.to_csv(output_file, index=False)
+        log().info(f"Saved metrics for {len(all_metrics)} cluster combinations to {output_file}")
+
+        # Return the metrics DataFrame for use by the optimizer
+        return metrics_df
+
+
+def generate_updated_metrics(locator, temp_locator, network_type, testing_clusters=None):
+    """
+    Generate updated metrics based on demand files in the temp scenario.
+
+    Parameters:
+    -----------
+    locator : InputLocator
+        Original scenario locator
+    temp_locator : InputLocator
+        Temporary scenario locator with modified demand files
+    network_type : str
+        'DH' for district heating or 'DC' for district cooling
+    testing_clusters : list, optional
+        List of cluster IDs to include
+
+    Returns:
+    --------
+    pd.DataFrame
+        DataFrame containing updated metrics for all cluster combinations
+    """
+    log().info("Generating updated metrics using temp scenario demand files...")
+
+    # Use the new direct functions to get the paths to the total demand files
+    original_total_demand = Path(locator.get_total_demand())
+    temp_total_demand = Path(locator.get_dynamic_dtn_optimization_temp_scenario_total_demand())
+
+    log().info(f"Original total demand path: {original_total_demand}")
+    log().info(f"Temp scenario total demand path: {temp_total_demand}")
+
+    if str(original_total_demand) == str(temp_total_demand):
+        log().warning("WARNING: The paths to the original and temp scenario total demand files are the same!")
+        log().warning("This suggests that the temp scenario may not have been properly created.")
+    else:
+        log().info("✓ Successfully identified distinct total demand files for original and temp scenarios")
+
+    # Create directory for updated metrics
+    output_dir = Path(locator.get_dynamic_dtn_optimization_updated_metrics_folder())
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create a custom PipeLayoutGenerator that uses the temp scenario's total demand file
+    class CustomPipeLayoutGenerator(PipeLayoutGenerator):
+        def _load_inputs(self):
+            """Override to ensure we use the temp scenario's total demand file."""
+            # Load cluster assignments
+            cluster_edges_path = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "cluster_edges.csv"
+            self.cluster_edges = pd.read_csv(cluster_edges_path)
+            
+            cluster_nodes_path = Path(self.locator.get_dtn_cluster_nodes_file())
+            self.cluster_nodes = pd.read_csv(cluster_nodes_path)
+            
+            # Load edge-node matrix
+            edge_node_path = Path(self.locator.get_thermal_network_edge_node_matrix_file(self.network_type))
+            self.edge_node_matrix = pd.read_csv(edge_node_path, index_col=0)
+            
+            # CRITICAL CHANGE: Explicitly use the temp scenario's total demand file
+            total_demand_path = temp_total_demand
+            log().info(f"Loading total demand from temp scenario: {total_demand_path}")
+            
+            # Verify the file exists
+            if not total_demand_path.exists():
+                log().error(f"Total demand file not found in temp scenario: {total_demand_path}")
+                raise FileNotFoundError(f"Total demand file not found in temp scenario: {total_demand_path}")
+            
+            self.total_demand = pd.read_csv(total_demand_path)
+            
+            # Get unique clusters (excluding 0 and -1)
+            all_clusters = sorted([c for c in self.cluster_edges['cluster'].unique() if c > 0])
+            
+            # If testing_clusters is specified, use it directly
+            if self.testing_clusters:
+                # Convert to list if it's a string
+                if isinstance(self.testing_clusters, str):
+                    self.testing_clusters = [int(c.strip()) for c in self.testing_clusters.split(',') if c.strip()]
+                
+                # No need to use chosen_buildings if testing_clusters is specified
+                log().info(f"Using specified testing clusters: {self.testing_clusters}")
+            # Otherwise, try to derive clusters from chosen buildings if specified
+            elif self.chosen_buildings:
+                # Convert to list if it's a string
+                if isinstance(self.chosen_buildings, str):
+                    self.chosen_buildings = [b.strip() for b in self.chosen_buildings.split(',') if b.strip()]
+                
+                log().info(f"Filtering to include only {len(self.chosen_buildings)} chosen buildings")
+                
+                # Get clusters that contain the chosen buildings
+                building_clusters = self.cluster_nodes[
+                    (self.cluster_nodes['type'] == 'CONSUMER') &
+                    (self.cluster_nodes['building'].isin(self.chosen_buildings))
+                ]['cluster'].unique()
+                
+                # Use the clusters from chosen buildings
+                self.testing_clusters = sorted([c for c in building_clusters if c > 0])
+                log().info(f"Derived clusters from chosen buildings: {self.testing_clusters}")
+            
+            # Ensure all testing clusters exist
+            if self.testing_clusters:
+                valid_clusters = [c for c in self.testing_clusters if c in all_clusters]
+                if len(valid_clusters) != len(self.testing_clusters):
+                    missing = set(self.testing_clusters) - set(valid_clusters)
+                    log().warning(f"Some testing clusters do not exist: {missing}")
+                
+                self.clusters = sorted(valid_clusters)
+                log().info(f"Using {len(self.clusters)} testing clusters: {self.clusters}")
+            else:
+                self.clusters = all_clusters
+                log().info(f"Using all {len(self.clusters)} clusters (excluding existing DTN and main roads)")
+    
+    log().info(
+        f"Creating CustomPipeLayoutGenerator with network_type={network_type}, testing_clusters={testing_clusters}")
+    generator = CustomPipeLayoutGenerator(
+        locator=locator,  # Use the original locator with our custom override
+        network_type=network_type,
+        phase=1,
+        testing_clusters=testing_clusters
+    )
+
+    # Generate the updated metrics
+    log().info("Generating pipe layouts with temp scenario demand files...")
+    metrics_df = generator.generate_pipe_layouts()
+
+    # Save the updated metrics
+    output_file = output_dir / "clusters_metrics_updated.csv"
+    metrics_df.to_csv(output_file, index=False)
+    log().info(f"Saved updated metrics to {output_file}")
+
+    return metrics_df
+
 def main(config):
     """
     Run the dynamic DTN optimization part 2 script.
@@ -3858,16 +4286,30 @@ def main(config):
     
     log().info(f"Successfully obtained temporary scenario locator")
     
-    # Load the metrics DataFrame from the dynamic DTN optimization updated metrics file
-    log().info("Loading metrics from dynamic DTN optimization updated metrics file")
-    metrics_file = Path(locator.get_dynamic_dtn_optimization_updated_metrics_file())
-    if not metrics_file.exists():
-        log().error(f"Updated metrics file not found: {metrics_file}")
-        log().error("Please run dynamic_dtn_optimization.py first to create the updated metrics file.")
-        return
+    # Parse testing clusters from config
+    testing_clusters_str = config.dtn_expansion_optimization.testing_clusters
+    if testing_clusters_str:
+        testing_clusters = [int(c.strip()) for c in testing_clusters_str.split(',') if c.strip()]
+    else:
+        testing_clusters = None
     
-    log().info(f"Loading metrics from: {metrics_file}")
-    metrics_df = pd.read_csv(metrics_file)
+    # Load the metrics DataFrame from the dynamic DTN optimization updated metrics file
+    log().info("Checking for dynamic DTN optimization updated metrics file")
+    metrics_file = Path(locator.get_dynamic_dtn_optimization_updated_metrics_file())
+    
+    # Generate the updated metrics file if it doesn't exist
+    if not metrics_file.exists():
+        log().info(f"Updated metrics file not found: {metrics_file}")
+        log().info("Generating updated metrics file...")
+        metrics_df = generate_updated_metrics(
+            locator=locator,
+            temp_locator=temp_locator,
+            network_type=network_type,
+            testing_clusters=testing_clusters
+        )
+    else:
+        log().info(f"Loading metrics from: {metrics_file}")
+        metrics_df = pd.read_csv(metrics_file)
     
     # Get optimization parameters from config
     num_phases = config.dtn_expansion_optimization.num_phases
@@ -3899,13 +4341,6 @@ def main(config):
         ghg_budget_per_phase = [float(b.strip()) for b in ghg_budget_str.split(',') if b.strip()]
     else:
         ghg_budget_per_phase = None
-        
-    # Parse testing clusters from config
-    testing_clusters_str = config.dtn_expansion_optimization.testing_clusters
-    if testing_clusters_str:
-        testing_clusters = [int(c.strip()) for c in testing_clusters_str.split(',') if c.strip()]
-    else:
-        testing_clusters = None
     
     log().info("Creating optimizer with temporary scenario locator")
     

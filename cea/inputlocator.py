@@ -413,6 +413,82 @@ class InputLocator(object):
             Path to the hourly total demand file in the temporary scenario
         """
         return os.path.join(self.get_dynamic_dtn_optimization_temp_scenario_demand_folder(), f'Total_demand_hourly.{format}')
+        
+    def get_dynamic_dtn_optimization_temp_scenario_demand_file(self, building_name):
+        """
+        Returns the path to a building demand file in the temporary scenario for dynamic DTN optimization
+        
+        Parameters:
+        -----------
+        building_name : str
+            The name of the building
+            
+        Returns:
+        --------
+        str
+            Path to the building demand file in the temporary scenario
+        """
+        return os.path.join(self.get_dynamic_dtn_optimization_temp_scenario_demand_folder(), f'{building_name}.csv')
+        
+    def get_dynamic_dtn_optimization_temp_scenario_optimization_folder(self):
+        """
+        Returns the path to the optimization folder in the temporary scenario for dynamic DTN optimization
+        
+        Returns:
+        --------
+        str
+            Path to the optimization folder in the temporary scenario
+        """
+        return self._ensure_folder(self.get_dynamic_dtn_optimization_temp_scenario_folder(), 'outputs', 'data', 'optimization')
+        
+    def get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder(self):
+        """
+        Returns the path to the dtn_expansion folder in the temporary scenario for dynamic DTN optimization
+        
+        Returns:
+        --------
+        str
+            Path to the dtn_expansion folder in the temporary scenario
+        """
+        return self._ensure_folder(self.get_dynamic_dtn_optimization_temp_scenario_optimization_folder(), 'dtn_expansion')
+        
+    def get_dynamic_dtn_optimization_temp_scenario_lca_operation_file(self):
+        """
+        Returns the path to the LCA operation file in the temporary scenario for dynamic DTN optimization
+        
+        Returns:
+        --------
+        str
+            Path to the LCA operation file in the temporary scenario
+        """
+        return os.path.join(self.get_dynamic_dtn_optimization_temp_scenario_folder(), 'outputs', 'data', 'emissions', 'operation.csv')
+        
+    def get_dynamic_dtn_optimization_temp_scenario_phase_supply_files_folder(self):
+        """
+        Returns the folder containing the phase supply files in the temporary scenario for dynamic DTN optimization
+        
+        Returns:
+        --------
+        str
+            Path to the phase supply files folder in the temporary scenario
+        """
+        return self._ensure_folder(self.get_dynamic_dtn_optimization_temp_scenario_folder(), 'outputs', 'data', 'optimization', 'dtn_expansion', 'phase_supply_files')
+        
+    def get_dynamic_dtn_optimization_temp_scenario_phase_supply_file(self, phase):
+        """
+        Returns the supply file for a specific phase in the temporary scenario for dynamic DTN optimization
+        
+        Parameters:
+        -----------
+        phase : int
+            The phase number
+            
+        Returns:
+        --------
+        str
+            Path to the phase supply file in the temporary scenario
+        """
+        return os.path.join(self.get_dynamic_dtn_optimization_temp_scenario_phase_supply_files_folder(), f'phase{phase}_supply.csv')
 
     def get_dynamic_dtn_optimization_modified_demands_folder(self):
         """

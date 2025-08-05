@@ -22,7 +22,7 @@ __status__ = "Production"
 from cea.datamanagement.format_helper.cea4_verify_db import get_csv_filenames
 
 
-def lca_operation(locator, custom_supply_path=None):
+def lca_operation(locator, custom_supply_path=None, custom_demand_path=None):
     """
     Algorithm to calculate the primary energy and GHG_kgCO2MJ emissions of buildings according to the method used in the
     integrated model of [Fonseca-Schlueter-2015]_ and the performance factors of [ecobau.ch].
@@ -31,6 +31,8 @@ def lca_operation(locator, custom_supply_path=None):
     :type locator: InputLocator
     :param custom_supply_path: optional path to a custom supply systems file
     :type custom_supply_path: str
+    :param custom_demand_path: optional path to a custom demand file
+    :type custom_demand_path: str
 
 
     The following file is created by this script:
@@ -48,7 +50,10 @@ def lca_operation(locator, custom_supply_path=None):
 
     # get local files
     ## get demand results for the scenario
-    demand = pd.read_csv(locator.get_total_demand())
+    if custom_demand_path and os.path.exists(custom_demand_path):
+        demand = pd.read_csv(custom_demand_path)
+    else:
+        demand = pd.read_csv(locator.get_total_demand())
     ## get the supply systems for each building in the scenario
     if custom_supply_path and os.path.exists(custom_supply_path):
         supply_systems = pd.read_csv(custom_supply_path)
@@ -182,8 +187,13 @@ def main(config):
     custom_supply_path = config.lca_operation.custom_supply_path if hasattr(config.lca_operation, 'custom_supply_path') else None
     if custom_supply_path:
         print(f'Using custom supply file: {custom_supply_path}')
+        
+    # Check if custom demand path is provided
+    custom_demand_path = config.lca_operation.custom_demand_path if hasattr(config.lca_operation, 'custom_demand_path') else None
+    if custom_demand_path:
+        print(f'Using custom demand file: {custom_demand_path}')
 
-    lca_operation(locator=locator, custom_supply_path=custom_supply_path)
+    lca_operation(locator=locator, custom_supply_path=custom_supply_path, custom_demand_path=custom_demand_path)
 
 
 if __name__ == '__main__':

@@ -1102,6 +1102,131 @@ class DynamicDTNOptimizer:
         total_demand_df.to_csv(temp_demand_dir / "Total_demand.csv", index=False, float_format='%.3f', na_rep='nan')
         self.logger.info("Updated Total_demand.csv generated successfully")
 
+        # After saving the initial Total_demand.csv, check for missing metadata columns
+        self.logger.info("Checking for missing metadata columns in Total_demand.csv")
+
+        # Required metadata columns that should be present
+        required_metadata_columns = ['Af_m2', 'Aroof_m2', 'GFA_m2', 'Aocc_m2', 'people0']
+
+        # Read the saved Total_demand.csv to check for missing columns
+        temp_total_demand = pd.read_csv(temp_demand_dir / "Total_demand.csv")
+        missing_columns = [col for col in required_metadata_columns if col not in temp_total_demand.columns]
+
+        if missing_columns:
+            self.logger.warning(f"Missing metadata columns in temporary Total_demand.csv: {missing_columns}")
+            
+            # Try to get the missing columns from the original Total_demand.csv
+            try:
+                original_total_demand = pd.read_csv(self.locator.get_total_demand())
+                self.logger.info(f"Reading original Total_demand.csv to retrieve missing columns")
+                
+                # Check if the original file has the missing columns
+                available_columns = [col for col in missing_columns if col in original_total_demand.columns]
+                
+                if available_columns:
+                    self.logger.info(f"Found {len(available_columns)} columns in original Total_demand.csv: {available_columns}")
+                    
+                    # Create a mapping from building names in original to temporary
+                    building_mapping = {}
+                    for building in temp_total_demand['name']:
+                        if building in original_total_demand['name'].values:
+                            building_mapping[building] = building
+                    
+                    # Add missing columns from original to temporary
+                    for col in available_columns:
+                        self.logger.info(f"Adding column {col} from original Total_demand.csv")
+                        
+                        # Create a dictionary to map building names to column values
+                        col_values = {}
+                        for building in original_total_demand['name']:
+                            if building in building_mapping:
+                                col_values[building] = original_total_demand.loc[
+                                    original_total_demand['name'] == building, col].values[0]
+                        
+                        # Add the column to the temporary Total_demand.csv
+                        temp_total_demand[col] = temp_total_demand['name'].map(col_values)
+                        
+                        # Fill NaN values with appropriate defaults
+                        if col == 'GFA_m2' or col == 'Af_m2':
+                            # If one exists but not the other, copy the value
+                            if 'GFA_m2' in temp_total_demand.columns and 'Af_m2' in temp_total_demand.columns:
+                                mask = temp_total_demand[col].isna()
+                                if col == 'GFA_m2' and 'Af_m2' in temp_total_demand.columns:
+                                    temp_total_demand.loc[mask, col] = temp_total_demand.loc[mask, 'Af_m2']
+                                elif col == 'Af_m2' and 'GFA_m2' in temp_total_demand.columns:
+                                    temp_total_demand.loc[mask, col] = temp_total_demand.loc[mask, 'GFA_m2']
+                            # Default value if still NaN
+                            temp_total_demand[col].fillna(1000.0, inplace=True)
+                        elif col == 'Aroof_m2':
+                            # Estimate roof area as a fraction of floor area if available
+                            if 'GFA_m2' in temp_total_demand.columns:
+                                mask = temp_total_demand[col].isna()
+                                temp_total_demand.loc[mask, col] = temp_total_demand.loc[mask, 'GFA_m2'] / 5  # Assuming 5 floors on average
+                            elif 'Af_m2' in temp_total_demand.columns:
+                                mask = temp_total_demand[col].isna()
+                                temp_total_demand.loc[mask, col] = temp_total_demand.loc[mask, 'Af_m2'] / 5
+                            else:
+                                temp_total_demand[col].fillna(200.0, inplace=True)
+                        elif col == 'Aocc_m2':
+                            # Estimate occupied area as a percentage of floor area if available
+                            if 'GFA_m2' in temp_total_demand.columns:
+                                mask = temp_total_demand[col].isna()
+                                temp_total_demand.loc[mask, col] = temp_total_demand.loc[mask, 'GFA_m2'] * 0.8  # Assuming 80% of GFA is occupied
+                            elif 'Af_m2' in temp_total_demand.columns:
+                                mask = temp_total_demand[col].isna()
+                                temp_total_demand.loc[mask, col] = temp_total_demand.loc[mask, 'Af_m2'] * 0.8
+                            else:
+                                temp_total_demand[col].fillna(800.0, inplace=True)
+                        elif col == 'people0':
+                            # Estimate people based on floor area if available
+                            if 'GFA_m2' in temp_total_demand.columns:
+                                mask = temp_total_demand[col].isna()
+                                temp_total_demand.loc[mask, col] = (temp_total_demand.loc[mask, 'GFA_m2'] / 25).round()  # Assuming 25 m² per person
+                            elif 'Af_m2' in temp_total_demand.columns:
+                                mask = temp_total_demand[col].isna()
+                                temp_total_demand.loc[mask, col] = (temp_total_demand.loc[mask, 'Af_m2'] / 25).round()
+                            else:
+                                temp_total_demand[col].fillna(40, inplace=True)
+                
+                # For any columns still missing, add with default values
+                still_missing = [col for col in missing_columns if col not in temp_total_demand.columns]
+                if still_missing:
+                    self.logger.warning(f"Still missing columns after checking original Total_demand.csv: {still_missing}")
+                    for col in still_missing:
+                        if col == 'GFA_m2' or col == 'Af_m2':
+                            temp_total_demand[col] = 1000.0
+                        elif col == 'Aroof_m2':
+                            temp_total_demand[col] = 200.0
+                        elif col == 'Aocc_m2':
+                            temp_total_demand[col] = 800.0
+                        elif col == 'people0':
+                            temp_total_demand[col] = 40
+                
+                # Save the updated Total_demand.csv
+                temp_total_demand.to_csv(temp_demand_dir / "Total_demand.csv", index=False, float_format='%.3f', na_rep='nan')
+                self.logger.info("Updated Total_demand.csv with missing metadata columns")
+                
+            except Exception as e:
+                self.logger.error(f"Error retrieving metadata columns from original Total_demand.csv: {e}")
+                self.logger.warning("Adding default values for missing metadata columns")
+                
+                # Add default values for missing columns
+                for col in missing_columns:
+                    if col == 'GFA_m2' or col == 'Af_m2':
+                        temp_total_demand[col] = 1000.0
+                    elif col == 'Aroof_m2':
+                        temp_total_demand[col] = 200.0
+                    elif col == 'Aocc_m2':
+                        temp_total_demand[col] = 800.0
+                    elif col == 'people0':
+                        temp_total_demand[col] = 40
+                
+                # Save the updated Total_demand.csv
+                temp_total_demand.to_csv(temp_demand_dir / "Total_demand.csv", index=False, float_format='%.3f', na_rep='nan')
+                self.logger.info("Updated Total_demand.csv with default values for missing metadata columns")
+        else:
+            self.logger.info("All required metadata columns are present in Total_demand.csv")
+
         # Generate updated Total_demand_hourly.csv
         self.logger.info("Generating updated Total_demand_hourly.csv")
 

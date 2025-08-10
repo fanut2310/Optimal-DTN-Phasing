@@ -17,16 +17,13 @@ from typing import Dict, Tuple, List, Set, Optional, Union
 import geopandas as gpd
 import pandas as pd
 import numpy as np
-import networkx as nx
 import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
 from deap import base, tools, algorithms, creator
 
 import cea.config
 import cea.inputlocator
 from cea.constants import HEAT_CAPACITY_OF_WATER_JPERKGK
 from cea.analysis.lca.operation import lca_operation
-from cea.optimization_new.dynamic_dtn_optimization import DynamicDTNOptimizer
 from cea.analysis.costs.equations import calc_capex_annualized, calc_opex_annualized
 
 
@@ -1357,7 +1354,7 @@ class DTNExpansionOptimizer:
             Path to the saved plot file
         """
         # Create output directory
-        output_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder())
+        output_dir = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder())
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Extract fitness values for all individuals
@@ -2249,8 +2246,8 @@ class DTNExpansionOptimizer:
         Path
             Path to the saved CSV file
         """
-        # Create output directory
-        output_dir = Path(output_dir)
+        # Force output into the dynamic temp scenario dtn_expansion folder
+        output_dir = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder())
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Create a list to store all individual metrics
@@ -3136,8 +3133,8 @@ class DTNExpansionOptimizer:
         Path
             Path to the results file
         """
-        # Create output directory
-        output_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder())
+        # Force output into the dynamic temp scenario dtn_expansion folder
+        output_dir = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder())
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Calculate district emissions using the new methodology
@@ -3195,8 +3192,8 @@ class DTNExpansionOptimizer:
 
             # Save to CSV
             pareto_df = pd.DataFrame(pareto_summary)
-            pareto_file = Path(
-                self.locator.get_dtn_expansion_optimization_results_folder()) / f"dtn_expansion_opt_pareto_{self.network_type}.csv"
+            # Save Pareto summary in the temp dtn_expansion folder (not the original folder)
+            pareto_file = output_dir / f"dtn_expansion_opt_pareto_{self.network_type}.csv"
             pareto_df.to_csv(pareto_file, index=False)
 
             # Create a combined detailed results file with all Pareto solutions
@@ -3240,13 +3237,14 @@ class DTNExpansionOptimizer:
             combined_df.to_csv(combined_file, index=False)
 
             # Also save individual detailed results for each solution (for backward compatibility)
+            # Save combined and per-solution detailed results also under output_dir
+            # (you already save combined_file under output_dir; just ensure per-solution dirs also live under output_dir)
             for i, sol in enumerate(solution):
-                # Create a subdirectory for each pareto solution
-                pareto_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / f"pareto_solution_{i}"
+                pareto_dir = output_dir / f"pareto_solution_{i}"
                 pareto_dir.mkdir(parents=True, exist_ok=True)
                 self.save_detailed_results([sol], pareto_dir)
 
-            return combined_file
+            return output_dir / f"dtn_expansion_opt_results_{self.network_type}_detailed_combined.csv"
 
         # For single-objective optimization, use the original approach
         # Create a DataFrame with the results

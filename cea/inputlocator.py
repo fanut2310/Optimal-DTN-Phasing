@@ -451,18 +451,24 @@ class InputLocator(object):
             Path to the dtn_expansion folder in the temporary scenario
         """
         return self._ensure_folder(self.get_dynamic_dtn_optimization_temp_scenario_optimization_folder(), 'dtn_expansion')
-        
+
+    def get_dynamic_dtn_optimization_temp_scenario_emissions_folder(self):
+        """
+        Returns the emissions folder in the temporary scenario for dynamic DTN optimization
+        """
+        return self._ensure_folder(self.get_dynamic_dtn_optimization_temp_scenario_folder(),
+                                   'outputs', 'data', 'emissions')
+
     def get_dynamic_dtn_optimization_temp_scenario_lca_operation_file(self):
         """
         Returns the path to the LCA operation file in the temporary scenario for dynamic DTN optimization
-        
-        Returns:
-        --------
-        str
-            Path to the LCA operation file in the temporary scenario
+
+        Notes:
+        - The LCA module writes 'Total_LCA_operation.csv' under outputs/data/emissions.
         """
-        return os.path.join(self.get_dynamic_dtn_optimization_temp_scenario_folder(), 'outputs', 'data', 'emissions', 'operation.csv')
-        
+        return os.path.join(self.get_dynamic_dtn_optimization_temp_scenario_emissions_folder(),
+                            'Total_LCA_operation.csv')
+
     def get_dynamic_dtn_optimization_temp_scenario_phase_supply_files_folder(self):
         """
         Returns the folder containing the phase supply files in the temporary scenario for dynamic DTN optimization

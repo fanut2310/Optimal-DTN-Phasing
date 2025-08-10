@@ -11,165 +11,14 @@ import shutil
 import sys
 import time
 import pandas as pd
-import numpy as np
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 import cea.config
 import cea.inputlocator
-from cea.optimization_new.DTN_expansion_optimization import DTNExpansionOptimizer
 from cea.technologies.thermal_network.thermal_network import main as thermal_network_simulation_main
 from cea.technologies.thermal_network_costs.thermal_network_costs_new import main as thermal_network_costs_main
 
-
-# TempScenarioLocator class for redirecting file requests to the temporary scenario
-class TempScenarioLocator(cea.inputlocator.InputLocator):
-    """
-    A locator that redirects file requests to the temporary scenario.
-    
-    This locator inherits from InputLocator and is initialized with the path to the 
-    temporary scenario created by dynamic_dtn_optimization.py. It overrides methods
-    to ensure that file requests are directed to the temporary scenario instead of
-    the original scenario.
-    
-    The TempScenarioLocator overrides key methods like get_total_demand() and 
-    get_total_demand_hourly() to ensure they return paths to files in the temporary 
-    scenario rather than the original scenario. This is essential for the dynamic DTN 
-    optimization workflow, which needs to use modified demand files for its calculations.
-    """
-    
-    def __init__(self, original_locator, temp_scenario_path):
-        """
-        Initialize the locator with the path to the temporary scenario.
-        
-        Parameters:
-        -----------
-        original_locator : cea.inputlocator.InputLocator
-            The original locator
-        temp_scenario_path : str or Path
-            Path to the temporary scenario
-        """
-        # Initialize with the temp scenario path
-        super().__init__(str(temp_scenario_path))
-        
-        # Store the original locator for reference
-        self.original_locator = original_locator
-        
-        # Copy attributes from original locator that might be needed
-        self.__dict__.update({k: v for k, v in original_locator.__dict__.items() 
-                             if k not in ['scenario', '_scenario', '_temp_directory']})
-        
-        # Clear any cache
-        if hasattr(self, '_demand_cache'):
-            self._demand_cache = {}
-            
-    def get_thermal_network_folder(self):
-        """
-        Get the path to the thermal network folder in the temp scenario.
-        
-        Returns:
-        --------
-        str
-            Path to the thermal network folder
-        """
-        path = os.path.join(self.scenario, 'outputs', 'data', 'thermal-network')
-        
-        if not os.path.exists(path):
-            logging.error(f"Thermal network folder not found in temp scenario: {path}")
-            raise FileNotFoundError(f"Thermal network folder not found in temp scenario: {path}")
-        
-        return path
-        
-    def get_dynamic_dtn_network_layout_costs_file(self, network_type, network_name=""):
-        """
-        Override to return the path to the network layout costs file in the temp scenario.
-        
-        Parameters:
-        -----------
-        network_type : str
-            Type of the network (e.g., 'DH', 'DC')
-        network_name : str, optional
-            Name of the network
-            
-        Returns:
-        --------
-        str
-            Path to the network layout costs file in the temp scenario
-        """
-        # Use get_thermal_network_folder() directly
-        file_name = f"{network_type}_costs.csv"
-        return os.path.join(self.get_thermal_network_folder(), file_name)
-
-###############################################################################
-# 2) CUSTOM INPUTLOCATOR                                                     #
-###############################################################################
-
-class ModifiedDemandsLocator(cea.inputlocator.InputLocator):
-    """A custom InputLocator that redirects demand file requests to modified versions."""
-
-    def __init__(self, locator, modified_demand_files):
-        super().__init__(locator.scenario)
-        self.original_locator = locator
-        self.modified_demand_files = modified_demand_files
-        self.__dict__.update(locator.__dict__)
-        self._demand_cache = {} # Add cache to prevent issues
-
-    def get_demand_results_file(self, building, format='csv'):
-        """
-        Override to return the path to the modified demand file if available.
-        """
-        key = building
-        if key in self.modified_demand_files:
-            modified_path = self.modified_demand_files[key]['modified']
-            # Normalize the path for consistent comparison
-            modified_path = os.path.normpath(modified_path)
-            # Verify the file exists
-            if not os.path.exists(modified_path):
-                raise FileNotFoundError(f"Modified demand file not found: {modified_path}")
-            # Add debug print
-            print(f"DEBUG: Using modified demand file for {building}: {modified_path}")
-            return modified_path
-        else:
-            # Pass the original building name to maintain case consistency
-            original_path = self.original_locator.get_demand_results_file(building, format)
-            # Normalize the path for consistent comparison
-            original_path = os.path.normpath(original_path)
-            print(f"DEBUG: Using original demand file for {building}: {original_path}")
-            return original_path
-
-    def get_total_demand(self, format='csv'):
-        """
-        Override to return the path to the total demand file in the temp scenario.
-        
-        Parameters:
-        -----------
-        format : str, optional
-            File format (default: 'csv')
-            
-        Returns:
-        --------
-        str
-            Path to the total demand file in the temp scenario
-        """
-        demand_folder = os.path.join(self.scenario, 'outputs', 'data', 'demand')
-        return os.path.join(demand_folder, f'Total_demand.{format}')
-        
-    def get_total_demand_hourly(self, format='csv'):
-        """
-        Override to return the path to the hourly total demand file in the temp scenario.
-        
-        Parameters:
-        -----------
-        format : str, optional
-            File format (default: 'csv')
-            
-        Returns:
-        --------
-        str
-            Path to the hourly total demand file in the temp scenario
-        """
-        demand_folder = os.path.join(self.scenario, 'outputs', 'data', 'demand')
-        return os.path.join(demand_folder, f'Total_demand_hourly.{format}')
 
 __author__ = "Fan Ut Chang"
 __copyright__ = "Copyright 2025, City Energy Analyst"
@@ -617,20 +466,16 @@ class DynamicDTNOptimizer:
 
         self.logger.info(f"Temporary scenario created at: {temp_dir}")
         return str(temp_dir)
-        
+
     def get_temp_locator(self):
         """
         Get a locator for the temporary scenario.
-        
+
         This method creates the temporary scenario if it doesn't exist,
-        and returns a TempScenarioLocator instance for the temporary scenario.
-        
-        Returns:
-            TempScenarioLocator: A locator for the temporary scenario
+        and returns a standard InputLocator instance for the temporary scenario.
         """
         self.logger.info("Getting locator for temporary scenario")
-        
-        # Check if the temporary scenario exists
+
         temp_dir = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_folder())
         if not temp_dir.exists():
             self.logger.info("Temporary scenario doesn't exist, creating it")
@@ -638,11 +483,11 @@ class DynamicDTNOptimizer:
         else:
             self.logger.info(f"Using existing temporary scenario at: {temp_dir}")
             temp_scenario_dir = str(temp_dir)
-            
-        # Create a TempScenarioLocator for the temporary scenario
-        temp_locator = TempScenarioLocator(self.locator, temp_scenario_dir)
-        self.logger.info(f"Created TempScenarioLocator for: {temp_scenario_dir}")
-        
+
+        # Use a standard InputLocator for the temp scenario
+        temp_locator = cea.inputlocator.InputLocator(temp_scenario_dir)
+        self.logger.info(f"Created InputLocator for temp scenario: {temp_scenario_dir}")
+
         return temp_locator
 
     def _copy_scenario_files(self, source_scenario, target_scenario):
@@ -661,6 +506,7 @@ class DynamicDTNOptimizer:
         # Create target directories
         target_path = Path(target_scenario)
         (target_path / "inputs").mkdir(parents=True, exist_ok=True)
+        (target_path / "outputs" / "data" / "emissions").mkdir(parents=True, exist_ok=True)
         (target_path / "inputs" / "building-geometry").mkdir(parents=True, exist_ok=True)
         (target_path / "inputs" / "networks").mkdir(parents=True, exist_ok=True)
         (target_path / "inputs" / "weather").mkdir(parents=True, exist_ok=True)
@@ -1392,295 +1238,6 @@ class DynamicDTNOptimizer:
 
         # Clean up temporary scenario
         self._cleanup_temp_scenario(temp_scenario_dir)
-
-    def rerun_dtn_optimization(self):
-        """
-        Rerun the DTN optimization with the updated thermal network results.
-
-        Returns:
-            New optimization results
-        """
-        self.logger.info("Rerunning DTN expansion optimization with modified demands")
-
-        # Create a copy of the config for the new optimization
-        new_config = self._create_config_copy()
-        self.logger.info(f"Created configuration copy for DTN expansion optimization")
-
-        # Create a custom locator that points to the modified demand files
-        self.logger.info("Creating custom locator that points to modified demand files")
-        modified_locator = ModifiedDemandsLocator(self.locator, self.modified_demand_files)
-
-        # Run the new DTN optimization with the modified locator
-        self.logger.info("Initializing DTN expansion optimizer with modified demands")
-        optimizer = DTNExpansionOptimizer(
-            locator=modified_locator,
-            network_type=self.network_type,
-            metrics_df=None,  # This will be loaded by the optimizer
-            num_phases=new_config.dtn_expansion_optimization.num_phases,
-            phase_durations=self._parse_list_param(new_config.dtn_expansion_optimization.phase_durations),
-            capex_budget_per_phase=self._parse_list_param(new_config.dtn_expansion_optimization.capex_budget_per_phase),
-            total_expenditure_budget_per_phase=self._parse_list_param(new_config.dtn_expansion_optimization.total_expenditure_budget_per_phase),
-            interest_rate=new_config.dtn_expansion_optimization.interest_rate,
-            cost_model=new_config.dtn_expansion_optimization.cost_model,
-            objective_function=new_config.dtn_expansion_optimization.objective_function,
-            diversity_factor=new_config.dtn_expansion_optimization.diversity_factor,
-            temperature_difference_dh=new_config.dtn_expansion_optimization.temperature_difference_dh,
-            temperature_difference_dc=new_config.dtn_expansion_optimization.temperature_difference_dc,
-            pressure_loss_pa_per_m=new_config.dtn_expansion_optimization.pressure_loss_pa_per_m,
-            pump_operation_hours=new_config.dtn_expansion_optimization.pump_operation_hours,
-            pump_efficiency=new_config.dtn_expansion_optimization.pump_efficiency,
-            pump_load_factor=new_config.dtn_expansion_optimization.pump_load_factor,
-            pump_capex_a=new_config.dtn_expansion_optimization.pump_capex_a,
-            pump_capex_b=new_config.dtn_expansion_optimization.pump_capex_b,
-            cooling_cop=new_config.dtn_expansion_optimization.cooling_cop,
-            ghg_budget_per_phase=self._parse_list_param(new_config.dtn_expansion_optimization.ghg_budget_per_phase),
-            multi_objective_mode=new_config.dtn_expansion_optimization.multi_objective_mode,
-            multi_objective_functions=new_config.dtn_expansion_optimization.multi_objective_functions
-        )
-        self.logger.info(f"DTN expansion optimizer initialized with {new_config.dtn_expansion_optimization.num_phases} phases")
-
-        # Run the optimization
-        population_size = new_config.dtn_expansion_optimization.population_size
-        num_generations = new_config.dtn_expansion_optimization.num_generations
-        self.logger.info(f"Starting DTN expansion optimization with population size {population_size} and {num_generations} generations")
-        new_results = optimizer.optimize(population_size=population_size, num_generations=num_generations)
-        self.logger.info("DTN expansion optimization completed successfully")
-
-        # Save the new results
-        self.new_optimizer = optimizer
-        self.new_results = new_results
-        self.logger.info(f"New optimization results saved with {len(new_results['genome'] if isinstance(new_results, dict) else new_results)} clusters")
-
-        return new_results
-
-    def compare_results(self):
-        """
-        Compare the original and new optimization results to assess sensitivity.
-
-        Returns:
-            DataFrame with comparison results
-        """
-        self.logger.info("Comparing original and new optimization results")
-
-        # Create a directory for comparison results
-        comparison_dir = Path(self.locator.get_optimization_results_folder()) / "dynamic_dtn_optimization" / "comparison"
-        comparison_dir.mkdir(parents=True, exist_ok=True)
-        self.logger.info(f"Created comparison results directory: {comparison_dir}")
-
-        # Extract connection sequences
-        self.logger.info("Extracting connection sequences from original and new optimization results")
-        original_sequence = self._extract_connection_sequence(self.original_results)
-        new_sequence = self._extract_connection_sequence(self.new_results)
-        self.logger.info(f"Original sequence has {len(original_sequence['flat'])} clusters")
-        self.logger.info(f"New sequence has {len(new_sequence['flat'])} clusters")
-
-        # Compare the sequences
-        self.logger.info("Comparing connection sequences")
-        sequence_changes = self._compare_sequences(original_sequence, new_sequence)
-        self.logger.info(f"Sequence comparison result: {sequence_changes}")
-
-        # Compare objective values
-        self.logger.info("Comparing objective values")
-        objective_changes = self._compare_objectives(self.original_results, self.new_results)
-        self.logger.info(f"Objective comparison result: {objective_changes}")
-
-        # Create a summary DataFrame
-        self.logger.info("Creating summary of comparison results")
-        summary = {
-            'parameter': ['Heating Demand Reduction', 'Cooling Demand Reduction', 'DHW Demand Reduction', 'Electricity Demand Reduction',
-                         'Number of Last Clusters Modified', 'Sequence Changes', 'Objective Value Changes'],
-            'value': [f"{self.heating_reduction * 100}%", f"{self.cooling_reduction * 100}%", 
-                     f"{self.dhw_reduction * 100}%", f"{self.electricity_reduction * 100}%",
-                     self.num_last_clusters, sequence_changes, objective_changes]
-        }
-        summary_df = pd.DataFrame(summary)
-
-        # Save the summary
-        summary_file = comparison_dir / "summary.csv"
-        self.logger.info(f"Saving summary to: {summary_file}")
-        summary_df.to_csv(str(summary_file), index=False)
-
-        # Create detailed comparison of connection sequences
-        self.logger.info("Creating detailed comparison of connection sequences")
-        sequence_comparison = {
-            'cluster_id': list(range(len(original_sequence['flat']))),
-            'original_phase': original_sequence['flat'],
-            'new_phase': new_sequence['flat']
-        }
-        sequence_df = pd.DataFrame(sequence_comparison)
-        sequence_df['phase_change'] = sequence_df['new_phase'] - sequence_df['original_phase']
-
-        # Count clusters that changed phases
-        changed_clusters = sequence_df[sequence_df['phase_change'] != 0]
-        self.logger.info(f"Found {len(changed_clusters)} clusters that changed phases")
-
-        # Save the sequence comparison
-        sequence_file = comparison_dir / "sequence_comparison.csv"
-        self.logger.info(f"Saving sequence comparison to: {sequence_file}")
-        sequence_df.to_csv(str(sequence_file), index=False)
-
-        # Create visualizations
-        self.logger.info("Creating visualizations of comparison results")
-        self._create_visualizations(sequence_df, comparison_dir)
-
-        self.logger.info(f"Comparison results saved to {comparison_dir}")
-        return summary_df
-
-    def _parse_list_param(self, param_str):
-        """Parse a comma-separated string parameter into a list of values."""
-        if not param_str or param_str.strip() == '':
-            return None
-        return [float(x) for x in param_str.split(',')]
-
-    def _extract_connection_sequence(self, results):
-        """
-        Extract the connection sequence from optimization results.
-
-        Args:
-            results: Optimization results
-
-        Returns:
-            Dictionary with connection sequence information
-        """
-        # Get the genome (connection sequence)
-        genome = results['genome']
-
-        # Extract the connection sequence by phase
-        connection_sequence = []
-        for phase in range(1, self.config.dtn_expansion_optimization.num_phases + 1):
-            clusters_in_phase = []
-            for i, cluster_phase in enumerate(genome):
-                if cluster_phase == phase:
-                    clusters_in_phase.append(i)
-            connection_sequence.append(clusters_in_phase)
-
-        return {
-            'by_phase': connection_sequence,
-            'flat': genome
-        }
-
-    def _compare_sequences(self, original_sequence, new_sequence):
-        """
-        Compare original and new connection sequences.
-
-        Args:
-            original_sequence: Original connection sequence
-            new_sequence: New connection sequence
-
-        Returns:
-            String describing the changes
-        """
-        # Count how many clusters changed phases
-        changes = 0
-        for i, (orig, new) in enumerate(zip(original_sequence['flat'], new_sequence['flat'])):
-            if orig != new:
-                changes += 1
-
-        return f"{changes} clusters changed phases ({changes/len(original_sequence['flat'])*100:.1f}%)"
-
-    def _compare_objectives(self, original_results, new_results):
-        """
-        Compare objective values between original and new results.
-
-        Args:
-            original_results: Original optimization results
-            new_results: New optimization results
-
-        Returns:
-            String describing the changes
-        """
-        changes = []
-
-        # Check for NPV
-        if 'fitness_NPV' in original_results and 'fitness_NPV' in new_results:
-            original_npv = original_results['fitness_NPV']
-            new_npv = new_results['fitness_NPV']
-            percent_change = (new_npv - original_npv) / abs(original_npv) * 100
-            changes.append(f"NPV: {percent_change:.2f}%")
-
-        # Check for ROI
-        if 'fitness_ROI' in original_results and 'fitness_ROI' in new_results:
-            original_roi = original_results['fitness_ROI']
-            new_roi = new_results['fitness_ROI']
-            percent_change = (new_roi - original_roi) / abs(original_roi) * 100
-            changes.append(f"ROI: {percent_change:.2f}%")
-
-        # Check for emissions
-        if 'fitness_emissions' in original_results and 'fitness_emissions' in new_results:
-            original_emissions = original_results['fitness_emissions']
-            new_emissions = new_results['fitness_emissions']
-            percent_change = (new_emissions - original_emissions) / abs(original_emissions) * 100
-            changes.append(f"Emissions: {percent_change:.2f}%")
-
-        return ", ".join(changes) if changes else "No comparable objective values found"
-
-    def _create_visualizations(self, sequence_df, output_dir):
-        """
-        Create visualizations of the results comparison.
-
-        Args:
-            sequence_df: DataFrame with sequence comparison
-            output_dir: Directory to save visualizations
-        """
-        try:
-            import matplotlib.pyplot as plt
-            import seaborn as sns
-
-            # Set style
-            sns.set(style="whitegrid")
-
-            # Create a heatmap of phase changes
-            plt.figure(figsize=(12, 8))
-            pivot_df = sequence_df.pivot_table(
-                index='cluster_id', 
-                values='phase_change',
-                aggfunc='first'
-            ).reset_index()
-            pivot_df = pivot_df.sort_values('phase_change')
-
-            # Plot the heatmap
-            ax = sns.heatmap(
-                pivot_df[['phase_change']].T, 
-                cmap='RdBu_r',
-                center=0,
-                cbar_kws={'label': 'Phase Change (New - Original)'}
-            )
-            ax.set_xticklabels(pivot_df['cluster_id'])
-            ax.set_title('Phase Changes by Cluster')
-            ax.set_xlabel('Cluster ID')
-            ax.set_ylabel('')
-
-            # Save the figure
-            plt.tight_layout()
-            plt.savefig(str(Path(output_dir) / 'phase_changes_heatmap.png'), dpi=300)
-            plt.close()
-
-            # Create a bar chart of original vs new phases
-            plt.figure(figsize=(12, 8))
-
-            # Sort by original phase
-            sorted_df = sequence_df.sort_values(['original_phase', 'cluster_id'])
-
-            # Plot
-            bar_width = 0.35
-            x = np.arange(len(sorted_df))
-
-            plt.bar(x - bar_width/2, sorted_df['original_phase'], bar_width, label='Original Phase')
-            plt.bar(x + bar_width/2, sorted_df['new_phase'], bar_width, label='New Phase')
-
-            plt.xlabel('Cluster ID')
-            plt.ylabel('Phase')
-            plt.title('Original vs New Connection Phases')
-            plt.xticks(x, sorted_df['cluster_id'], rotation=90)
-            plt.legend()
-
-            # Save the figure
-            plt.tight_layout()
-            plt.savefig(str(Path(output_dir) / 'phase_comparison_bar.png'), dpi=300)
-            plt.close()
-
-        except ImportError:
-            self.logger.warning("Matplotlib or seaborn not available. Skipping visualizations.")
 
     def run(self):
         """

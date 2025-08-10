@@ -58,20 +58,31 @@ def setup_creator(multi_objective=False, objective_function='NPV', multi_objecti
         del creator.Individual
 
     if multi_objective:
-        # For multi-objective optimization, create a fitness class that handles multiple objectives
-        creator.create("FitnessMulti", base.Fitness, weights=(1.0,) * len(multi_objective_functions))
+        # Build weights per objective: +1 for benefits (NPV/ROI), -1 for costs (emissions/total_capex)
+        if not multi_objective_functions or len(multi_objective_functions) == 0:
+            multi_objective_functions = ['NPV', 'emissions']
+        multi_objective_functions = multi_objective_functions[:3]
+
+        weights = []
+        for obj in multi_objective_functions:
+            obj_lower = obj.lower() if isinstance(obj, str) else obj
+            if obj_lower in ('npv', 'roi'):
+                weights.append(1.0)
+            elif obj_lower in ('emissions', 'total_capex'):
+                weights.append(-1.0)
+            else:
+                weights.append(1.0)
+
+        creator.create("FitnessMulti", base.Fitness, weights=tuple(weights))
         creator.create("Individual", list, fitness=creator.FitnessMulti)
     else:
-        # For single-objective optimization, create a fitness class based on the objective function
-        if objective_function.lower() == 'emissions':
-            # For emissions, we want to minimize, so use negative weights
+        # Single objective: minimize for emissions, maximize otherwise
+        if isinstance(objective_function, str) and objective_function.lower() == 'emissions':
             creator.create("FitnessMin", base.Fitness, weights=(-1.0,))
             creator.create("Individual", list, fitness=creator.FitnessMin)
         else:
-            # For other objectives (NPV, ROI), we want to maximize
             creator.create("FitnessMax", base.Fitness, weights=(1.0,))
             creator.create("Individual", list, fitness=creator.FitnessMax)
-
 
 def log():
     """
@@ -219,7 +230,7 @@ class DTNExpansionOptimizer:
         interest_rate : float
             Annual interest rate for NPV calculations
         cost_model : str
-            Method for calculating pipe costs ('simplified' or 'detailed')
+            Method for calculating pipe costs (only 'detailed')
         objective_function : str
             Objective function to maximize ('NPV', 'ROI') or minimize ('emissions')
         diversity_factor : float
@@ -258,6 +269,10 @@ class DTNExpansionOptimizer:
 
         # Set default phase durations if not provided
         self.phase_durations = phase_durations or [3] * num_phases
+
+        if cost_model and cost_model.lower() != 'detailed':
+            log().warning(f"Ignoring cost_model='{cost_model}'. Only 'detailed' is supported now.")
+        self.cost_model = 'detailed'
 
         # Validate that the length of phase_durations matches num_phases
         if len(self.phase_durations) != self.num_phases:
@@ -367,9 +382,6 @@ class DTNExpansionOptimizer:
             'capex_hex_USD': cost_data['capex_hex_USD'].iloc[0],
             'network_length_m': cost_data['network_length_m'].iloc[0],
         }
-
-        # Calculate cost per meter of pipe (for simplified model)
-        cost_components['cost_per_meter'] = cost_components['capex_network_USD'] / cost_components['network_length_m']
 
         return cost_components
 
@@ -612,34 +624,7 @@ class DTNExpansionOptimizer:
 
             return total_pipe_cost
         except Exception as e:
-            log().warning(f"Error in detailed CAPEX calculation: {e}. Falling back to simplified calculation.")
-            # Fall back to simplified calculation
-            return self.calculate_simplified_capex(cluster_set)
-
-    def calculate_simplified_capex(self, cluster_set):
-        """
-        Calculate CAPEX using simplified average cost per meter.
-
-        Parameters:
-        -----------
-        cluster_set : tuple or list
-            Tuple or list of cluster IDs
-
-        Returns:
-        --------
-        float
-            Total pipe CAPEX
-        """
-        # Get edges for this cluster set
-        required_pipes = self.get_required_pipes_for_clusters(cluster_set)
-
-        # Calculate total pipe length
-        total_pipe_length = required_pipes['length_m'].sum()
-
-        # Calculate cost using average cost per meter
-        total_pipe_cost = total_pipe_length * self.cost_data['cost_per_meter']
-
-        return total_pipe_cost
+            raise RuntimeError(f"Detailed CAPEX calculation failed: {e}") from e
 
     def calculate_pump_costs(self, cluster_set):
         """
@@ -734,8 +719,7 @@ class DTNExpansionOptimizer:
         peak_demand_kw = annual_demand_kwh / 2000 / self.diversity_factor  # Assuming 2000 equivalent full load hours
         peak_demand_w = peak_demand_kw * 1000  # Convert to W
 
-        # Calculate cooling plant CAPEX using a simplified approach
-        # Based on typical costs for chillers and cooling towers
+        # Calculate cooling plant CAPEX based on typical costs for chillers and cooling towers
         if peak_demand_w > 0:
             # Chiller costs (USD)
             chiller_capex = 750 * (peak_demand_w / 1000) ** 0.85
@@ -777,7 +761,9 @@ class DTNExpansionOptimizer:
         # Load HEX cost parameters from database
         try:
             HEX_prices = pd.read_csv(
-                self.locator.get_db4_components_conversion_conversion_technology_csv('HEAT_EXCHANGERS'), index_col=0)
+                self.locator.get_db4_components_conversion_conversion_technology_csv('HEAT_EXCHANGERS'),
+                index_col=0
+            )
             a = HEX_prices['a']['District substation heat exchanger']
             b = HEX_prices['b']['District substation heat exchanger']
             c = HEX_prices['c']['District substation heat exchanger']
@@ -786,8 +772,7 @@ class DTNExpansionOptimizer:
             Inv_IR = HEX_prices['IR_%']['District substation heat exchanger']
             Inv_LT = HEX_prices['LT_yr']['District substation heat exchanger']
         except Exception as ex:
-            # Fallback to simplified approach if database access fails
-            return len(buildings) * (self.cost_data['capex_hex_USD'] / self.total_buildings)
+            raise RuntimeError(f"Detailed HEX costs calculation failed: {ex}") from ex
 
         # Get metrics for this cluster set
         key = '+'.join(map(str, sorted(cluster_set)))
@@ -860,24 +845,12 @@ class DTNExpansionOptimizer:
             (float, dict) - Total CAPEX for the phase with interest rate adjustment and a dictionary with component costs
         """
         # Calculate base CAPEX
-        if self.cost_model == 'detailed':
-            pipe_capex = self.calculate_detailed_capex(cluster_set)
-            hex_capex = self.calculate_hex_costs(cluster_set)
-            pump_capex, _ = self.calculate_pump_costs(cluster_set)
-            cooling_plant_capex = 0
-            if self.network_type == 'DC':
-                cooling_plant_capex, _ = self.calculate_cooling_plant_costs(cluster_set)
-        else:
-            # Simplified cost model calculations
-            pipe_capex = self.calculate_simplified_capex(cluster_set)
-            buildings = self._get_buildings_in_clusters(cluster_set)
-            hex_capex = len(buildings) * (self.cost_data['capex_hex_USD'] / self.total_buildings)
-            required_pipes = self.get_required_pipes_for_clusters(cluster_set)
-            pipe_length_ratio = required_pipes['length_m'].sum() / self.cost_data['network_length_m']
-            pump_capex = self.cost_data['capex_pumps_USD'] * pipe_length_ratio
-            cooling_plant_capex = 0
-            if self.network_type == 'DC':
-                cooling_plant_capex = self.cost_data['capex_cooling_plant_USD'] * pipe_length_ratio
+        pipe_capex = self.calculate_detailed_capex(cluster_set)
+        hex_capex = self.calculate_hex_costs(cluster_set)
+        pump_capex, _ = self.calculate_pump_costs(cluster_set)
+        cooling_plant_capex = 0
+        if self.network_type == 'DC':
+            cooling_plant_capex, _ = self.calculate_cooling_plant_costs(cluster_set)
 
         # Calculate total base CAPEX
         total_base_capex = pipe_capex + hex_capex + pump_capex + cooling_plant_capex
@@ -1213,13 +1186,11 @@ class DTNExpansionOptimizer:
 
         # Get cluster assignments from current individual
         if hasattr(self, 'current_individual') and self.current_individual:
-            # Use the current individual's phase assignments
             cluster_phase_map = {cluster: p for cluster, p in zip(self.all_clusters, self.current_individual)}
             clusters_by_phase = {}
             for phase in range(1, self.num_phases + 1):
                 clusters_by_phase[phase] = [cluster for cluster, p in cluster_phase_map.items() if p == phase]
-        elif self.solution and 'genome' in self.solution:
-            # Use the solution's genome if available
+        elif hasattr(self, 'solution') and self.solution and 'genome' in self.solution:
             cluster_phase_map = {cluster: p for cluster, p in zip(self.all_clusters, self.solution['genome'])}
             clusters_by_phase = {}
             for phase in range(1, self.num_phases + 1):
@@ -2537,27 +2508,13 @@ class DTNExpansionOptimizer:
                             f'linear_{demand_type}_density_MWh_per_km', 0)
 
                 # Calculate CAPEX components for cluster 0
-                if self.cost_model == 'detailed':
-                    pipe_capex = self.calculate_detailed_capex((0,))
-                    hex_capex = self.calculate_hex_costs((0,))
-                    pump_capex, pump_electricity = self.calculate_pump_costs((0,))
-                    cooling_plant_capex = 0
-                    cooling_plant_electricity = 0
-                    if self.network_type == 'DC':
-                        cooling_plant_capex, cooling_plant_electricity = self.calculate_cooling_plant_costs((0,))
-                else:
-                    # Simplified cost model calculations
-                    pipe_capex = self.calculate_simplified_capex((0,))
-                    buildings = self._get_buildings_in_clusters((0,))
-                    hex_capex = len(buildings) * (self.cost_data['capex_hex_USD'] / self.total_buildings)
-                    required_pipes = self.get_required_pipes_for_clusters((0,))
-                    pipe_length_ratio = required_pipes['length_m'].sum() / self.cost_data['network_length_m']
-                    pump_capex = self.cost_data['capex_pumps_USD'] * pipe_length_ratio
-                    cooling_plant_capex = 0
-                    pump_electricity = 0
-                    cooling_plant_electricity = 0
-                    if self.network_type == 'DC':
-                        cooling_plant_capex = self.cost_data['capex_cooling_plant_USD'] * pipe_length_ratio
+                pipe_capex = self.calculate_detailed_capex((0,))
+                hex_capex = self.calculate_hex_costs((0,))
+                pump_capex, pump_electricity = self.calculate_pump_costs((0,))
+                cooling_plant_capex = 0
+                cooling_plant_electricity = 0
+                if self.network_type == 'DC':
+                    cooling_plant_capex, cooling_plant_electricity = self.calculate_cooling_plant_costs((0,))
 
                 # Update phase0_result with calculated CAPEX components
                 phase0_result['new_cluster(s)_pipe_capex [USD]'] = pipe_capex
@@ -2799,28 +2756,16 @@ class DTNExpansionOptimizer:
                     clusters = [int(c) for c in result['newly_connected_cluster(s)'].split('+')]
 
                     # Calculate detailed CAPEX components
-                    if self.cost_model == 'detailed':
-                        pipe_capex = self.calculate_detailed_capex(tuple(clusters))
-                    else:
-                        pipe_capex = self.calculate_simplified_capex(tuple(clusters))
+                    pipe_capex = self.calculate_detailed_capex(tuple(clusters))
 
                     # Get buildings in the clusters
                     buildings = self._get_buildings_in_clusters(tuple(clusters))
 
                     # Calculate heat exchanger costs
-                    if self.cost_model == 'detailed':
-                        hex_capex = self.calculate_hex_costs(tuple(clusters))
-                    else:
-                        hex_capex = len(buildings) * (self.cost_data['capex_hex_USD'] / self.total_buildings)
+                    hex_capex = self.calculate_hex_costs(tuple(clusters))
 
                     # Calculate pump costs
-                    if self.cost_model == 'detailed':
-                        pump_capex, pump_electricity = self.calculate_pump_costs(tuple(clusters))
-                    else:
-                        required_pipes = self.get_required_pipes_for_clusters(tuple(clusters))
-                        pipe_length_ratio = required_pipes['length_m'].sum() / self.cost_data['network_length_m']
-                        pump_capex = self.cost_data['capex_pumps_USD'] * pipe_length_ratio
-                        pump_electricity = 0  # Not calculated in simplified model
+                    pump_capex, pump_electricity = self.calculate_pump_costs(tuple(clusters))
 
                     # Calculate cooling plant costs for DC networks
                     if self.network_type == 'DC':
@@ -3329,27 +3274,13 @@ class DTNExpansionOptimizer:
                     f'linear_{demand_type}_density_MWh_per_km', 0)
 
             # Calculate CAPEX components for cluster 0
-            if self.cost_model == 'detailed':
-                pipe_capex = self.calculate_detailed_capex((0,))
-                hex_capex = self.calculate_hex_costs((0,))
-                pump_capex, pump_electricity = self.calculate_pump_costs((0,))
-                cooling_plant_capex = 0
-                cooling_plant_electricity = 0
-                if self.network_type == 'DC':
-                    cooling_plant_capex, cooling_plant_electricity = self.calculate_cooling_plant_costs((0,))
-            else:
-                # Simplified cost model calculations
-                pipe_capex = self.calculate_simplified_capex((0,))
-                buildings = self._get_buildings_in_clusters((0,))
-                hex_capex = len(buildings) * (self.cost_data['capex_hex_USD'] / self.total_buildings)
-                required_pipes = self.get_required_pipes_for_clusters((0,))
-                pipe_length_ratio = required_pipes['length_m'].sum() / self.cost_data['network_length_m']
-                pump_capex = self.cost_data['capex_pumps_USD'] * pipe_length_ratio
-                cooling_plant_capex = 0
-                pump_electricity = 0
-                cooling_plant_electricity = 0
-                if self.network_type == 'DC':
-                    cooling_plant_capex = self.cost_data['capex_cooling_plant_USD'] * pipe_length_ratio
+            pipe_capex = self.calculate_detailed_capex((0,))
+            hex_capex = self.calculate_hex_costs((0,))
+            pump_capex, pump_electricity = self.calculate_pump_costs((0,))
+            cooling_plant_capex = 0
+            cooling_plant_electricity = 0
+            if self.network_type == 'DC':
+                cooling_plant_capex, cooling_plant_electricity = self.calculate_cooling_plant_costs((0,))
 
             # Calculate total CAPEX
             total_capex = pipe_capex + hex_capex + pump_capex + cooling_plant_capex

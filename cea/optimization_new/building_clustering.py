@@ -24,6 +24,7 @@ __status__ = "Production"
 
 # Standard libraries
 import os
+os.environ['OMP_NUM_THREADS'] = '1'
 import sys
 import warnings
 import logging
@@ -53,7 +54,6 @@ from matplotlib.colors import ListedColormap
 import cea.config
 import cea.inputlocator
 
-os.environ['OMP_NUM_THREADS'] = '1'
 
 def log()->logging.Logger:
     """Return a logger for this module."""

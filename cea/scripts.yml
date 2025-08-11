@@ -339,7 +339,7 @@ Energy Supply System Optimisation:
                   'dtn-expansion-optimization:cluster0_district_scale_warning', 'dtn-expansion-optimization:network-type', 
                   'dtn-expansion-optimization:testing-clusters', 'dtn-expansion-optimization:chosen-buildings',
                   'dtn-expansion-optimization:run-optimization', 'dtn-expansion-optimization:capex-budget-per-phase', 
-                  'dtn-expansion-optimization:total-expenditure-budget-per-phase', 'dtn-expansion-optimization:cost-model',
+                  'dtn-expansion-optimization:total-expenditure-budget-per-phase',
                   'dtn-expansion-optimization:num-phases', 'dtn-expansion-optimization:phase-durations', 'dtn-expansion-optimization:interest-rate',
                   'dtn-expansion-optimization:population-size', 'dtn-expansion-optimization:num-generations',
                   'dtn-expansion-optimization:objective-function', 'dtn-expansion-optimization:roi-phase-weights',

@@ -1225,7 +1225,19 @@ class DynamicDTNOptimizer:
         tn_config.scenario = temp_scenario_dir
         tn_config.thermal_network.network_type = self.network_type
 
-        # Run thermal network simulation on the temporary scenario
+        # Diagnostics: more verbose logs and no multiprocessing buffering
+        # (prevents Windows child process issues and shows progress)
+        tn_config.general.debug = True
+        try:
+            tn_config.general.multiprocessing = False
+        except Exception:
+            pass
+
+        # Ensure thermal-network module emits INFO-level logs
+        import logging
+        logging.getLogger('cea.technologies.thermal_network').setLevel(logging.INFO)
+        logging.getLogger('cea.technologies.thermal_network.thermal_network').setLevel(logging.INFO)
+
         self.logger.info("Starting thermal network simulation (Part 2)")
         self.logger.info("Detailed progress messages will be displayed in the console")
         thermal_network_simulation_main(tn_config)

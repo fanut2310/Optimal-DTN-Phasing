@@ -388,14 +388,17 @@ class DTNExpansionOptimizer:
     def _load_cluster_data(self):
         """Load cluster data from cluster_edges.csv and cluster_nodes.csv."""
         # Load cluster assignments
-        cluster_edges_path = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "cluster_edges.csv"
+        cluster_edges_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_edges.csv"
+        log().info(f"Loading cluster edges (temp scenario) from: {cluster_edges_path}")
         self.cluster_edges = pd.read_csv(cluster_edges_path)
 
-        cluster_nodes_path = Path(self.locator.get_dtn_cluster_nodes_file())
+        cluster_nodes_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_nodes.csv"
+        log().info(f"Loading cluster nodes (temp scenario) from: {cluster_nodes_path}")
         self.cluster_nodes = pd.read_csv(cluster_nodes_path)
 
         # Load total demand
-        total_demand_path = Path(self.locator.get_total_demand())
+        total_demand_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand())
+        log().info(f"Loading total demand (temp scenario) from: {total_demand_path}")
         self.total_demand = pd.read_csv(total_demand_path)
 
         # If testing_clusters is specified, use only those clusters
@@ -1092,7 +1095,8 @@ class DTNExpansionOptimizer:
 
     def _cache_emissions_for_individual(self, individual, emissions, has_non_district_scale):
         """Store emissions results and non-district scale flag for an individual in the cache"""
-        self.emissions_cache[individual] = (emissions, has_non_district_scale)
+        key = tuple(individual) if not isinstance(individual, tuple) else individual
+        self.emissions_cache[key] = (emissions, has_non_district_scale)
 
     def calculate_district_emissions_new(self):
         """
@@ -3710,11 +3714,11 @@ class PipeLayoutGenerator:
         
         # Load cluster assignments
         cluster_edges_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_edges.csv"
-        log().info(f"Loading cluster edges from: {cluster_edges_path}")
+        log().info(f"Loading cluster edges (temp scenario) from: {cluster_edges_path}")
         self.cluster_edges = pd.read_csv(cluster_edges_path)
-        
-        cluster_nodes_path = Path(self.locator.get_dtn_cluster_nodes_file())
-        log().info(f"Loading cluster nodes from: {cluster_nodes_path}")
+
+        cluster_nodes_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_nodes.csv"
+        log().info(f"Loading cluster nodes (temp scenario) from: {cluster_nodes_path}")
         self.cluster_nodes = pd.read_csv(cluster_nodes_path)
         
         # Load edge-node matrix
@@ -4016,13 +4020,12 @@ def generate_updated_metrics(locator, network_type, testing_clusters=None):
         def _load_inputs(self):
             """Override to ensure we use the temp scenario's total demand file."""
             # Load cluster assignments using direct path methods
-            cluster_edges_path = Path(
-                self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_edges.csv"
+            cluster_edges_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_edges.csv"
             log().info(f"Loading cluster edges from: {cluster_edges_path}")
             self.cluster_edges = pd.read_csv(cluster_edges_path)
 
-            cluster_nodes_path = Path(self.locator.get_dtn_cluster_nodes_file())
-            log().info(f"Loading cluster nodes from: {cluster_nodes_path}")
+            cluster_nodes_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_nodes.csv"
+            log().info(f"Loading cluster nodes (temp scenario) from: {cluster_nodes_path}")
             self.cluster_nodes = pd.read_csv(cluster_nodes_path)
 
             # Load edge-node matrix

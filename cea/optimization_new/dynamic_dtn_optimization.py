@@ -197,11 +197,15 @@ class DynamicDTNOptimizer:
         except Exception:
             pass  # leave as-is if parsing fails
 
+        parsed_any_phase = False
         for phase_col in phase_cols:
             try:
                 solution[phase_col] = eval(best_row[phase_col])
+                parsed_any_phase = True
             except Exception:
-                self.logger.warning(f"Could not parse {phase_col} from results")
+                self.logger.debug(f"Could not parse optional column {phase_col} from results")
+        if not parsed_any_phase and phase_cols:
+            self.logger.info("No phase_*_clusters metadata parsed from results (optional). Proceeding without them.")
 
         self.original_results = solution
         return solution
@@ -282,7 +286,13 @@ class DynamicDTNOptimizer:
         self._densify_buildings = set(densify_buildings)
 
         self.logger.info(f"Buildings to RETROFIT: {len(retrofit_buildings)}")
+        if retrofit_buildings:
+            self.logger.info(f"RETROFIT targets ({len(retrofit_buildings)} buildings): {', '.join(sorted(retrofit_buildings))}")
+            self.logger.info(f"Retrofit reductions: Heating={self.heating_reduction*100:.1f}%, Cooling={self.cooling_reduction*100:.1f}%, DHW={self.dhw_reduction*100:.1f}%, Electricity={self.electricity_reduction*100:.1f}%")
         self.logger.info(f"Buildings to DENSIFY: {len(densify_buildings)} (factor: {1.0 + self.densification_pct:.3f})")
+        if densify_buildings:
+            self.logger.info(f"DENSIFY targets ({len(densify_buildings)} buildings): {', '.join(sorted(densify_buildings))}")
+            self.logger.info(f"Densification percent: {self.densification_pct*100:.1f}% (applies to all *_kWh and metadata columns Af_m2/Aroof_m2/GFA_m2/Aocc_m2/people0)")
 
         # Create output directory
         modified_demand_dir = Path(self.locator.get_optimization_results_folder()) / "dynamic_dtn_optimization" / "modified_demands"
@@ -342,14 +352,14 @@ class DynamicDTNOptimizer:
                     if col.endswith('_kWh'):
                         demand_df[col] = demand_df[col] * up_factor
                         cols_scaled += 1
-                # Scale area / floors metadata if present in per-building CSV
-                for meta_col in ['GFA_m2', 'Af_m2', 'TFA_m2', 'floors_ag']:
+                # Scale selected metadata if present in per-building CSV (only Af_m2 & GFA_m2)
+                for meta_col in ['GFA_m2', 'Af_m2']:
                     if meta_col in demand_df.columns:
                         try:
                             demand_df.loc[:, meta_col] = demand_df[meta_col] * up_factor
                         except Exception:
                             pass
-                self.logger.debug(f"{building}: densified {cols_scaled} *_kWh columns and scaled area/floors by {up_factor:.3f}")
+                self.logger.debug(f"{building}: densified {cols_scaled} *_kWh columns and scaled Af/GFA by {up_factor:.3f}")
                 action = 'densify'
 
             # Save the modified demand file
@@ -843,8 +853,8 @@ class DynamicDTNOptimizer:
             # Create a row for this building in the total_demand_df
             building_row = {'name': building}
 
-            # Add metadata columns if they exist (include TFA_m2 and floors_ag)
-            for col in ['Af_m2', 'Aroof_m2', 'GFA_m2', 'TFA_m2', 'Aocc_m2', 'people0', 'floors_ag']:
+            # Add metadata columns if they exist (restrict to five required)
+            for col in ['Af_m2', 'Aroof_m2', 'GFA_m2', 'Aocc_m2', 'people0']:
                 if col in building_df.columns:
                     building_row[col] = building_df[col].iloc[0]
 
@@ -892,19 +902,26 @@ class DynamicDTNOptimizer:
                 total_demand_df['QC_sys_MWhyr'] = 0.0
                 self.logger.warning("Could not calculate QC_sys_MWhyr, adding column with zeros")
 
-        # Apply densification scaling to area-related fields before first save (if any densified buildings)
+        # Apply densification to ONLY the five metadata columns before first save (if any densified buildings)
         up_factor = 1.0 + getattr(self, 'densification_pct', 0.0)
+        five_meta_cols = ['Af_m2', 'Aroof_m2', 'GFA_m2', 'Aocc_m2', 'people0']
         if up_factor != 1.0 and hasattr(self, '_densify_buildings') and len(self._densify_buildings) > 0:
             try:
                 mask = total_demand_df['name'].isin(list(self._densify_buildings))
-                for col in ['GFA_m2', 'Af_m2', 'TFA_m2', 'Aroof_m2', 'Aocc_m2', 'people0', 'floors_ag']:
+                for col in five_meta_cols:
                     if col in total_demand_df.columns:
                         total_demand_df.loc[mask, col] = total_demand_df.loc[mask, col] * up_factor
                 if 'people0' in total_demand_df.columns:
                     total_demand_df.loc[mask, 'people0'] = total_demand_df.loc[mask, 'people0'].round()
-                self.logger.info(f"Applied densification factor {up_factor:.3f} to area-related fields in Total_demand.csv for densified buildings before first save.")
+                self.logger.info(f"Applied densification factor {up_factor:.3f} to metadata in Total_demand.csv before first save.")
             except Exception as e:
-                self.logger.warning(f"Could not apply densification scaling to area fields before first save: {e}")
+                self.logger.warning(f"Could not apply densification scaling to metadata before first save: {e}")
+        # Reorder columns: name, five metadata, then PV_MWhyr (if present), then others
+        front_cols = ['name'] + [c for c in five_meta_cols if c in total_demand_df.columns]
+        other_cols = [c for c in total_demand_df.columns if c not in front_cols]
+        if 'PV_MWhyr' in other_cols:
+            other_cols = ['PV_MWhyr'] + [c for c in other_cols if c != 'PV_MWhyr']
+        total_demand_df = total_demand_df[front_cols + other_cols]
         # Save updated Total_demand.csv
         total_demand_df.to_csv(temp_demand_dir / "Total_demand.csv", index=False, float_format='%.3f', na_rep='nan')
         self.logger.info("Updated Total_demand.csv generated successfully")
@@ -912,15 +929,15 @@ class DynamicDTNOptimizer:
         # After saving the initial Total_demand.csv, check for missing metadata columns
         self.logger.info("Checking for missing metadata columns in Total_demand.csv")
 
-        # Required metadata columns that should be present
-        required_metadata_columns = ['Af_m2', 'Aroof_m2', 'GFA_m2', 'TFA_m2', 'Aocc_m2', 'people0', 'floors_ag']
+        # Required metadata columns that should be present (only five)
+        required_metadata_columns = ['Af_m2', 'Aroof_m2', 'GFA_m2', 'Aocc_m2', 'people0']
 
         # Read the saved Total_demand.csv to check for missing columns
         temp_total_demand = pd.read_csv(temp_demand_dir / "Total_demand.csv")
         missing_columns = [col for col in required_metadata_columns if col not in temp_total_demand.columns]
 
         if missing_columns:
-            self.logger.warning(f"Missing metadata columns in temporary Total_demand.csv: {missing_columns}")
+            self.logger.info(f"Some metadata columns missing in temporary Total_demand.csv: {missing_columns}")
             
             # Try to get the missing columns from the original Total_demand.csv
             try:
@@ -1016,25 +1033,30 @@ class DynamicDTNOptimizer:
                 if up_factor != 1.0 and hasattr(self, '_densify_buildings') and len(self._densify_buildings) > 0:
                     try:
                         mask = temp_total_demand['name'].isin(list(self._densify_buildings))
-                        for col in ['GFA_m2', 'Af_m2', 'TFA_m2', 'Aroof_m2', 'Aocc_m2', 'people0', 'floors_ag']:
+                        five_meta_cols = ['Af_m2', 'Aroof_m2', 'GFA_m2', 'Aocc_m2', 'people0']
+                        for col in five_meta_cols:
                             if col in temp_total_demand.columns:
                                 temp_total_demand.loc[mask, col] = temp_total_demand.loc[mask, col] * up_factor
                         if 'people0' in temp_total_demand.columns:
                             temp_total_demand.loc[mask, 'people0'] = temp_total_demand.loc[mask, 'people0'].round()
-                        self.logger.info(f"Applied densification factor {up_factor:.3f} to area-related fields in Total_demand.csv after backfilling.")
+                        self.logger.info(f"Applied densification factor {up_factor:.3f} to metadata fields after backfilling.")
                     except Exception as e:
-                        self.logger.warning(f"Could not apply densification scaling to area fields after backfilling: {e}")
+                        self.logger.warning(f"Could not apply densification scaling to metadata after backfilling: {e}")
+                # Reorder again to keep the five metadata columns as 2nd–6th
+                front_cols = ['name'] + [c for c in ['Af_m2', 'Aroof_m2', 'GFA_m2', 'Aocc_m2', 'people0'] if c in temp_total_demand.columns]
+                other_cols = [c for c in temp_total_demand.columns if c not in front_cols]
+                temp_total_demand = temp_total_demand[front_cols + other_cols]
                 # Save the updated Total_demand.csv
                 temp_total_demand.to_csv(temp_demand_dir / "Total_demand.csv", index=False, float_format='%.3f', na_rep='nan')
-                self.logger.info("Updated Total_demand.csv with missing metadata columns")
+                self.logger.info("Updated Total_demand.csv with metadata backfill and ordering")
                 
             except Exception as e:
                 self.logger.error(f"Error retrieving metadata columns from original Total_demand.csv: {e}")
                 self.logger.warning("Adding default values for missing metadata columns")
                 
-                # Add default values for missing columns
+                # Add default values for missing columns (only five)
                 for col in missing_columns:
-                    if col in ['GFA_m2', 'Af_m2', 'TFA_m2']:
+                    if col in ['GFA_m2', 'Af_m2']:
                         temp_total_demand[col] = 1000.0
                     elif col == 'Aroof_m2':
                         temp_total_demand[col] = 200.0
@@ -1042,26 +1064,27 @@ class DynamicDTNOptimizer:
                         temp_total_demand[col] = 800.0
                     elif col == 'people0':
                         temp_total_demand[col] = 40
-                    elif col == 'floors_ag':
-                        temp_total_demand[col] = 5
                 
-                # Apply densification scaling to area-related fields before saving (if any densified buildings)
+                # Apply densification scaling to metadata before saving (if any densified buildings)
                 up_factor = 1.0 + getattr(self, 'densification_pct', 0.0)
                 if up_factor != 1.0 and hasattr(self, '_densify_buildings') and len(self._densify_buildings) > 0:
                     try:
                         mask = temp_total_demand['name'].isin(list(self._densify_buildings))
-                        for col in ['GFA_m2', 'Af_m2', 'TFA_m2', 'Aroof_m2', 'Aocc_m2', 'people0', 'floors_ag']:
+                        for col in ['Af_m2', 'Aroof_m2', 'GFA_m2', 'Aocc_m2', 'people0']:
                             if col in temp_total_demand.columns:
                                 temp_total_demand.loc[mask, col] = temp_total_demand.loc[mask, col] * up_factor
                         if 'people0' in temp_total_demand.columns:
                             temp_total_demand.loc[mask, 'people0'] = temp_total_demand.loc[mask, 'people0'].round()
-                        self.logger.info(f"Applied densification factor {up_factor:.3f} to area-related fields in Total_demand.csv in exception path.")
+                        self.logger.info(f"Applied densification factor {up_factor:.3f} to metadata in exception path.")
                     except Exception as e2:
-                        self.logger.warning(f"Could not apply densification scaling to area fields in exception path: {e2}")
+                        self.logger.warning(f"Could not apply densification scaling to metadata in exception path: {e2}")
                 
-                # Save the updated Total_demand.csv
+                # Reorder columns and save
+                front_cols = ['name'] + [c for c in ['Af_m2', 'Aroof_m2', 'GFA_m2', 'Aocc_m2', 'people0'] if c in temp_total_demand.columns]
+                other_cols = [c for c in temp_total_demand.columns if c not in front_cols]
+                temp_total_demand = temp_total_demand[front_cols + other_cols]
                 temp_total_demand.to_csv(temp_demand_dir / "Total_demand.csv", index=False, float_format='%.3f', na_rep='nan')
-                self.logger.info("Updated Total_demand.csv with default values for missing metadata columns")
+                self.logger.info("Updated Total_demand.csv with default metadata and ordering")
         else:
             self.logger.info("All required metadata columns are present in Total_demand.csv")
 

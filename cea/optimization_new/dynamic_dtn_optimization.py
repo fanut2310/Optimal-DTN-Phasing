@@ -189,14 +189,19 @@ class DynamicDTNOptimizer:
             if col not in ['individual_id', 'genome']:
                 solution[col] = best_row[col]
 
-        # Parse phase clusters
-        for phase in range(1, self.config.dtn_expansion_optimization.num_phases + 1):
-            phase_clusters_col = f'phase_{phase}_clusters'
-            if phase_clusters_col in results_df.columns:
-                try:
-                    solution[phase_clusters_col] = eval(best_row[phase_clusters_col])
-                except:
-                    self.logger.warning(f"Could not parse {phase_clusters_col} from results")
+        # Parse phase_*_clusters columns without relying on config
+        phase_cols = [c for c in results_df.columns if c.startswith('phase_') and c.endswith('_clusters')]
+        # Sort by the integer after 'phase_' if possible
+        try:
+            phase_cols.sort(key=lambda c: int(c.split('_')[1]))
+        except Exception:
+            pass  # leave as-is if parsing fails
+
+        for phase_col in phase_cols:
+            try:
+                solution[phase_col] = eval(best_row[phase_col])
+            except Exception:
+                self.logger.warning(f"Could not parse {phase_col} from results")
 
         self.original_results = solution
         return solution

@@ -3866,8 +3866,8 @@ class PipeLayoutGenerator:
         # Convert to DataFrame
         metrics_df = pd.DataFrame(all_metrics)
 
-        # Save to CSV
-        output_file = self.output_folder / "clusters_metrics.csv"
+        # Save to CSV in the parent dtn_expansion folder (not phase-specific)
+        output_file = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "clusters_metrics.csv"
         metrics_df.to_csv(output_file, index=False)
         log().info(f"Saved metrics for {len(all_metrics)} cluster combinations to {output_file}")
 

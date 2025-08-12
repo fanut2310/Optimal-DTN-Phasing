@@ -11,6 +11,7 @@ import shutil
 import sys
 import time
 import pandas as pd
+import geopandas as gpd
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -1237,6 +1238,67 @@ class DynamicDTNOptimizer:
         import logging
         logging.getLogger('cea.technologies.thermal_network').setLevel(logging.INFO)
         logging.getLogger('cea.technologies.thermal_network.thermal_network').setLevel(logging.INFO)
+
+        # Preflight diagnostics to ensure TN can run
+        temp_locator = cea.inputlocator.InputLocator(temp_scenario_dir)
+        try:
+            td_path = temp_locator.get_total_demand()
+            td_df = pd.read_csv(td_path)
+        except Exception as e:
+            self.logger.error(f"Cannot read temp Total_demand.csv: {td_path} -> {e}")
+            return
+        name_col = 'name' if 'name' in td_df.columns else ('Name' if 'Name' in td_df.columns else None)
+        if not name_col:
+            self.logger.error("Temp Total_demand.csv lacks 'name' (or 'Name') column. Aborting.")
+            return
+        buildings_td = set(td_df[name_col].dropna().astype(str))
+
+        sum_QH = td_df['QH_sys_MWhyr'].sum() if 'QH_sys_MWhyr' in td_df.columns else 0.0
+        sum_QC = td_df['QC_sys_MWhyr'].sum() if 'QC_sys_MWhyr' in td_df.columns else 0.0
+        self.logger.info(f"Preflight: Total demand sums — QH={sum_QH:.1f} MWh/yr, QC={sum_QC:.1f} MWh/yr")
+
+        nodes_shp = os.path.join(temp_locator.get_thermal_network_folder(), self.network_type, 'nodes.shp')
+        try:
+            gdf_nodes = gpd.read_file(nodes_shp)
+            n_rows = len(gdf_nodes)
+            type_col = 'Type' if 'Type' in gdf_nodes.columns else ('type' if 'type' in gdf_nodes.columns else None)
+            name_attr = 'name' if 'name' in gdf_nodes.columns else ('Name' if 'Name' in gdf_nodes.columns else None)
+            if type_col:
+                consumers = gdf_nodes[gdf_nodes[type_col].astype(str).str.upper().str.contains('CONSUMER|SUBSTATION', na=False)]
+            else:
+                consumers = gdf_nodes
+            n_consumers = len(consumers)
+            self.logger.info(f"Preflight: nodes.shp has {n_rows} rows; detected {n_consumers} consumer/substation nodes.")
+            if name_attr:
+                node_buildings = set(consumers[name_attr].dropna().astype(str))
+                overlap = sorted(node_buildings.intersection(buildings_td))
+                self.logger.info(f"Preflight: consumer↔demand name overlap = {len(overlap)} buildings.")
+                if len(overlap) == 0:
+                    self.logger.error("No overlap between nodes.shp names and Total_demand.csv names. Aborting Part 2.")
+                    return
+            else:
+                self.logger.warning("nodes.shp lacks a 'name' or 'Name' attribute; TN may not map consumers to buildings.")
+        except Exception as e:
+            self.logger.error(f"Cannot read/inspect nodes shapefile: {nodes_shp} -> {e}")
+            return
+
+        # Sample-check that some demand files exist in temp scenario
+        missing = []
+        for b in list(buildings_td)[:10]:
+            bfile = temp_locator.get_demand_results_file(b)
+            if not os.path.exists(bfile):
+                missing.append(b)
+        if missing:
+            self.logger.error(f"Missing demand files for sampled buildings in temp scenario: {missing[:5]} ... Aborting.")
+            return
+
+        # Abort if loads are zero for the selected network type
+        if self.network_type == 'DH' and sum_QH <= 0:
+            self.logger.error("QH_sys_MWhyr sum is 0 — DH TN has nothing to simulate. Aborting.")
+            return
+        if self.network_type == 'DC' and sum_QC <= 0:
+            self.logger.error("QC_sys_MWhyr sum is 0 — DC TN has nothing to simulate. Aborting.")
+            return
 
         self.logger.info("Starting thermal network simulation (Part 2)")
         self.logger.info("Detailed progress messages will be displayed in the console")

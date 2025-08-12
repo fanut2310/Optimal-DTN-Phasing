@@ -1262,22 +1262,43 @@ class DynamicDTNOptimizer:
             gdf_nodes = gpd.read_file(nodes_shp)
             n_rows = len(gdf_nodes)
             type_col = 'Type' if 'Type' in gdf_nodes.columns else ('type' if 'type' in gdf_nodes.columns else None)
-            name_attr = 'name' if 'name' in gdf_nodes.columns else ('Name' if 'Name' in gdf_nodes.columns else None)
+
+            # Prefer the 'building' attribute for consumer <-> demand mapping
+            building_attr = None
+            if 'building' in gdf_nodes.columns:
+                building_attr = 'building'
+            elif 'BUILDING' in gdf_nodes.columns:
+                building_attr = 'BUILDING'
+
+            # Filter consumer/substation nodes
             if type_col:
-                consumers = gdf_nodes[gdf_nodes[type_col].astype(str).str.upper().str.contains('CONSUMER|SUBSTATION', na=False)]
+                consumers = gdf_nodes[
+                    gdf_nodes[type_col].astype(str).upper().str.contains('CONSUMER|SUBSTATION', na=False)]
             else:
                 consumers = gdf_nodes
+
             n_consumers = len(consumers)
-            self.logger.info(f"Preflight: nodes.shp has {n_rows} rows; detected {n_consumers} consumer/substation nodes.")
-            if name_attr:
-                node_buildings = set(consumers[name_attr].dropna().astype(str))
-                overlap = sorted(node_buildings.intersection(buildings_td))
-                self.logger.info(f"Preflight: consumer↔demand name overlap = {len(overlap)} buildings.")
-                if len(overlap) == 0:
-                    self.logger.error("No overlap between nodes.shp names and Total_demand.csv names. Aborting Part 2.")
-                    return
+            self.logger.info(
+                f"Preflight: nodes.shp has {len(gdf_nodes)} rows; detected {n_consumers} consumer/substation nodes.")
+
+            # Use 'building' if available, else fallback to 'name'/'Name'
+            if building_attr:
+                node_b_ids = set(consumers[building_attr].dropna().astype(str))
+                overlap = sorted(node_b_ids.intersection(buildings_td))
+                self.logger.info(f"Preflight: consumer <-> demand overlap by '{building_attr}' = {len(overlap)} buildings.")
             else:
-                self.logger.warning("nodes.shp lacks a 'name' or 'Name' attribute; TN may not map consumers to buildings.")
+                self.logger.error(
+                    "nodes.shp lacks 'building' attribute to match with 'name' in Total_demand.csv. Aborting Part 2.")
+                return
+
+            if len(overlap) == 0:
+                eg_nodes = list(node_b_ids)[:5]
+                eg_td = list(buildings_td)[:5]
+                self.logger.error(
+                    "No overlap between nodes.shp consumer identifiers and Total_demand.csv building names.\n"
+                    f"Example nodes: {eg_nodes}\nExample TD: {eg_td}\nAborting Part 2."
+                )
+                return
         except Exception as e:
             self.logger.error(f"Cannot read/inspect nodes shapefile: {nodes_shp} -> {e}")
             return

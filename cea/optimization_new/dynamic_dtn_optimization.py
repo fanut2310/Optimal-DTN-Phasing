@@ -62,11 +62,27 @@ class DynamicDTNOptimizer:
         self.locator = locator
         self.config = config
         self.network_type = config.dynamic_dtn_optimization.network_type
-        self.heating_reduction = config.dynamic_dtn_optimization.heating_demand_reduction / 100.0  # Convert percentage to fraction
-        self.cooling_reduction = config.dynamic_dtn_optimization.cooling_demand_reduction / 100.0  # Convert percentage to fraction
-        self.dhw_reduction = config.dynamic_dtn_optimization.dhw_demand_reduction / 100.0  # Convert percentage to fraction
-        self.electricity_reduction = config.dynamic_dtn_optimization.electricity_demand_reduction / 100.0  # Convert percentage to fraction
-        self.num_last_clusters = config.dynamic_dtn_optimization.num_last_clusters
+        # Retrofit reductions (fractions)
+        self.heating_reduction = config.dynamic_dtn_optimization.heating_demand_reduction / 100.0
+        self.cooling_reduction = config.dynamic_dtn_optimization.cooling_demand_reduction / 100.0
+        self.dhw_reduction = config.dynamic_dtn_optimization.dhw_demand_reduction / 100.0
+        self.electricity_reduction = config.dynamic_dtn_optimization.electricity_demand_reduction / 100.0
+
+        # New options: early retrofit and last densification
+        self.apply_early_retrofit = bool(getattr(config.dynamic_dtn_optimization, 'apply_early_retrofit', True))
+        self.num_early_clusters_retrofit = int(getattr(config.dynamic_dtn_optimization, 'num_early_clusters_retrofit', 1))
+        self.apply_last_densification = bool(getattr(config.dynamic_dtn_optimization, 'apply_last_densification', False))
+        self.num_last_clusters_densify = int(getattr(config.dynamic_dtn_optimization, 'num_last_clusters_densify', 1))
+        self.densification_pct = getattr(config.dynamic_dtn_optimization, 'densification_percent', 0) / 100.0
+
+        # Deprecation warning for legacy parameter if present
+        if hasattr(config.dynamic_dtn_optimization, 'num_last_clusters'):
+            try:
+                _ = config.dynamic_dtn_optimization.num_last_clusters
+                # Log warning but ignore
+                log().warning("Parameter 'dynamic-dtn-optimization:num-last-clusters' is deprecated and ignored. Use the new retrofit/densification options instead.")
+            except Exception:
+                pass
 
         # Get testing clusters from config if available
         self.testing_clusters = None
@@ -185,238 +201,165 @@ class DynamicDTNOptimizer:
         self.original_results = solution
         return solution
 
-    def identify_last_clusters(self, results):
-        """
-        Identify the clusters that are connected last in the original optimization.
-
-        Args:
-            results: Results from the original optimization
-
-        Returns:
-            List of cluster IDs that are connected last
-        """
-        self.logger.info(f"Identifying the last {self.num_last_clusters} clusters to be connected")
-
-        # Get the genome (connection sequence)
+    def identify_early_clusters(self, results, k: int) -> List[int]:
+        """Select EARLY clusters to retrofit: phases >= 2 (exclude phase 0 & 1), ascending phase order. Exclude cluster 0."""
         genome = results['genome']
-        self.logger.info(f"Genome: {genome}")
-        self.logger.info(f"Testing clusters: {self.testing_clusters}")
-
-        # Get all clusters that are connected (phase > 0)
-        connected_clusters = []
+        candidates = []
         for i, phase in enumerate(genome):
-            if phase > 0:  # Skip unconnected clusters (phase 0)
-                # Map genome index to actual cluster ID if testing_clusters is available
-                if self.testing_clusters and i < len(self.testing_clusters):
-                    cluster_id = self.testing_clusters[i]
-                else:
-                    cluster_id = i + 1  # Use 1-based indexing for cluster IDs
-                connected_clusters.append((cluster_id, phase))  # (cluster_id, phase)
-                self.logger.info(f"Cluster {cluster_id} is connected in phase {phase}")
+            if not isinstance(phase, (int, float)):
+                continue
+            # Map genome index to actual cluster ID if testing_clusters is available
+            if self.testing_clusters and i < len(self.testing_clusters):
+                cluster_id = self.testing_clusters[i]
+            else:
+                cluster_id = i + 1
+            if cluster_id == 0:
+                continue
+            if phase >= 2:
+                candidates.append((cluster_id, phase))
+        # Earliest phases first
+        candidates.sort(key=lambda x: x[1])
+        k = max(0, int(k))
+        selected = [c for c, _ in candidates[:k]]
+        if len(selected) < k:
+            self.logger.warning(f"Requested {k} early clusters for retrofit but only {len(selected)} available.")
+        return selected
 
-        # Sort by phase (descending) to get the last connected clusters
-        connected_clusters.sort(key=lambda x: x[1], reverse=True)
-        self.logger.info(f"Connected clusters sorted by phase (descending): {connected_clusters}")
+    def identify_last_clusters_for_densification(self, results, k: int) -> List[int]:
+        """Select LAST clusters to densify: phases > 0 (connected), descending phase order. Exclude cluster 0."""
+        genome = results['genome']
+        candidates = []
+        for i, phase in enumerate(genome):
+            if not isinstance(phase, (int, float)):
+                continue
+            if self.testing_clusters and i < len(self.testing_clusters):
+                cluster_id = self.testing_clusters[i]
+            else:
+                cluster_id = i + 1
+            if cluster_id == 0:
+                continue
+            if phase > 0:
+                candidates.append((cluster_id, phase))
+        # Last phases first
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        k = max(0, int(k))
+        selected = [c for c, _ in candidates[:k]]
+        if len(selected) < k:
+            self.logger.warning(f"Requested {k} last clusters for densification but only {len(selected)} available.")
+        return selected
 
-        # Get the last N clusters
-        last_clusters = [cluster_id for cluster_id, _ in connected_clusters[:self.num_last_clusters]]
-
-        self.logger.info(f"Last clusters to be connected: {last_clusters}")
-        return last_clusters
-
-    def modify_building_demands(self, last_clusters):
+    def modify_building_demands_and_built_form(self, retrofit_clusters: List[int], densify_clusters: List[int]):
         """
-        Modify the demand of buildings in the last clusters.
-
-        Args:
-            last_clusters: List of cluster IDs to modify
-
-        Returns:
-            Dictionary mapping building names to their modified demand files
+        Modify building demand time series and built form based on selected clusters:
+        - Retrofit: reduce selected end-uses for early-phase clusters (exclude phases 0 & 1).
+        - Densify: scale ALL *_kWh series and area-related metadata (e.g., GFA_m2, Af_m2, TFA_m2, floors_ag)
+                   for last-phase clusters by (1 + densification_pct).
+        Saves modified per-building CSVs and records mapping in self.modified_demand_files.
         """
-        self.logger.info("Modifying building demands for retrofit scenario")
+        self.logger.info("Modifying building demands and built form for selected clusters")
 
         # Load the cluster assignment file to get buildings in each cluster
         cluster_assignment_file_path = self.locator.get_dtn_cluster_assignment_file()
         self.logger.info(f"Cluster assignment file path: {cluster_assignment_file_path}")
-
-        # Convert to Path object
         cluster_assignment_file = Path(cluster_assignment_file_path)
-
-        # Check if the file exists
         if not cluster_assignment_file.exists():
             self.logger.error(f"Cluster assignment file not found: {cluster_assignment_file}")
             raise FileNotFoundError(f"Cluster assignment file not found: {cluster_assignment_file}")
 
-        # Use os.path.normpath to ensure the path is properly formatted for the current OS
-        cluster_assignment_file_str = os.path.normpath(str(cluster_assignment_file))
-        self.logger.info(f"Reading cluster assignment file from: {cluster_assignment_file_str}")
+        cluster_df = pd.read_csv(os.path.normpath(str(cluster_assignment_file)))
 
-        try:
-            # Read the file using the normalized path
-            cluster_df = pd.read_csv(cluster_assignment_file_str)
-        except Exception as e:
-            self.logger.error(f"Error reading cluster assignment file: {e}")
-            # Try alternative approach
-            self.logger.info("Trying alternative approach to read the file...")
-            try:
-                with open(cluster_assignment_file_str, 'r') as f:
-                    file_content = f.read()
-                    self.logger.info(f"File content preview: {file_content[:100]}...")
-                cluster_df = pd.read_csv(io.StringIO(file_content))
-            except Exception as e2:
-                self.logger.error(f"Alternative approach also failed: {e2}")
-                raise
+        # Resolve buildings per action
+        retrofit_buildings = set(cluster_df[cluster_df['cluster'].isin(retrofit_clusters)]['name'].tolist())
+        densify_buildings = set(cluster_df[cluster_df['cluster'].isin(densify_clusters)]['name'].tolist())
 
-        # Get all buildings in the last clusters
-        buildings_to_modify = []
-        for cluster_id in last_clusters:
-            cluster_buildings = cluster_df[cluster_df['cluster'] == cluster_id]['name'].tolist()
-            buildings_to_modify.extend(cluster_buildings)
+        # Persist target building sets for later use (e.g., updating Total_demand.csv areas)
+        self._retrofit_buildings = set(retrofit_buildings)
+        self._densify_buildings = set(densify_buildings)
 
-        self.logger.info(f"Buildings to modify: {buildings_to_modify}")
+        self.logger.info(f"Buildings to RETROFIT: {len(retrofit_buildings)}")
+        self.logger.info(f"Buildings to DENSIFY: {len(densify_buildings)} (factor: {1.0 + self.densification_pct:.3f})")
 
-        # Create a directory for modified demand files
+        # Create output directory
         modified_demand_dir = Path(self.locator.get_optimization_results_folder()) / "dynamic_dtn_optimization" / "modified_demands"
         modified_demand_dir.mkdir(parents=True, exist_ok=True)
 
-        # Dictionary to store original and modified demand files
-        modified_demand_files = {}
+        modified_demand_files: Dict[str, Dict[str, str]] = {}
 
-        # Modify the demand for each building
-        for building in buildings_to_modify:
-            # Load the original demand file
+        # Precompute factors
+        down_factors = {
+            'heating': max(0.0, 1.0 - self.heating_reduction),
+            'cooling': max(0.0, 1.0 - self.cooling_reduction),
+            'dhw': max(0.0, 1.0 - self.dhw_reduction),
+            'elec': max(0.0, 1.0 - self.electricity_reduction)
+        }
+        up_factor = (1.0 + self.densification_pct)
+
+        # Iterate target buildings (union)
+        target_buildings = sorted(retrofit_buildings.union(densify_buildings))
+        if not target_buildings:
+            self.logger.warning("No buildings selected for modification.")
+        for building in target_buildings:
             original_demand_file_path = self.locator.get_demand_results_file(building)
-            self.logger.info(f"Demand results file path for building {building}: {original_demand_file_path}")
-
-            # Convert to Path object
             original_demand_file = Path(original_demand_file_path)
-
-            # Check if the file exists
             if not original_demand_file.exists():
                 self.logger.error(f"Demand results file not found for building {building}: {original_demand_file}")
                 raise FileNotFoundError(f"Demand results file not found for building {building}: {original_demand_file}")
 
-            # Use os.path.normpath to ensure the path is properly formatted for the current OS
-            original_demand_file_str = os.path.normpath(str(original_demand_file))
-            self.logger.info(f"Reading demand results file from: {original_demand_file_str}")
+            demand_df = pd.read_csv(os.path.normpath(str(original_demand_file)))
 
-            try:
-                # Read the file using the normalized path
-                demand_df = pd.read_csv(original_demand_file_str)
-            except Exception as e:
-                self.logger.error(f"Error reading demand results file for building {building}: {e}")
-                # Try alternative approach
-                self.logger.info("Trying alternative approach to read the file...")
-                try:
-                    with open(original_demand_file_str, 'r') as f:
-                        file_content = f.read()
-                    demand_df = pd.read_csv(io.StringIO(file_content))
-                except Exception as e2:
-                    self.logger.error(f"Alternative approach also failed: {e2}")
-                    raise
-
-            # Apply reductions to the demand
-            if self.heating_reduction > 0:
-                self.logger.info(f"Applying {self.heating_reduction*100}% heating demand reduction to building {building}")
-                # Space heating related columns
-                heating_patterns = ['QH', 'Qhs', 'hs_', '_hs']
-                heating_columns = []
-                for pattern in heating_patterns:
-                    pattern_columns = [col for col in demand_df.columns if pattern in col]
-                    heating_columns.extend(pattern_columns)
-                    self.logger.debug(f"Found {len(pattern_columns)} columns matching pattern '{pattern}'")
-
-                # Exclude DHW columns if they were caught by the patterns
-                heating_columns = [col for col in heating_columns if 'ww' not in col.lower() and 'hw' not in col.lower()]
-                unique_heating_columns = set(heating_columns)
-                self.logger.info(f"Identified {len(unique_heating_columns)} unique heating columns to modify: {', '.join(sorted(unique_heating_columns))}")
-
-                # Apply reduction to all heating columns
-                for col in set(heating_columns):  # Use set to remove duplicates
-                    demand_df[col] = demand_df[col] * (1 - self.heating_reduction)
-
-            if self.cooling_reduction > 0:
-                self.logger.info(f"Applying {self.cooling_reduction*100}% cooling demand reduction to building {building}")
-                # Space cooling related columns
-                cooling_patterns = ['QC', 'Qc', 'cs_', '_cs', 'cdata', 'cre']
-                cooling_columns = []
-                for pattern in cooling_patterns:
-                    pattern_columns = [col for col in demand_df.columns if pattern in col]
-                    cooling_columns.extend(pattern_columns)
-                    self.logger.debug(f"Found {len(pattern_columns)} columns matching pattern '{pattern}'")
-
-                # Apply reduction to all cooling columns
-                unique_cooling_columns = set(cooling_columns)
-                self.logger.info(f"Identified {len(unique_cooling_columns)} unique cooling columns to modify: {', '.join(sorted(unique_cooling_columns))}")
-                for col in set(cooling_columns):  # Use set to remove duplicates
-                    demand_df[col] = demand_df[col] * (1 - self.cooling_reduction)
-
-            if self.dhw_reduction > 0:
-                self.logger.info(f"Applying {self.dhw_reduction*100}% DHW demand reduction to building {building}")
-                # DHW related columns
-                dhw_patterns = ['QHW', 'Qww', 'ww_', '_ww']
-                dhw_columns = []
-                for pattern in dhw_patterns:
-                    pattern_columns = [col for col in demand_df.columns if pattern in col]
-                    dhw_columns.extend(pattern_columns)
-                    self.logger.debug(f"Found {len(pattern_columns)} columns matching pattern '{pattern}'")
-
-                # Apply reduction to all DHW columns
-                unique_dhw_columns = set(dhw_columns)
-                self.logger.info(f"Identified {len(unique_dhw_columns)} unique DHW columns to modify: {', '.join(sorted(unique_dhw_columns))}")
-                for col in set(dhw_columns):  # Use set to remove duplicates
-                    demand_df[col] = demand_df[col] * (1 - self.dhw_reduction)
-
-            if self.electricity_reduction > 0:
-                self.logger.info(f"Applying {self.electricity_reduction*100}% electricity demand reduction to building {building}")
-                # Electricity related columns
-                elec_patterns = ['E_', 'Ea', 'Eve', 'GRID']
-                elec_columns = []
-                for pattern in elec_patterns:
-                    pattern_columns = [col for col in demand_df.columns if pattern in col]
-                    elec_columns.extend(pattern_columns)
-                    self.logger.debug(f"Found {len(pattern_columns)} columns matching pattern '{pattern}'")
-
-                # Exclude PV generation columns
-                elec_columns = [col for col in elec_columns if 'PV' not in col]
-                unique_elec_columns = set(elec_columns)
-                self.logger.info(f"Identified {len(unique_elec_columns)} unique electricity columns to modify (excluding PV generation): {', '.join(sorted(unique_elec_columns))}")
-
-                # Apply reduction to all electricity columns
-                for col in set(elec_columns):  # Use set to remove duplicates
-                    demand_df[col] = demand_df[col] * (1 - self.electricity_reduction)
+            if building in retrofit_buildings:
+                # Reduce heating
+                if self.heating_reduction > 0:
+                    for col in list(demand_df.columns):
+                        if (col.endswith('_kWh') and ('QH' in col or 'Qhs' in col)) or ('hs_' in col or col.endswith('_hs')):
+                            if 'ww' not in col.lower() and 'hw' not in col.lower():
+                                demand_df[col] = demand_df[col] * down_factors['heating']
+                # Reduce cooling
+                if self.cooling_reduction > 0:
+                    for col in list(demand_df.columns):
+                        if col.endswith('_kWh') and (col.startswith('QC') or col.startswith('Qc') or 'cs_' in col or col.endswith('_cs') or 'cdata' in col or 'cre' in col):
+                            demand_df[col] = demand_df[col] * down_factors['cooling']
+                # Reduce DHW
+                if self.dhw_reduction > 0:
+                    for col in list(demand_df.columns):
+                        if col.endswith('_kWh') and ('QHW' in col or 'Qww' in col or col.startswith('ww_') or col.endswith('_ww')):
+                            demand_df[col] = demand_df[col] * down_factors['dhw']
+                # Reduce electricity (excluding PV)
+                if self.electricity_reduction > 0:
+                    for col in list(demand_df.columns):
+                        if ('E_' in col or col.startswith('Ea') or col.startswith('Eve') or 'GRID' in col) and col.endswith('_kWh') and 'PV' not in col:
+                            demand_df[col] = demand_df[col] * down_factors['elec']
+                action = 'retrofit'
+            else:
+                # Densify: scale all *_kWh time series and area metadata
+                cols_scaled = 0
+                for col in demand_df.columns:
+                    if col.endswith('_kWh'):
+                        demand_df[col] = demand_df[col] * up_factor
+                        cols_scaled += 1
+                # Scale area / floors metadata if present in per-building CSV
+                for meta_col in ['GFA_m2', 'Af_m2', 'TFA_m2', 'floors_ag']:
+                    if meta_col in demand_df.columns:
+                        try:
+                            demand_df.loc[:, meta_col] = demand_df[meta_col] * up_factor
+                        except Exception:
+                            pass
+                self.logger.debug(f"{building}: densified {cols_scaled} *_kWh columns and scaled area/floors by {up_factor:.3f}")
+                action = 'densify'
 
             # Save the modified demand file
             modified_demand_file = modified_demand_dir / f"{building}.csv"
-            modified_demand_file_str = os.path.normpath(str(modified_demand_file))
-            self.logger.info(f"Saving modified demand file to: {modified_demand_file_str}")
+            demand_df.to_csv(os.path.normpath(str(modified_demand_file)), index=False)
 
-            try:
-                # Save the file using the normalized path
-                demand_df.to_csv(modified_demand_file_str, index=False)
-                self.logger.info(f"Successfully saved modified demand file for building {building}")
-            except Exception as e:
-                self.logger.error(f"Error saving modified demand file for building {building}: {e}")
-                # Try alternative approach
-                self.logger.info("Trying alternative approach to save the file...")
-                try:
-                    with open(modified_demand_file_str, 'w') as f:
-                        demand_df.to_csv(f, index=False)
-                    self.logger.info(f"Successfully saved modified demand file using alternative approach")
-                except Exception as e2:
-                    self.logger.error(f"Alternative approach also failed: {e2}")
-                    raise
-
-            # Store the mapping
             modified_demand_files[building] = {
-                'original': original_demand_file_str,
-                'modified': modified_demand_file_str
+                'original': os.path.normpath(str(original_demand_file)),
+                'modified': os.path.normpath(str(modified_demand_file)),
+                'action': action
             }
-            self.logger.debug(f"Added mapping for building {building} to modified_demand_files dictionary")
 
+        # store for copying into temp scenario later
         self.modified_demand_files = modified_demand_files
-        self.logger.info(f"Completed demand modifications for all {len(buildings_to_modify)} buildings in the last clusters")
+        self.logger.info(f"Completed modifications: retrofit={len(retrofit_buildings)}, densify={len(densify_buildings)}")
         return modified_demand_files
 
     def _create_config_copy(self):
@@ -895,8 +838,8 @@ class DynamicDTNOptimizer:
             # Create a row for this building in the total_demand_df
             building_row = {'name': building}
 
-            # Add metadata columns if they exist
-            for col in ['Af_m2', 'Aroof_m2', 'GFA_m2', 'Aocc_m2', 'people0']:
+            # Add metadata columns if they exist (include TFA_m2 and floors_ag)
+            for col in ['Af_m2', 'Aroof_m2', 'GFA_m2', 'TFA_m2', 'Aocc_m2', 'people0', 'floors_ag']:
                 if col in building_df.columns:
                     building_row[col] = building_df[col].iloc[0]
 
@@ -944,6 +887,19 @@ class DynamicDTNOptimizer:
                 total_demand_df['QC_sys_MWhyr'] = 0.0
                 self.logger.warning("Could not calculate QC_sys_MWhyr, adding column with zeros")
 
+        # Apply densification scaling to area-related fields before first save (if any densified buildings)
+        up_factor = 1.0 + getattr(self, 'densification_pct', 0.0)
+        if up_factor != 1.0 and hasattr(self, '_densify_buildings') and len(self._densify_buildings) > 0:
+            try:
+                mask = total_demand_df['name'].isin(list(self._densify_buildings))
+                for col in ['GFA_m2', 'Af_m2', 'TFA_m2', 'Aroof_m2', 'Aocc_m2', 'people0', 'floors_ag']:
+                    if col in total_demand_df.columns:
+                        total_demand_df.loc[mask, col] = total_demand_df.loc[mask, col] * up_factor
+                if 'people0' in total_demand_df.columns:
+                    total_demand_df.loc[mask, 'people0'] = total_demand_df.loc[mask, 'people0'].round()
+                self.logger.info(f"Applied densification factor {up_factor:.3f} to area-related fields in Total_demand.csv for densified buildings before first save.")
+            except Exception as e:
+                self.logger.warning(f"Could not apply densification scaling to area fields before first save: {e}")
         # Save updated Total_demand.csv
         total_demand_df.to_csv(temp_demand_dir / "Total_demand.csv", index=False, float_format='%.3f', na_rep='nan')
         self.logger.info("Updated Total_demand.csv generated successfully")
@@ -952,7 +908,7 @@ class DynamicDTNOptimizer:
         self.logger.info("Checking for missing metadata columns in Total_demand.csv")
 
         # Required metadata columns that should be present
-        required_metadata_columns = ['Af_m2', 'Aroof_m2', 'GFA_m2', 'Aocc_m2', 'people0']
+        required_metadata_columns = ['Af_m2', 'Aroof_m2', 'GFA_m2', 'TFA_m2', 'Aocc_m2', 'people0', 'floors_ag']
 
         # Read the saved Total_demand.csv to check for missing columns
         temp_total_demand = pd.read_csv(temp_demand_dir / "Total_demand.csv")
@@ -1039,7 +995,7 @@ class DynamicDTNOptimizer:
                 if still_missing:
                     self.logger.warning(f"Still missing columns after checking original Total_demand.csv: {still_missing}")
                     for col in still_missing:
-                        if col == 'GFA_m2' or col == 'Af_m2':
+                        if col in ['GFA_m2', 'Af_m2', 'TFA_m2']:
                             temp_total_demand[col] = 1000.0
                         elif col == 'Aroof_m2':
                             temp_total_demand[col] = 200.0
@@ -1047,7 +1003,22 @@ class DynamicDTNOptimizer:
                             temp_total_demand[col] = 800.0
                         elif col == 'people0':
                             temp_total_demand[col] = 40
+                        elif col == 'floors_ag':
+                            temp_total_demand[col] = 5
                 
+                # Apply densification scaling to area-related fields after backfilling (if any densified buildings)
+                up_factor = 1.0 + getattr(self, 'densification_pct', 0.0)
+                if up_factor != 1.0 and hasattr(self, '_densify_buildings') and len(self._densify_buildings) > 0:
+                    try:
+                        mask = temp_total_demand['name'].isin(list(self._densify_buildings))
+                        for col in ['GFA_m2', 'Af_m2', 'TFA_m2', 'Aroof_m2', 'Aocc_m2', 'people0', 'floors_ag']:
+                            if col in temp_total_demand.columns:
+                                temp_total_demand.loc[mask, col] = temp_total_demand.loc[mask, col] * up_factor
+                        if 'people0' in temp_total_demand.columns:
+                            temp_total_demand.loc[mask, 'people0'] = temp_total_demand.loc[mask, 'people0'].round()
+                        self.logger.info(f"Applied densification factor {up_factor:.3f} to area-related fields in Total_demand.csv after backfilling.")
+                    except Exception as e:
+                        self.logger.warning(f"Could not apply densification scaling to area fields after backfilling: {e}")
                 # Save the updated Total_demand.csv
                 temp_total_demand.to_csv(temp_demand_dir / "Total_demand.csv", index=False, float_format='%.3f', na_rep='nan')
                 self.logger.info("Updated Total_demand.csv with missing metadata columns")
@@ -1058,7 +1029,7 @@ class DynamicDTNOptimizer:
                 
                 # Add default values for missing columns
                 for col in missing_columns:
-                    if col == 'GFA_m2' or col == 'Af_m2':
+                    if col in ['GFA_m2', 'Af_m2', 'TFA_m2']:
                         temp_total_demand[col] = 1000.0
                     elif col == 'Aroof_m2':
                         temp_total_demand[col] = 200.0
@@ -1066,6 +1037,22 @@ class DynamicDTNOptimizer:
                         temp_total_demand[col] = 800.0
                     elif col == 'people0':
                         temp_total_demand[col] = 40
+                    elif col == 'floors_ag':
+                        temp_total_demand[col] = 5
+                
+                # Apply densification scaling to area-related fields before saving (if any densified buildings)
+                up_factor = 1.0 + getattr(self, 'densification_pct', 0.0)
+                if up_factor != 1.0 and hasattr(self, '_densify_buildings') and len(self._densify_buildings) > 0:
+                    try:
+                        mask = temp_total_demand['name'].isin(list(self._densify_buildings))
+                        for col in ['GFA_m2', 'Af_m2', 'TFA_m2', 'Aroof_m2', 'Aocc_m2', 'people0', 'floors_ag']:
+                            if col in temp_total_demand.columns:
+                                temp_total_demand.loc[mask, col] = temp_total_demand.loc[mask, col] * up_factor
+                        if 'people0' in temp_total_demand.columns:
+                            temp_total_demand.loc[mask, 'people0'] = temp_total_demand.loc[mask, 'people0'].round()
+                        self.logger.info(f"Applied densification factor {up_factor:.3f} to area-related fields in Total_demand.csv in exception path.")
+                    except Exception as e2:
+                        self.logger.warning(f"Could not apply densification scaling to area fields in exception path: {e2}")
                 
                 # Save the updated Total_demand.csv
                 temp_total_demand.to_csv(temp_demand_dir / "Total_demand.csv", index=False, float_format='%.3f', na_rep='nan')
@@ -1253,8 +1240,8 @@ class DynamicDTNOptimizer:
         """
         self.logger.info("Starting Dynamic DTN Optimization workflow")
         self.logger.info(f"Network type: {self.network_type}")
-        self.logger.info(f"Demand reduction parameters: Heating={self.heating_reduction*100}%, Cooling={self.cooling_reduction*100}%, DHW={self.dhw_reduction*100}%, Electricity={self.electricity_reduction*100}%")
-        self.logger.info(f"Number of last clusters to modify: {self.num_last_clusters}")
+        self.logger.info(f"Demand reduction parameters (retrofit): Heating={self.heating_reduction*100}%, Cooling={self.cooling_reduction*100}%, DHW={self.dhw_reduction*100}%, Electricity={self.electricity_reduction*100}%")
+        self.logger.info(f"Options: early_retrofit={self.apply_early_retrofit} (k={self.num_early_clusters_retrofit}), last_densification={self.apply_last_densification} (k={self.num_last_clusters_densify}, pct={self.densification_pct*100}%)")
 
         # Step 1: Check if DTN optimization results exist
         self.logger.info("STEP 1: Checking if DTN optimization results exist")
@@ -1272,14 +1259,30 @@ class DynamicDTNOptimizer:
         original_results = self.load_original_optimization_results(results_file)
         self.logger.info(f"Original optimization results loaded with {len(original_results['genome'])} clusters")
 
-        # Step 3: Identify the last clusters to be connected
-        self.logger.info("STEP 3: Identifying the last clusters to be connected")
-        last_clusters = self.identify_last_clusters(original_results)
-        self.logger.info(f"Identified {len(last_clusters)} clusters to modify: {last_clusters}")
+        # Step 3: Select target clusters for retrofit and/or densification
+        self.logger.info("STEP 3: Selecting target clusters for retrofit and/or densification")
+        retrofit_targets: List[int] = []
+        densify_targets: List[int] = []
+        if self.apply_early_retrofit and self.num_early_clusters_retrofit > 0:
+            retrofit_targets = self.identify_early_clusters(original_results, self.num_early_clusters_retrofit)
+            self.logger.info(f"Retrofit early-phase clusters (exclude phase 0 & 1): {retrofit_targets}")
+        if self.apply_last_densification and self.num_last_clusters_densify > 0:
+            densify_targets = self.identify_last_clusters_for_densification(original_results, self.num_last_clusters_densify)
+            self.logger.info(f"Densify last-phase clusters: {densify_targets}")
 
-        # Step 4: Modify the demand of buildings in the last clusters
-        self.logger.info("STEP 4: Modifying the demand of buildings in the last clusters")
-        self.modify_building_demands(last_clusters)
+        # Resolve overlap: prioritize retrofit
+        overlap = sorted(set(retrofit_targets).intersection(densify_targets))
+        if overlap:
+            self.logger.warning(f"Clusters selected for both retrofit and densification: {overlap}. Prioritizing retrofit; removing from densification targets.")
+            densify_targets = [c for c in densify_targets if c not in overlap]
+
+        if not retrofit_targets and not densify_targets:
+            self.logger.warning("No target clusters selected. Nothing will be modified. Aborting.")
+            return None
+
+        # Step 4: Modify the demand and built form of buildings in target clusters
+        self.logger.info("STEP 4: Modifying demands and built form for selected clusters")
+        self.modify_building_demands_and_built_form(retrofit_targets, densify_targets)
 
         # Step 5: Rerun the thermal network simulation with modified demands
         self.logger.info("STEP 5: Rerunning the thermal network simulation with modified demands")

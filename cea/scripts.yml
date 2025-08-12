@@ -362,22 +362,33 @@ Energy Supply System Optimisation:
   - name: dynamic-dtn-optimization
     label: "Dynamic DTN Optimization Part 1: Urban Metric Modifications"
     description: |
-      Analyzes how strategic modifications to building demands (retrofits) affect the optimal 
-      connection sequence in district thermal networks. This module takes the results from 
-      DTN expansion optimization, modifies the demand of the last connected clusters, and 
-      reruns the optimization to assess sensitivity.
+      Analyze how strategic building changes affect DTN phasing and performance.
 
-      **IMPORTANT**: This module requires results from the DTN Expansion Optimization module.
-      Please run the DTN Expansion Optimization module with the same network type before running this module.
+      Options:
+      - Retrofit early-phase clusters (exclude phase 0 & 1) to reduce operational emissions.
+      - Densify last-phase clusters to boost demand, heat sales, and NPV. A single densification percentage scales floors, GFA, and all end-use demands linearly.
+      - Or apply both simultaneously, while Phase 1 is committed and not modified.
+
+      IMPORTANT: Requires results from DTN Expansion Optimization (same network type).
     interfaces: [ cli, dashboard ]
     module: cea.optimization_new.dynamic_dtn_optimization
     parameters: [ 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free',
                   'dynamic-dtn-optimization:network-type',
+
+                  # Action toggles and counts
+                  'dynamic-dtn-optimization:apply-early-retrofit',
+                  'dynamic-dtn-optimization:num-early-clusters-retrofit',
+                  'dynamic-dtn-optimization:apply-last-densification',
+                  'dynamic-dtn-optimization:num-last-clusters-densify',
+
+                  # Retrofit (reductions)
                   'dynamic-dtn-optimization:heating-demand-reduction',
                   'dynamic-dtn-optimization:cooling-demand-reduction',
                   'dynamic-dtn-optimization:dhw-demand-reduction',
                   'dynamic-dtn-optimization:electricity-demand-reduction',
-                  'dynamic-dtn-optimization:num-last-clusters']
+
+                  # Densification (single percent)
+                  'dynamic-dtn-optimization:densification-percent' ]
     input-files:
       - [get_street_network]
       - [get_total_demand]

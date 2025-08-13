@@ -1264,16 +1264,15 @@ class DynamicDTNOptimizer:
             type_col = 'Type' if 'Type' in gdf_nodes.columns else ('type' if 'type' in gdf_nodes.columns else None)
 
             # Prefer the 'building' attribute for consumer <-> demand mapping
-            building_attr = None
-            if 'building' in gdf_nodes.columns:
-                building_attr = 'building'
-            elif 'BUILDING' in gdf_nodes.columns:
-                building_attr = 'BUILDING'
+            building_attr = 'building' if 'building' in gdf_nodes.columns else (
+                'BUILDING' if 'BUILDING' in gdf_nodes.columns else None
+            )
 
             # Filter consumer/substation nodes
             if type_col:
                 consumers = gdf_nodes[
-                    gdf_nodes[type_col].astype(str).upper().str.contains('CONSUMER|SUBSTATION', na=False)]
+                    gdf_nodes[type_col].astype(str).str.upper().str.contains('CONSUMER|SUBSTATION', na=False)
+                ]
             else:
                 consumers = gdf_nodes
 

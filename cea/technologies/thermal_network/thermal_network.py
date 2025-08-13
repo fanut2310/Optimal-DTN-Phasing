@@ -612,19 +612,28 @@ def output_hex_specs_at_nodes(substation_HEX_Q, thermal_network):
 
 
 def prepare_inputs_of_representative_weeks(thermal_network):
-    hours_list = chain(range(0, 168), range(744, 912), range(1416, 1584), range(2160, 2328), range(2880, 3048),
-                       range(3624, 3792), range(4344, 4512), range(5088, 5256), range(5832, 6000), range(6522, 6690),
-                       range(7296, 7464), range(8016, 8184))
-    # cut out relevant parts of all dataframes
-    thermal_network.T_ground_K = [value for index, value in enumerate(thermal_network.T_ground_K) if
-                                  index in hours_list]
+    # Materialize the chained ranges once; iterators get exhausted if reused
+    hours_idx = list(chain(
+        range(0, 168), range(744, 912), range(1416, 1584), range(2160, 2328), range(2880, 3048),
+        range(3624, 3792), range(4344, 4512), range(5088, 5256), range(5832, 6000), range(6522, 6690),
+        range(7296, 7464), range(8016, 8184)
+    ))
+
+    # Cut out relevant parts of all arrays/dataframes
+    thermal_network.T_ground_K = [
+        value for index, value in enumerate(thermal_network.T_ground_K) if index in hours_idx
+    ]
     for building in thermal_network.buildings_demands.keys():
-        thermal_network.buildings_demands[building] = thermal_network.buildings_demands[building].iloc[hours_list]
-        thermal_network.buildings_demands[building].index = range(0, 2016)
-    thermal_network.t_target_supply_C = thermal_network.t_target_supply_C.iloc[hours_list]
+        df = thermal_network.buildings_demands[building].iloc[hours_idx]
+        df.index = range(0, 2016)
+        thermal_network.buildings_demands[building] = df
+
+    thermal_network.t_target_supply_C = thermal_network.t_target_supply_C.iloc[hours_idx]
     thermal_network.t_target_supply_C.index = range(0, 2016)
-    thermal_network.t_target_supply_df = thermal_network.t_target_supply_df.iloc[hours_list]
+
+    thermal_network.t_target_supply_df = thermal_network.t_target_supply_df.iloc[hours_idx]
     thermal_network.t_target_supply_df.index = range(0, 2016)
+
     return np.nan
 
 
@@ -1803,19 +1812,19 @@ def load_max_edge_flowrate_from_previous_run(thermal_network):
     edge_mass_flow_df = pd.read_csv(
         thermal_network.locator.get_nominal_edge_mass_flow_csv_file(thermal_network.network_type,
                                                                     thermal_network.network_name))
-    del edge_mass_flow_df['Unnamed: 0']
-    # max_edge_mass_flow_df = pd.DataFrame(data=[(edge_mass_flow_df.abs()).max(axis=0)],
-    #                                     columns=thermal_network.edge_node_df.columns)
+    # Some legacy files were saved with an index column; drop it only if present
+    if 'Unnamed: 0' in edge_mass_flow_df.columns:
+        edge_mass_flow_df = edge_mass_flow_df.drop(columns=['Unnamed: 0'])
     return edge_mass_flow_df
-
 
 def load_node_flowrate_from_previous_run(thermal_network):
     """Bypass the calculation of calc_max_edge_flowrate and use the results form the previous run"""
     node_mass_flow_df = pd.read_csv(
         thermal_network.locator.get_nominal_node_mass_flow_csv_file(thermal_network.network_type,
                                                                     thermal_network.network_name))
-    # max_edge_mass_flow_df = pd.DataFrame(data=[(edge_mass_flow_df.abs()).max(axis=0)],
-    #                                     columns=thermal_network.edge_node_df.columns)
+    # Apply same guard for legacy files
+    if 'Unnamed: 0' in node_mass_flow_df.columns:
+        node_mass_flow_df = node_mass_flow_df.drop(columns=['Unnamed: 0'])
     return node_mass_flow_df
 
 

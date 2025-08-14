@@ -4167,82 +4167,114 @@ def main(config):
         log().info(f"Loading metrics from: {metrics_file}")
         metrics_df = pd.read_csv(metrics_file)
 
-    # Get optimization parameters from config
-    num_phases = config.dtn_expansion_optimization.num_phases
+    # Load saved DTN optimization settings (if available) and resolve parameters with precedence
+    saved = {}
+    saved_path = Path(locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "run_settings.json"
+    if saved_path.exists():
+        log().info(f"Loading saved DTN run settings from {saved_path}")
+        try:
+            with open(saved_path, 'r') as f:
+                saved = json.load(f)
+        except Exception as e:
+            log().warning(f"Failed to load saved settings JSON: {e}")
+    else:
+        log().info("No run_settings.json found in temp scenario. Using config/defaults only unless CLI flags provided.")
 
-    # Parse phase durations from config
-    phase_durations_str = config.dtn_expansion_optimization.phase_durations
+    def pick(cfg_value, saved_value, default_value):
+        return cfg_value if cfg_value not in (None, "", []) else (saved_value if saved_value not in (None, "", []) else default_value)
+
+    # Core settings
+    num_phases = pick(getattr(config.dtn_expansion_optimization, 'num_phases', None), saved.get('num_phases'), 3)
+
+    # Phase durations
+    phase_durations = None
+    phase_durations_str = getattr(config.dtn_expansion_optimization, 'phase_durations', None)
     if phase_durations_str:
-        phase_durations = [int(d.strip()) for d in phase_durations_str.split(',') if d.strip()]
+        phase_durations = [int(d.strip()) for d in str(phase_durations_str).split(',') if str(d).strip()]
+    elif saved.get('phase_durations'):
+        phase_durations = [int(d) for d in saved.get('phase_durations')]
     else:
-        phase_durations = [10] * num_phases
+        phase_durations = [10] * int(num_phases)
 
-    # Parse CAPEX budget per phase from config
-    capex_budget_str = config.dtn_expansion_optimization.capex_budget_per_phase
-    if capex_budget_str:
-        capex_budget_per_phase = [float(b.strip()) for b in capex_budget_str.split(',') if b.strip()]
-    else:
-        capex_budget_per_phase = None
+    # Budgets
+    capex_budget_str = getattr(config.dtn_expansion_optimization, 'capex_budget_per_phase', None)
+    capex_budget_per_phase = [float(b.strip()) for b in str(capex_budget_str).split(',') if str(b).strip()] if capex_budget_str else saved.get('capex_budget_per_phase')
 
-    # Parse total expenditure budget per phase from config
-    total_expenditure_budget_str = config.dtn_expansion_optimization.total_expenditure_budget_per_phase
-    if total_expenditure_budget_str:
-        total_expenditure_budget_per_phase = [float(b.strip()) for b in total_expenditure_budget_str.split(',') if
-                                              b.strip()]
-    else:
-        total_expenditure_budget_per_phase = None
+    total_expenditure_budget_str = getattr(config.dtn_expansion_optimization, 'total_expenditure_budget_per_phase', None)
+    total_expenditure_budget_per_phase = [float(b.strip()) for b in str(total_expenditure_budget_str).split(',') if str(b).strip()] if total_expenditure_budget_str else saved.get('total_expenditure_budget_per_phase')
 
-    # Parse GHG budget per phase from config
-    ghg_budget_str = config.dtn_expansion_optimization.ghg_budget_per_phase
-    if ghg_budget_str:
-        ghg_budget_per_phase = [float(b.strip()) for b in ghg_budget_str.split(',') if b.strip()]
-    else:
-        ghg_budget_per_phase = None
+    ghg_budget_str = getattr(config.dtn_expansion_optimization, 'ghg_budget_per_phase', None)
+    ghg_budget_per_phase = [float(b.strip()) for b in str(ghg_budget_str).split(',') if str(b).strip()] if ghg_budget_str else saved.get('ghg_budget_per_phase')
 
     log().info("Creating optimizer with original locator (using direct path methods)")
 
-    # Create the optimizer with the original locator
+    # Resolve objective and technical parameters with precedence (config > saved > defaults)
+    objective_function = pick(getattr(config.dtn_expansion_optimization, 'objective_function', None), saved.get('objective_function'), 'NPV')
+
+    # Enforce single-objective-only mode
+    requested_moo = bool(getattr(config.dtn_expansion_optimization, 'multi_objective_mode', False)) or bool(saved.get('multi_objective_mode', False))
+    if requested_moo:
+        log().warning("Dynamic Part 2 only supports single-objective reruns. Overriding multi_objective_mode=False and ignoring multi_objective_functions.")
+    multi_objective_mode = False
+    multi_objective_functions = None
+
+    # Validate objective for SOO
+    allowed_soo = {"npv", "roi", "emissions", "total_capex"}
+    if str(objective_function).lower() not in allowed_soo:
+        log().warning(f"Unsupported single-objective '{objective_function}'. Falling back to 'NPV'.")
+        objective_function = 'NPV'
+
+    # Technical / economic parameters
+    interest_rate = pick(getattr(config.dtn_expansion_optimization, 'interest_rate', None), saved.get('interest_rate'), 0.05)
+    cost_model = pick(getattr(config.dtn_expansion_optimization, 'cost_model', None), saved.get('cost_model'), 'detailed')
+    diversity_factor = pick(getattr(config.dtn_expansion_optimization, 'diversity_factor', None), saved.get('diversity_factor'), 0.7)
+    temperature_difference_dh = pick(getattr(config.dtn_expansion_optimization, 'temperature_difference_dh', None), saved.get('temperature_difference_dh'), 20)
+    temperature_difference_dc = pick(getattr(config.dtn_expansion_optimization, 'temperature_difference_dc', None), saved.get('temperature_difference_dc'), 10)
+    pressure_loss_pa_per_m = pick(getattr(config.dtn_expansion_optimization, 'pressure_loss_pa_per_m', None), saved.get('pressure_loss_pa_per_m'), 200)
+    pump_operation_hours = pick(getattr(config.dtn_expansion_optimization, 'pump_operation_hours', None), saved.get('pump_operation_hours'), 4000)
+    pump_efficiency = pick(getattr(config.dtn_expansion_optimization, 'pump_efficiency', None), saved.get('pump_efficiency'), 0.8)
+    pump_load_factor = pick(getattr(config.dtn_expansion_optimization, 'pump_load_factor', None), saved.get('pump_load_factor'), 0.5)
+    pump_capex_a = pick(getattr(config.dtn_expansion_optimization, 'pump_capex_a', None), saved.get('pump_capex_a'), 1230)
+    pump_capex_b = pick(getattr(config.dtn_expansion_optimization, 'pump_capex_b', None), saved.get('pump_capex_b'), 0.65)
+    cooling_cop = pick(getattr(config.dtn_expansion_optimization, 'cooling_cop', None), saved.get('cooling_cop'), 4.0)
+
+    # Testing clusters fallback to saved if not provided
+    if not testing_clusters and saved.get('testing_clusters'):
+        testing_clusters = saved.get('testing_clusters')
+
+    # Create the optimizer with the resolved parameters
     optimizer = DTNExpansionOptimizer(
         locator=locator,  # Use the original locator with direct path methods
         network_type=network_type,
         metrics_df=metrics_df,
-        num_phases=num_phases,
+        num_phases=int(num_phases),
         phase_durations=phase_durations,
         capex_budget_per_phase=capex_budget_per_phase,
         total_expenditure_budget_per_phase=total_expenditure_budget_per_phase,
-        interest_rate=config.dtn_expansion_optimization.interest_rate,
-        cost_model=config.dtn_expansion_optimization.cost_model,
-        objective_function=config.dtn_expansion_optimization.objective_function,
-        diversity_factor=config.dtn_expansion_optimization.diversity_factor,
-        temperature_difference_dh=config.dtn_expansion_optimization.temperature_difference_dh,
-        temperature_difference_dc=config.dtn_expansion_optimization.temperature_difference_dc,
-        pressure_loss_pa_per_m=config.dtn_expansion_optimization.pressure_loss_pa_per_m,
-        pump_operation_hours=config.dtn_expansion_optimization.pump_operation_hours,
-        pump_efficiency=config.dtn_expansion_optimization.pump_efficiency,
-        pump_load_factor=config.dtn_expansion_optimization.pump_load_factor,
-        pump_capex_a=config.dtn_expansion_optimization.pump_capex_a,
-        pump_capex_b=config.dtn_expansion_optimization.pump_capex_b,
-        cooling_cop=config.dtn_expansion_optimization.cooling_cop,
+        interest_rate=float(interest_rate),
+        cost_model=str(cost_model),
+        objective_function=str(objective_function),
+        diversity_factor=float(diversity_factor),
+        temperature_difference_dh=float(temperature_difference_dh),
+        temperature_difference_dc=float(temperature_difference_dc),
+        pressure_loss_pa_per_m=float(pressure_loss_pa_per_m),
+        pump_operation_hours=int(pump_operation_hours),
+        pump_efficiency=float(pump_efficiency),
+        pump_load_factor=float(pump_load_factor),
+        pump_capex_a=float(pump_capex_a),
+        pump_capex_b=float(pump_capex_b),
+        cooling_cop=float(cooling_cop),
         ghg_budget_per_phase=ghg_budget_per_phase,
-        multi_objective_mode=config.dtn_expansion_optimization.multi_objective_mode,
-        multi_objective_functions=config.dtn_expansion_optimization.multi_objective_functions if config.dtn_expansion_optimization.multi_objective_functions else None,
+        multi_objective_mode=multi_objective_mode,
+        multi_objective_functions=multi_objective_functions,
         testing_clusters=testing_clusters
     )
 
-    # Run the optimization
-    try:
-        population_size = config.dtn_expansion_optimization.population_size
-    except AttributeError:
-        population_size = 50  # Default value
-        log().info("Using default population size: 50")
+    # Run the optimization (GA runtime controls with precedence)
+    population_size = pick(getattr(config.dtn_expansion_optimization, 'population_size', None), saved.get('population_size'), 50)
+    num_generations = pick(getattr(config.dtn_expansion_optimization, 'num_generations', None), saved.get('num_generations'), 30)
 
-    try:
-        num_generations = config.dtn_expansion_optimization.num_generations
-    except AttributeError:
-        num_generations = 30  # Default value
-        log().info("Using default number of generations: 30")
-
-    solution = optimizer.optimize(population_size=population_size, num_generations=num_generations)
+    solution = optimizer.optimize(population_size=int(population_size), num_generations=int(num_generations))
 
     # Save the results
     if isinstance(solution, list):
@@ -4260,6 +4292,35 @@ def main(config):
         log().info("Saving optimization results")
         result_files = optimizer.save_results(solution)
         log().info(f"Results saved to: {result_files}")
+
+    # Write a compact rerun summary JSON to help Part 3 analysis
+    try:
+        summary = {
+            "network_type": network_type,
+            "objective_function": objective_function,
+            "num_phases": int(num_phases),
+            "phase_durations": phase_durations,
+            "population_size": int(population_size),
+            "num_generations": int(num_generations),
+            "testing_clusters": testing_clusters,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+        }
+        # get genome if available
+        try:
+            if isinstance(solution, dict) and 'genome' in solution:
+                summary["genome"] = solution['genome']
+            elif hasattr(optimizer, 'solution') and isinstance(optimizer.solution, dict) and 'genome' in optimizer.solution:
+                summary["genome"] = optimizer.solution['genome']
+        except Exception:
+            pass
+        # save to rerun_results root
+        rerun_root = Path(locator.get_dynamic_dtn_optimization_results_folder())
+        rerun_root.mkdir(parents=True, exist_ok=True)
+        with open(rerun_root / 'rerun_summary.json', 'w') as f:
+            json.dump(summary, f, indent=2)
+        log().info(f"Saved rerun summary to {rerun_root / 'rerun_summary.json'}")
+    except Exception as e:
+        log().warning(f"Could not write rerun summary JSON: {e}")
 
     # Copy results from temp scenario to rerun_results folder
     temp_results_dir = Path(locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder())

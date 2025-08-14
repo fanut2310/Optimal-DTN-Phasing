@@ -57,6 +57,7 @@ import shutil
 import time
 import itertools
 import random
+import json
 from pathlib import Path
 from typing import Dict, Tuple, List, Set, Optional, Union
 
@@ -4037,6 +4038,44 @@ def main(config):
         # Get population size and number of generations from config
         population_size = config.dtn_expansion_optimization.population_size if hasattr(config.dtn_expansion_optimization, 'population_size') else 50
         num_generations = config.dtn_expansion_optimization.num_generations if hasattr(config.dtn_expansion_optimization, 'num_generations') else 30
+
+        # Save run settings to temp scenario for Dynamic Part 2 to inherit
+        try:
+            settings_dir = Path(locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder())
+            settings_dir.mkdir(parents=True, exist_ok=True)
+            settings = {
+                "network_type": network_type,
+                "objective_function": objective_function,
+                "multi_objective_mode": multi_objective_mode,
+                "multi_objective_functions": multi_objective_functions,
+                "num_phases": num_phases,
+                "phase_durations": phase_durations,
+                "population_size": population_size,
+                "num_generations": num_generations,
+                "capex_budget_per_phase": capex_budget_per_phase,
+                "total_expenditure_budget_per_phase": total_expenditure_budget_per_phase,
+                "ghg_budget_per_phase": ghg_budget_per_phase,
+                "interest_rate": interest_rate,
+                "cost_model": cost_model,
+                "diversity_factor": diversity_factor,
+                "temperature_difference_dh": temperature_difference_dh,
+                "temperature_difference_dc": temperature_difference_dc,
+                "pressure_loss_pa_per_m": pressure_loss_pa_per_m,
+                "pump_operation_hours": pump_operation_hours,
+                "pump_efficiency": pump_efficiency,
+                "pump_load_factor": pump_load_factor,
+                "pump_capex_a": pump_capex_a,
+                "pump_capex_b": pump_capex_b,
+                "cooling_cop": cooling_cop,
+                "testing_clusters": testing_clusters,
+                "random_seed": None
+            }
+            settings_path = settings_dir / 'run_settings.json'
+            with open(settings_path, 'w') as f:
+                json.dump(settings, f, indent=2)
+            log().info(f"Saved DTN run settings to {settings_path}")
+        except Exception as e:
+            log().warning(f"Could not save run settings JSON: {e}")
 
         # Create optimizer
         optimizer = DTNExpansionOptimizer(

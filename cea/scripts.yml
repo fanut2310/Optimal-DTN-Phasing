@@ -475,18 +475,20 @@ Energy Supply System Optimisation:
       - [get_optimization_results_folder]
       - [get_dtn_expansion_optimization_results_folder]
 
-  - name: dynamic-dtn-result-comparison
-    label: "Dynamic DTN Optimization Part 3: Result Comparisons"
+  - name: dynamic-dtn-optimization-part3
+    label: "Dynamic DTN Optimization Part 3: Sensitivity Analysis"
     description: |
-      Compares and visualizes results from Dynamic DTN Optimization without rerunning 
-      the thermal network simulation or DTN optimization.
+      Computes and summarizes sensitivity metrics for dynamic DTN reruns by comparing baseline and temp-scenario
+      demands, genomes, and KPIs. Produces master_summary.csv and cluster_level_deltas.csv under
+      outputs/data/optimization/dynamic_dtn_optimization/analysis.
     interfaces: [ cli, dashboard ]
-    module: cea.optimization_new.dynamic_dtn_result_comparison
+    module: cea.optimization_new.dynamic_dtn_optimization_part3
     parameters: [ 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free',
-                  'dynamic-dtn-optimization:network-type' ]
+                  'dynamic-dtn-optimization:network-type', 'dtn-expansion-optimization:testing-clusters' ]
     input-files:
       - [get_optimization_results_folder]
       - [get_dtn_expansion_optimization_results_folder]
+      - [get_total_demand]
 
   - name: decentralized
     label: "Supply System Part 1: decentralised"

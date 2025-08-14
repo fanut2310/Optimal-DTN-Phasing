@@ -358,7 +358,7 @@ HourlyThermalResults = collections.namedtuple('HourlyThermalResults',
                                                'pressure_loss_supply_edge_kW'])
 
 
-def thermal_network_main(locator, thermal_network, processes=1, config=None):
+def thermal_network_main(locator, thermal_network, processes=1):
     """
     This function performs thermal and hydraulic calculation of a "well-defined" network, namely, the plant/consumer
     substations, piping routes and the pipe properties (length/diameter/heat transfer coefficient) are already
@@ -465,11 +465,7 @@ def thermal_network_main(locator, thermal_network, processes=1, config=None):
             # To do this, the initial dataset is repeated 4 times, the remaining values are filled with the average values of all above.
             edge_mass_flow_for_csv = pd.concat([edge_mass_flow_for_csv] * 4, ignore_index=True)
             while len(edge_mass_flow_for_csv.index) < HOURS_IN_YEAR:
-                # REPLACE append(...) WITH concat(...)
-                edge_mass_flow_for_csv = pd.concat(
-                    [edge_mass_flow_for_csv, edge_mass_flow_for_csv.mean().to_frame().T],
-                    ignore_index=True
-                )
+                edge_mass_flow_for_csv = edge_mass_flow_for_csv.append(edge_mass_flow_for_csv.mean(), ignore_index=True)
             edge_mass_flow_for_csv.to_csv(
                 thermal_network.locator.get_nominal_edge_mass_flow_csv_file(thermal_network.network_type,
                                                                             thermal_network.network_name), index=False)
@@ -563,7 +559,6 @@ def thermal_network_main(locator, thermal_network, processes=1, config=None):
                 print(key, thermal_network.problematic_edges[key])
 
 
-
 def calculate_pressure_loss_critical_path(dP_timestep, thermal_network):
     dP_all_edges = dP_timestep[0]
     plant_node = thermal_network.all_nodes_df[thermal_network.all_nodes_df['type'] == 'PLANT'].index[0]
@@ -616,28 +611,19 @@ def output_hex_specs_at_nodes(substation_HEX_Q, thermal_network):
 
 
 def prepare_inputs_of_representative_weeks(thermal_network):
-    # Materialize the chained ranges once; iterators get exhausted if reused
-    hours_idx = list(chain(
-        range(0, 168), range(744, 912), range(1416, 1584), range(2160, 2328), range(2880, 3048),
-        range(3624, 3792), range(4344, 4512), range(5088, 5256), range(5832, 6000), range(6522, 6690),
-        range(7296, 7464), range(8016, 8184)
-    ))
-
-    # Cut out relevant parts of all arrays/dataframes
-    thermal_network.T_ground_K = [
-        value for index, value in enumerate(thermal_network.T_ground_K) if index in hours_idx
-    ]
+    hours_list = chain(range(0, 168), range(744, 912), range(1416, 1584), range(2160, 2328), range(2880, 3048),
+                       range(3624, 3792), range(4344, 4512), range(5088, 5256), range(5832, 6000), range(6522, 6690),
+                       range(7296, 7464), range(8016, 8184))
+    # cut out relevant parts of all dataframes
+    thermal_network.T_ground_K = [value for index, value in enumerate(thermal_network.T_ground_K) if
+                                  index in hours_list]
     for building in thermal_network.buildings_demands.keys():
-        df = thermal_network.buildings_demands[building].iloc[hours_idx]
-        df.index = range(0, 2016)
-        thermal_network.buildings_demands[building] = df
-
-    thermal_network.t_target_supply_C = thermal_network.t_target_supply_C.iloc[hours_idx]
+        thermal_network.buildings_demands[building] = thermal_network.buildings_demands[building].iloc[hours_list]
+        thermal_network.buildings_demands[building].index = range(0, 2016)
+    thermal_network.t_target_supply_C = thermal_network.t_target_supply_C.iloc[hours_list]
     thermal_network.t_target_supply_C.index = range(0, 2016)
-
-    thermal_network.t_target_supply_df = thermal_network.t_target_supply_df.iloc[hours_idx]
+    thermal_network.t_target_supply_df = thermal_network.t_target_supply_df.iloc[hours_list]
     thermal_network.t_target_supply_df.index = range(0, 2016)
-
     return np.nan
 
 
@@ -935,12 +921,9 @@ def extrapolate_datapoints_for_representative_weeks(representative_week_data):
     representative_week_df = pd.DataFrame(representative_week_data)
     representative_week_df = pd.concat([representative_week_df] * 4, ignore_index=True)
     while len(representative_week_df.index) < HOURS_IN_YEAR:
-        # REPLACE append(...) WITH concat(...)
-        representative_week_df = pd.concat(
-            [representative_week_df, representative_week_df.mean().to_frame().T],
-            ignore_index=True
-        )
+        representative_week_df = representative_week_df.append(representative_week_df.mean(), ignore_index=True)
     return representative_week_df
+
 
 
 def calculate_ground_temperature(locator):
@@ -1819,19 +1802,19 @@ def load_max_edge_flowrate_from_previous_run(thermal_network):
     edge_mass_flow_df = pd.read_csv(
         thermal_network.locator.get_nominal_edge_mass_flow_csv_file(thermal_network.network_type,
                                                                     thermal_network.network_name))
-    # Some legacy files were saved with an index column; drop it only if present
-    if 'Unnamed: 0' in edge_mass_flow_df.columns:
-        edge_mass_flow_df = edge_mass_flow_df.drop(columns=['Unnamed: 0'])
+    del edge_mass_flow_df['Unnamed: 0']
+    # max_edge_mass_flow_df = pd.DataFrame(data=[(edge_mass_flow_df.abs()).max(axis=0)],
+    #                                     columns=thermal_network.edge_node_df.columns)
     return edge_mass_flow_df
+
 
 def load_node_flowrate_from_previous_run(thermal_network):
     """Bypass the calculation of calc_max_edge_flowrate and use the results form the previous run"""
     node_mass_flow_df = pd.read_csv(
         thermal_network.locator.get_nominal_node_mass_flow_csv_file(thermal_network.network_type,
                                                                     thermal_network.network_name))
-    # Apply same guard for legacy files
-    if 'Unnamed: 0' in node_mass_flow_df.columns:
-        node_mass_flow_df = node_mass_flow_df.drop(columns=['Unnamed: 0'])
+    # max_edge_mass_flow_df = pd.DataFrame(data=[(edge_mass_flow_df.abs()).max(axis=0)],
+    #                                     columns=thermal_network.edge_node_df.columns)
     return node_mass_flow_df
 
 
@@ -3497,7 +3480,7 @@ def main(config):
         for network_name in network_names:
             check_heating_cooling_demand(locator, config)
             thermal_network = ThermalNetwork(locator, network_name, config.thermal_network)
-            thermal_network_main(locator, thermal_network, processes=config.get_number_of_processes(), config=config)
+            thermal_network_main(locator, thermal_network, processes=config.get_number_of_processes())
         # Print the time used for the entire processing
         time_elapsed = time.time() - start
         print('The process of thermal network design is completed - time elapsed: %.2f seconds.' % time_elapsed)

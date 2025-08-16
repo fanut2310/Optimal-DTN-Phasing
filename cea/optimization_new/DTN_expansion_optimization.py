@@ -2005,7 +2005,8 @@ class DTNExpansionOptimizer:
         cooling_df = pd.read_csv(self.locator.get_database_assemblies_supply_cooling())
         dhw_df = pd.read_csv(self.locator.get_database_assemblies_supply_hot_water())
 
-        # Check if all systems are DISTRICT scale
+        # Check DISTRICT scale only for the relevant system based on network type
+        nt = (self.network_type or '').upper()
         for _, row in cluster0_supply.iterrows():
             hs_code = row['supply_type_hs']
             cs_code = row['supply_type_cs']
@@ -2015,8 +2016,21 @@ class DTNExpansionOptimizer:
             cs_scale = cooling_df[cooling_df['code'] == cs_code]['scale'].iloc[0] if len(cooling_df[cooling_df['code'] == cs_code]) > 0 else 'UNKNOWN'
             dhw_scale = dhw_df[dhw_df['code'] == dhw_code]['scale'].iloc[0] if len(dhw_df[dhw_df['code'] == dhw_code]) > 0 else 'UNKNOWN'
 
-            if hs_scale != 'DISTRICT' or cs_scale != 'DISTRICT' or dhw_scale != 'DISTRICT':
-                log().warning(f"Building {row['name']} in cluster 0 does not use DISTRICT scale systems: HS={hs_scale}, CS={cs_scale}, DHW={dhw_scale}. This will result in penalties for the optimization results.")
+            if nt == 'DC':
+                # For DC, check only cooling
+                if cs_scale != 'DISTRICT':
+                    log().warning(
+                        f"Building {row['name']} in cluster 0 (DC) does not use DISTRICT scale for cooling (CS={cs_scale}).")
+            elif nt == 'DH':
+                # For DH, check only heating
+                if hs_scale != 'DISTRICT':
+                    log().warning(
+                        f"Building {row['name']} in cluster 0 (DH) does not use DISTRICT scale for heating (HS={hs_scale}).")
+            else:
+                # Fallback (unknown network type) – keep broader warning as a safe default
+                if hs_scale != 'DISTRICT' or cs_scale != 'DISTRICT' or dhw_scale != 'DISTRICT':
+                    log().warning(
+                        f"Building {row['name']} in cluster 0 has non-DISTRICT systems: HS={hs_scale}, CS={cs_scale}, DHW={dhw_scale}.")
 
     def optimize(self, population_size=50, num_generations=30):
         """

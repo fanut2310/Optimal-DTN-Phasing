@@ -853,7 +853,8 @@ def cluster_buildings(buildings_shp, demand_df, locator,
                       include_heat_demand=False,
                       max_demand_ratio=3.0,
                       max_distance_threshold=100,  # Maximum distance between buildings in same cluster
-                      show_interactive_plot=False):
+                      show_interactive_plot=False,
+                      pin_existing_to_cluster0=True):
     """
     Main clustering function with support for K-means or HDBSCAN algorithms.
 
@@ -1038,6 +1039,23 @@ def cluster_buildings(buildings_shp, demand_df, locator,
 
     final_df = spatial_majority_reassignment(final_df, n_neighbors=3)
 
+    # Final safeguard: pin seed buildings to cluster 0 if requested
+    if pin_existing_to_cluster0 and existing_dtn_buildings:
+        try:
+            existing_set = {str(b).strip() for b in existing_dtn_buildings}
+            name_series = final_df['name'].astype(str).str.strip()
+            mask = name_series.isin(existing_set)
+            if mask.any():
+                prev = final_df.loc[mask, 'cluster'].copy()
+                final_df.loc[mask, 'cluster'] = 0
+                total_pinned = int(mask.sum())
+                changed = int((prev != 0).sum())
+                print(f"Pinned existing DTN buildings to cluster 0: {total_pinned} pinned, {changed} changed from non-zero clusters.")
+            else:
+                print("Pinning requested, but none of the provided existing DTN buildings were found in the merged dataset.")
+        except Exception as e:
+            print(f"Warning: pin_existing_to_cluster0 encountered an issue: {e}")
+
     # Save results
     out_csv, out_shp = save_results(final_df, locator)
 
@@ -1100,6 +1118,9 @@ def main(config):
     ensure_min_use_types = config.building_clustering.ensure_min_use_types
     min_use_types_per_cluster = config.building_clustering.min_use_types_per_cluster
 
+    # Pinning option (default True if not defined in schema)
+    pin_existing_to_cluster0 = getattr(config.building_clustering, 'pin_existing_to_cluster0', True)
+
     # Determine if we're running from GUI or command line
     # In GUI mode, don't show interactive plots to avoid blocking
     show_interactive_plot = not hasattr(config, 'multiprocessing') or not config.multiprocessing
@@ -1132,7 +1153,8 @@ def main(config):
         max_demand_ratio=max_demand_ratio,
         noise_flag=noise_flag,                                  # fix typo here
         noise_reassign_distance=noise_reassign_distance,
-        show_interactive_plot=show_interactive_plot
+        show_interactive_plot=show_interactive_plot,
+        pin_existing_to_cluster0=pin_existing_to_cluster0
     )
 
     # Perform node and edge clustering after building clustering is complete

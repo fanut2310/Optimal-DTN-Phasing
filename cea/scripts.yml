@@ -322,7 +322,8 @@ Energy Supply System Optimisation:
                   'building-clustering:reassign-noise',
                   'building-clustering:noise-reassign-distance',
                   'building-clustering:ensure-min-use-types',
-                  'building-clustering:min-use-types-per-cluster' ]
+                  'building-clustering:min-use-types-per-cluster',
+                  'building-clustering:pin-existing-to-cluster0' ]
     input-files:
       - [ get_zone_geometry ]
       - [ get_total_demand ]

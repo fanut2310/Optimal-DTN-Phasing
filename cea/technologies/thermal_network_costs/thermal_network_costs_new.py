@@ -108,12 +108,16 @@ def calc_Ctot_network_pump(network_cost_features, locator):
 
     # Read in node mass flows
     df = pd.read_csv(locator.get_nominal_edge_mass_flow_csv_file(network_type, network_name), index_col=0)
-    mdotA_kgpers = np.array(df)
+    # Ensure numeric data (coerce non-numeric to NaN -> 0.0)
+    df = df.apply(pd.to_numeric, errors='coerce').fillna(0.0)
+    mdotA_kgpers = np.array(df, dtype=float)
     mdotA_kgpers = np.nan_to_num(mdotA_kgpers)
     mdotnMax_kgpers = np.amax(mdotA_kgpers)  # find highest mass flow of all nodes at all timesteps
 
     # Read in total pressure loss in kW
     deltaP_df = pd.read_csv(locator.get_network_energy_pumping_requirements_file(network_type, network_name))
+    # Ensure numeric pressure loss column
+    deltaP_df['pressure_loss_total_kW'] = pd.to_numeric(deltaP_df['pressure_loss_total_kW'], errors='coerce').fillna(0.0)
     deltaP_kW = deltaP_df['pressure_loss_total_kW'].sum()
 
     # Get electricity price
@@ -147,7 +151,9 @@ def calc_Ctot_cooling_plants(thermal_network_type, thermal_network_name, locator
     """
     # Read in plant heat requirement
     plant_heat_hourly_kWh = pd.read_csv(
-        locator.get_thermal_network_plant_heat_requirement_file(thermal_network_type, thermal_network_name))
+        locator.get_thermal_network_plant_heat_requirement_file(thermal_network_type, thermal_network_name), index_col=0)
+    # Ensure numeric values
+    plant_heat_hourly_kWh = plant_heat_hourly_kWh.apply(pd.to_numeric, errors='coerce').fillna(0.0)
 
     # Read in number of plants
     number_of_plants = len(plant_heat_hourly_kWh.columns)
@@ -195,7 +201,7 @@ def calc_Ctot_cooling_plants(thermal_network_type, thermal_network_name, locator
             COP_chiller = 4.5  # Slightly higher than system COP
 
             # Calculate cost of producing cooling
-            Opex_var_plant += abs(plant_heat_yearly_kWh) / COP_plant * 1000 * prices.ELEC_PRICE
+            Opex_var_plant += plant_heat_yearly_kWh / COP_plant * 1000 * prices.ELEC_PRICE
 
             # Calculate equipment cost of chiller and cooling tower
             Capex_a_chiller_USD, Opex_fixed_chiller, _ = VCCModel.calc_Cinv_VCC(peak_demand_W, locator, 'CH1')
@@ -248,7 +254,9 @@ def calc_Cinv_HEX_modified(thermal_network_type, thermal_network_name, locator):
 
         # Read in node mass flows
         node_flows = pd.read_csv(
-            locator.get_nominal_node_mass_flow_csv_file(thermal_network_type, thermal_network_name))
+            locator.get_nominal_node_mass_flow_csv_file(thermal_network_type, thermal_network_name), index_col=0)
+        # Ensure numeric values
+        node_flows = node_flows.apply(pd.to_numeric, errors='coerce').fillna(0.0)
 
         # Find design condition node mcp
         if node_id in node_flows.columns:

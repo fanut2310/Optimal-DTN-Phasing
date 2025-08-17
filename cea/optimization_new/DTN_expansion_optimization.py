@@ -392,7 +392,7 @@ class DTNExpansionOptimizer:
 
             # Try to load the feedstock data
             feedstock_file = self.locator.get_db4_components_feedstocks_feedstocks_csv(feedstocks=feedstock_name)
-            log().info(f"Reading energy price from {feedstock_file}")
+            log().debug(f"Reading energy price from {feedstock_file}")
 
             feedstock_data = pd.read_csv(feedstock_file)
 
@@ -400,7 +400,7 @@ class DTNExpansionOptimizer:
             if 'Opex_var_buy_USD2015kWh' in feedstock_data.columns:
                 # Calculate average price across all hours
                 energy_price = feedstock_data['Opex_var_buy_USD2015kWh'].mean()
-                log().info(f"Using energy price from {feedstock_name}: {energy_price:.4f} USD/kWh")
+                log().debug(f"Using energy price from {feedstock_name}: {energy_price:.4f} USD/kWh")
                 return energy_price
             else:
                 log().warning(f"Column 'Opex_var_buy_USD2015kWh' not found in {feedstock_name} data. Using default value.")
@@ -1276,7 +1276,7 @@ class DTNExpansionOptimizer:
         if 'PV' in ef_simple['code'].values:
             ef_pv = ef_kg_per_kwh('PV')
         elif 'SOLAR' in ef_simple['code'].values:
-            log().info("PV feedstock EF not found; using SOLAR EF for PV.")
+            log().debug("PV feedstock EF not found; using SOLAR EF for PV.")
             ef_pv = ef_kg_per_kwh('SOLAR')
         else:
             log().warning("PV (and SOLAR) feedstock EF not found; assuming 0 kgCO2/kWh for PV operational emissions.")
@@ -1348,7 +1348,7 @@ class DTNExpansionOptimizer:
         # Create phase 0 supply file (original)
         phase0_supply_path = phase_files_dir / "phase0_supply.csv"
         original_supply_df.to_csv(phase0_supply_path, index=False)
-        log().info(f"Created phase 0 supply file: {phase0_supply_path}")
+        log().debug(f"Created phase 0 supply file: {phase0_supply_path}")
 
         # Load demand once for GFA denominators
         _demand_df = pd.read_csv(self.locator.get_total_demand())
@@ -1436,7 +1436,7 @@ class DTNExpansionOptimizer:
             # Save the phase-specific supply file
             phase_supply_path = phase_files_dir / f"phase{phase}_supply.csv"
             phase_supply_df.to_csv(phase_supply_path, index=False)
-            log().info(f"Created phase {phase} supply file: {phase_supply_path}")
+            log().debug(f"Created phase {phase} supply file: {phase_supply_path}")
 
             if self.compute_emissions_from_cop:
                 # Pump electricity for cumulative connected clusters (convert Wh to kWh)
@@ -2988,7 +2988,7 @@ class DTNExpansionOptimizer:
                     from cea.optimization.prices import Prices  # Import Prices class
                     prices = Prices(supply_systems)
                     electricity_price = np.mean(prices.ELEC_PRICE, dtype=np.float64)  # [USD/W]
-                    log().info(f"Using electricity price: {electricity_price} USD/W")
+                    log().debug(f"Using electricity price: {electricity_price} USD/W")
                 except Exception as e:
                     log().warning(f"Could not get electricity price: {e}. Using default value of 0.1 USD/kWh")
                     electricity_price = 0.1 / 1000  # Convert from USD/kWh to USD/W
@@ -4321,7 +4321,7 @@ def main(config):
     total_time = time.time() - start_time
     if not (hasattr(config.dtn_expansion_optimization, 'run_optimization') and config.dtn_expansion_optimization.run_optimization):
         log().info("Note: Optimization was not run. To run optimization, use --run_optimization true parameter.")
-    log().info(f"DTN expansion optimization completed successfully in {total_time:.2f} seconds.")
+    log().info(f"Execution time: {total_time:.2f}s")
 
 if __name__ == "__main__":
     main(None)

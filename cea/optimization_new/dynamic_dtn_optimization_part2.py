@@ -315,6 +315,9 @@ class DTNExpansionOptimizer:
         # Create a cache for emissions results
         self.emissions_cache = {}
 
+        # Emissions computation preference: default to COP-based correction (fail-fast on errors)
+        self.compute_emissions_from_cop = True
+
         # Initialize DEAP toolbox
         self.toolbox = base.Toolbox()
         self._setup_genetic_algorithm()
@@ -1098,6 +1101,164 @@ class DTNExpansionOptimizer:
         key = tuple(individual) if not isinstance(individual, tuple) else individual
         self.emissions_cache[key] = (emissions, has_non_district_scale)
 
+    def _compute_phase_emissions_from_cop(self, phase_supply_path: Union[str, Path], scope_buildings: Optional[Set[str]] = None, pump_electricity_kwh: float = 0.0, custom_demand_path: Optional[Union[str, Path]] = None) -> Tuple[float, float]:
+        """
+        Compute phase operational emissions from baseline thermal needs and phase-specific supply COP/efficiency without
+        re-running Demand. Adds network pump electricity. Fails fast on any missing inputs.
+
+        Returns (total_ton_co2, kg_co2_per_m2_per_yr)
+        """
+        # Resolve paths
+        phase_supply_path = str(phase_supply_path)
+        if not os.path.exists(phase_supply_path):
+            log().error(f"Phase supply file not found: {phase_supply_path}")
+            raise FileNotFoundError(f"Phase supply file not found: {phase_supply_path}")
+
+        demand_path = str(custom_demand_path) if custom_demand_path else self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand()
+        if not os.path.exists(demand_path):
+            log().error(f"Total demand file not found: {demand_path}")
+            raise FileNotFoundError(f"Total demand file not found: {demand_path}")
+
+        # Load datasets
+        demand = pd.read_csv(demand_path)
+        supply = pd.read_csv(phase_supply_path)
+
+        # Required demand columns
+        req_cols = ['name', 'GFA_m2', 'QC_sys_MWhyr', 'Qhs_sys_MWhyr', 'Qww_sys_MWhyr', 'GRID_MWhyr', 'PV_MWhyr']
+        missing = [c for c in req_cols if c not in demand.columns]
+        if missing:
+            log().error(f"Missing required demand columns: {missing} in {demand_path}")
+            raise KeyError(f"Missing required demand columns: {missing}")
+
+        # Required supply columns
+        sup_req = ['name', 'supply_type_cs', 'supply_type_hs', 'supply_type_dhw', 'supply_type_el']
+        sup_missing = [c for c in sup_req if c not in supply.columns]
+        if sup_missing:
+            log().error(f"Missing required supply columns: {sup_missing} in {phase_supply_path}")
+            raise KeyError(f"Missing required supply columns: {sup_missing}")
+
+        # Load assemblies (COP / efficiency and feedstock)
+        cooling_db = pd.read_csv(self.locator.get_database_assemblies_supply_cooling())
+        heating_db = pd.read_csv(self.locator.get_database_assemblies_supply_heating())
+        dhw_db = pd.read_csv(self.locator.get_database_assemblies_supply_hot_water())
+        el_db = pd.read_csv(self.locator.get_database_assemblies_supply_electricity())
+        for db, nm in [(cooling_db, 'cooling'), (heating_db, 'heating'), (dhw_db, 'hot water'), (el_db, 'electricity')]:
+            for col in ['code', 'feedstock', 'scale', 'efficiency']:
+                if col not in db.columns:
+                    log().error(f"Assemblies {nm} database missing column '{col}'")
+                    raise KeyError(f"Assemblies {nm} database missing column '{col}'")
+
+        # Load feedstock emission factors (kgCO2/MJ)
+        from cea.datamanagement.format_helper.cea4_verify_db import get_csv_filenames
+        factors_resources = {}
+        list_feedstocks = get_csv_filenames(self.locator.get_db4_components_feedstocks_library_folder())
+        for feedstock in list_feedstocks:
+            factors_resources[feedstock] = pd.read_csv(self.locator.get_db4_components_feedstocks_feedstocks_csv(feedstocks=feedstock))
+        if not factors_resources:
+            log().error("No feedstock emission factors found in database.")
+            raise RuntimeError("No feedstock emission factors found.")
+        ef_simple = pd.concat([
+            pd.DataFrame([(k, v['GHG_kgCO2MJ'].mean()) for k, v in factors_resources.items() if k != 'ENERGY_CARRIERS'],
+                         columns=['code', 'GHG_kgCO2MJ']),
+            pd.DataFrame([{'code': 'NONE', 'GHG_kgCO2MJ': 0.0}])
+        ], ignore_index=True)
+
+        def ef_kg_per_kwh(feedstock_code: str) -> float:
+            row = ef_simple.loc[ef_simple['code'] == str(feedstock_code)]
+            if row.empty or pd.isna(row['GHG_kgCO2MJ'].iloc[0]):
+                log().error(f"Missing emission factor for feedstock '{feedstock_code}'")
+                raise KeyError(f"Missing emission factor for feedstock '{feedstock_code}'")
+            return float(row['GHG_kgCO2MJ'].iloc[0]) * 3.6
+
+        # Merge supply with assemblies
+        sup = supply[['name', 'supply_type_cs', 'supply_type_hs', 'supply_type_dhw', 'supply_type_el']].copy()
+        sup = sup.merge(cooling_db[['code', 'feedstock', 'scale', 'efficiency']].rename(
+            columns={'code': 'supply_type_cs', 'feedstock': 'feedstock_cs', 'scale': 'scale_cs', 'efficiency': 'eff_cs'}),
+            on='supply_type_cs', how='left')
+        sup = sup.merge(heating_db[['code', 'feedstock', 'scale', 'efficiency']].rename(
+            columns={'code': 'supply_type_hs', 'feedstock': 'feedstock_hs', 'scale': 'scale_hs', 'efficiency': 'eff_hs'}),
+            on='supply_type_hs', how='left')
+        sup = sup.merge(dhw_db[['code', 'feedstock', 'scale', 'efficiency']].rename(
+            columns={'code': 'supply_type_dhw', 'feedstock': 'feedstock_dhw', 'scale': 'scale_dhw', 'efficiency': 'eff_dhw'}),
+            on='supply_type_dhw', how='left')
+
+        # Validate COPs/effectiveness are present
+        if sup[['eff_cs', 'eff_hs', 'eff_dhw']].isna().any().any():
+            missing_rows = sup[sup[['eff_cs', 'eff_hs', 'eff_dhw']].isna().any(axis=1)]
+            log().error(f"Missing efficiency/COP for some supply codes: {missing_rows.to_dict(orient='records')}")
+            raise KeyError("Missing efficiency/COP for some supply codes")
+
+        # Merge with demand
+        df = demand.merge(sup, on='name', how='inner')
+        if scope_buildings:
+            df = df[df['name'].isin(scope_buildings)].copy()
+        if df.empty:
+            log().error("No buildings found in scope after merging demand and supply.")
+            raise RuntimeError("Empty scope for emissions computation.")
+
+        # Thermal needs (ensure non-negative)
+        df['QC_sys_MWhyr'] = df['QC_sys_MWhyr'].abs().fillna(0.0)
+        df['Qhs_sys_MWhyr'] = df['Qhs_sys_MWhyr'].abs().fillna(0.0)
+        df['Qww_sys_MWhyr'] = df['Qww_sys_MWhyr'].abs().fillna(0.0)
+
+        # Cooling emissions (generalized by feedstock)
+        def emis_from_thermal(q_mwh, eff, feedstock):
+            fs = str(feedstock).upper() if pd.notna(feedstock) else 'NONE'
+
+            # Legitimate no-system case: zero emissions only if thermal need is zero
+            if fs == 'NONE':
+                if (q_mwh or 0) > 1e-9:
+                    log().error(f"Non-zero thermal need ({q_mwh} MWh) with supply feedstock NONE. Inconsistent demand/supply configuration.")
+                    raise ValueError("Thermal need present with NONE supply.")
+                return 0.0
+
+            # For any real feedstock, efficiency must be positive
+            if eff is None or eff <= 0:
+                log().error(f"Non-positive efficiency detected for feedstock {fs}")
+                raise ValueError("Non-positive efficiency")
+
+            if fs == 'GRID':
+                e_kwh = (q_mwh * 1000.0) / eff
+                return (e_kwh * ef_kg_per_kwh('GRID')) / 1000.0
+            else:
+                mwh_final = q_mwh / eff
+                return (mwh_final * ef_kg_per_kwh(fs)) / 1000.0
+
+        df['Emis_cool_t'] = [emis_from_thermal(q, e, fs) for q, e, fs in zip(df['QC_sys_MWhyr'], df['eff_cs'], df['feedstock_cs'])]
+        df['Emis_hs_t'] = [emis_from_thermal(q, e, fs) for q, e, fs in zip(df['Qhs_sys_MWhyr'], df['eff_hs'], df['feedstock_hs'])]
+        df['Emis_dhw_t'] = [emis_from_thermal(q, e, fs) for q, e, fs in zip(df['Qww_sys_MWhyr'], df['eff_dhw'], df['feedstock_dhw'])]
+
+        # Electricity end-uses (non-HVAC)
+        ef_grid = ef_kg_per_kwh('GRID')
+
+        # PV EF fallback logic:
+        # 1) Use PV if present; 2) Else use SOLAR if present; 3) Else assume 0 for PV operation
+        if 'PV' in ef_simple['code'].values:
+            ef_pv = ef_kg_per_kwh('PV')
+        elif 'SOLAR' in ef_simple['code'].values:
+            log().info("PV feedstock EF not found; using SOLAR EF for PV.")
+            ef_pv = ef_kg_per_kwh('SOLAR')
+        else:
+            log().warning("PV (and SOLAR) feedstock EF not found; assuming 0 kgCO2/kWh for PV operational emissions.")
+            ef_pv = 0.0
+
+        df['Emis_el_t'] = (df['GRID_MWhyr'] * ef_grid + df['PV_MWhyr'] * ef_pv) / 1000.0
+
+        # Sum per building
+        df['Emis_total_t'] = df['Emis_cool_t'] + df['Emis_hs_t'] + df['Emis_dhw_t'] + df['Emis_el_t']
+
+        # Pumps
+        if pump_electricity_kwh < 0:
+            log().error("Pump electricity cannot be negative.")
+            raise ValueError("Negative pump electricity")
+        emis_pump_t = (pump_electricity_kwh * ef_grid) / 1000.0
+
+        # Aggregate
+        total_t = float(df['Emis_total_t'].sum()) + emis_pump_t
+        gfa = float(df['GFA_m2'].sum())
+        kg_per_m2_yr = (total_t * 1000.0 / gfa) if gfa > 0 else 0.0
+        return total_t, kg_per_m2_yr
+
     def calculate_district_emissions_new(self):
         """
         Calculate district operation emissions using the new methodology.
@@ -1150,42 +1311,43 @@ class DTNExpansionOptimizer:
         original_supply_df.to_csv(phase0_supply_path, index=False)
         log().info(f"Created phase 0 supply file at: {phase0_supply_path}")
 
-        # Phase 0: Calculate emissions for the whole district with cluster 0 using district systems
-        # and all other clusters using building-scale systems
+        # Load demand once for GFA denominators (temp scenario)
+        _demand_df = pd.read_csv(self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand())
+        _total_gfa_const = float(_demand_df['GFA_m2'].sum())
+        _name_to_gfa = dict(zip(_demand_df['name'], _demand_df['GFA_m2']))
 
-        # Run LCA operation module with original supply file
-        from cea.analysis.lca.operation import lca_operation
-        # Get the temp scenario's total demand file path
-        temp_demand_path = self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand()
-        log().info(f"Running LCA operation for phase 0 with:")
-        log().info(f"  - Supply path: {phase0_supply_path}")
-        log().info(f"  - Demand path: {temp_demand_path}")
-        lca_operation(self.locator, custom_supply_path=str(phase0_supply_path), custom_demand_path=temp_demand_path)
+        # Phase 0 emissions: COP-based if enabled, else use LCA operation with temp demand
+        if self.compute_emissions_from_cop:
+            # District-wide scope: ALL buildings
+            total_ghg, _ = self._compute_phase_emissions_from_cop(phase0_supply_path, scope_buildings=None, pump_electricity_kwh=0.0,
+                                                                  custom_demand_path=self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand())
+        else:
+            from cea.analysis.lca.operation import lca_operation
+            temp_demand_path = self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand()
+            log().info(f"Running LCA operation for phase 0 with:")
+            log().info(f"  - Supply path: {phase0_supply_path}")
+            log().info(f"  - Demand path: {temp_demand_path}")
+            lca_operation(self.locator, custom_supply_path=str(phase0_supply_path), custom_demand_path=temp_demand_path)
 
-        # Load LCA results
-        lca_results_path = self.locator.get_dynamic_dtn_optimization_temp_scenario_lca_operation_file()
-        log().info(f"Loading LCA results from: {lca_results_path}")
-        lca_operation_results = pd.read_csv(lca_results_path)
-        log().info(f"Loaded LCA results with {len(lca_operation_results)} buildings")
+            # Load LCA results (ALL buildings)
+            lca_results_path = self.locator.get_dynamic_dtn_optimization_temp_scenario_lca_operation_file()
+            log().info(f"Loading LCA results from: {lca_results_path}")
+            lca_operation_results = pd.read_csv(lca_results_path)
+            log().info(f"Loaded LCA results with {len(lca_operation_results)} buildings")
+            total_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())
 
-        # Filter LCA results to only include buildings in testing clusters if specified
-        if hasattr(self, 'testing_clusters') and self.testing_clusters:
-            log().info(f"Filtering emissions to only include buildings in testing clusters: {self.testing_clusters}")
-            lca_operation_results = lca_operation_results[
-                lca_operation_results['name'].isin(self.buildings_in_testing_clusters)]
-            log().info(f"Filtered to {len(lca_operation_results)} buildings for emissions calculation")
+        # Compute GFA denominators for phase 0
+        _connected_buildings_p0 = set(self._get_buildings_in_specific_cluster(0))
+        _connected_gfa_p0 = float(sum(_name_to_gfa.get(b, 0.0) for b in _connected_buildings_p0))
+        per_connected = (total_ghg * 1000.0 / _connected_gfa_p0) if _connected_gfa_p0 > 0 else 0.0
+        per_total = (total_ghg * 1000.0 / _total_gfa_const) if _total_gfa_const > 0 else 0.0
 
-        # Calculate total GHG emissions and GFA for phase 0
-        total_ghg = lca_operation_results['GHG_sys_tonCO2'].sum()
-        total_gfa = lca_operation_results['GFA_m2'].sum()
-
-        # Calculate emissions per GFA
-        ghg_per_gfa = total_ghg / total_gfa if total_gfa > 0 else 0
-
-        # Store results for phase 0
+        # Store results for phase 0 (keep legacy key mapped to connected intensity)
         results[0] = {
             'district_operation_emission [t CO2eq/yr]': total_ghg,
-            'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': ghg_per_gfa * 1000  # Convert to kg
+            'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': per_connected,
+            'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': per_total,
+            'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': per_connected
         }
 
         # Get cluster assignments from current individual
@@ -1244,36 +1406,44 @@ class DTNExpansionOptimizer:
             phase_supply_df.to_csv(phase_supply_path, index=False)
             log().info(f"Created phase {phase} supply file: {phase_supply_path}")
 
-            # Run LCA operation module with the phase-specific supply file
-            # Use the same temp scenario's total demand file path
-            temp_demand_path = self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand()
-            log().info(f"Running LCA operation for phase {phase} with:")
-            log().info(f"  - Supply path: {phase_supply_path}")
-            log().info(f"  - Demand path: {temp_demand_path}")
-            lca_operation(self.locator, custom_supply_path=str(phase_supply_path), custom_demand_path=temp_demand_path)
+            if self.compute_emissions_from_cop:
+                # Pump electricity for cumulative connected clusters (convert Wh to kWh)
+                try:
+                    _, pump_electricity_wh = self.calculate_pump_costs(tuple(connected_clusters))
+                except Exception as e:
+                    log().error(f"Failed to calculate pump electricity for clusters {connected_clusters}: {e}")
+                    raise
+                pump_electricity_kwh = pump_electricity_wh / 1000.0
+                # District-wide emissions for ALL buildings
+                total_ghg, _ = self._compute_phase_emissions_from_cop(phase_supply_path, scope_buildings=None, pump_electricity_kwh=pump_electricity_kwh,
+                                                                       custom_demand_path=self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand())
+            else:
+                # Run LCA operation module with the phase-specific supply file
+                from cea.analysis.lca.operation import lca_operation
+                temp_demand_path = self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand()
+                log().info(f"Running LCA operation for phase {phase} with:")
+                log().info(f"  - Supply path: {phase_supply_path}")
+                log().info(f"  - Demand path: {temp_demand_path}")
+                lca_operation(self.locator, custom_supply_path=str(phase_supply_path), custom_demand_path=temp_demand_path)
 
-            # Load LCA results
-            lca_results_path = self.locator.get_dynamic_dtn_optimization_temp_scenario_lca_operation_file()
-            log().info(f"Loading LCA results from: {lca_results_path}")
-            lca_operation_results = pd.read_csv(lca_results_path)
-            log().info(f"Loaded LCA results with {len(lca_operation_results)} buildings")
+                # Load LCA results and use ALL buildings
+                lca_results_path = self.locator.get_dynamic_dtn_optimization_temp_scenario_lca_operation_file()
+                log().info(f"Loading LCA results from: {lca_results_path}")
+                lca_operation_results = pd.read_csv(lca_results_path)
+                log().info(f"Loaded LCA results with {len(lca_operation_results)} buildings")
+                total_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())
 
-            # Filter LCA results to only include buildings in testing clusters if specified
-            if hasattr(self, 'testing_clusters') and self.testing_clusters:
-                lca_operation_results = lca_operation_results[
-                    lca_operation_results['name'].isin(self.buildings_in_testing_clusters)]
+            # Compute GFA denominators for this phase
+            _connected_gfa = float(sum(_name_to_gfa.get(b, 0.0) for b in set(connected_buildings)))
+            per_connected = (total_ghg * 1000.0 / _connected_gfa) if _connected_gfa > 0 else 0.0
+            per_total = (total_ghg * 1000.0 / _total_gfa_const) if _total_gfa_const > 0 else 0.0
 
-            # Calculate total GHG emissions and GFA for this phase
-            total_ghg = lca_operation_results['GHG_sys_tonCO2'].sum()
-            total_gfa = lca_operation_results['GFA_m2'].sum()
-
-            # Calculate emissions per GFA
-            ghg_per_gfa = total_ghg / total_gfa if total_gfa > 0 else 0
-
-            # Store results for this phase
+            # Store results for this phase (include new columns and legacy mapping)
             results[phase] = {
                 'district_operation_emission [t CO2eq/yr]': total_ghg,
-                'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': ghg_per_gfa * 1000  # Convert to kg
+                'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': per_connected,
+                'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': per_total,
+                'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': per_connected
             }
 
         return results
@@ -3247,6 +3417,10 @@ class DTNExpansionOptimizer:
             'ghg_cap [t CO2eq/yr]': '-',  # No GHG cap for existing DTN
             'district_operation_emission [t CO2eq/yr]': district_emissions.get(0, {}).get(
                 'district_operation_emission [t CO2eq/yr]', 0),
+            'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': district_emissions.get(0, {}).get(
+                'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]', 0),
+            'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': district_emissions.get(0, {}).get(
+                'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]', 0),
             'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': district_emissions.get(0, {}).get(
                 'district_operation_emission_per_gfa [kg CO2eq/yr/m2]', 0),
             'new_cluster(s)_discounted_roi [-]': 0,  # Will be calculated if data is available
@@ -3532,9 +3706,13 @@ class DTNExpansionOptimizer:
                 result.get('new_cluster(s)_om_cost [USD]', 0) for result in results if result['phase'] != 0),
             'ghg_cap [t CO2eq/yr]': self.ghg_budget_per_phase[-1] if self.ghg_budget_per_phase else '-',
             'district_operation_emission [t CO2eq/yr]': district_emissions.get(self.num_phases, {}).get(
-                'district_operation_emission [t CO2eq/yr]', 0),
-            'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': district_emissions.get(self.num_phases, {}).get(
-                'district_operation_emission_per_gfa [kg CO2eq/yr/m2]', 0),
+            'district_operation_emission [t CO2eq/yr]', 0),
+        'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': district_emissions.get(self.num_phases, {}).get(
+            'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]', 0),
+        'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': district_emissions.get(self.num_phases, {}).get(
+            'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]', 0),
+        'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': district_emissions.get(self.num_phases, {}).get(
+            'district_operation_emission_per_gfa [kg CO2eq/yr/m2]', 0),
             'new_cluster(s)_discounted_roi [-]': sum(
                 result['new_cluster(s)_discounted_roi [-]'] * result['new_cluster(s)_capex [USD]'] for result in results
                 if result['phase'] != 0) / sum(
@@ -4279,6 +4457,14 @@ def main(config):
         multi_objective_functions=multi_objective_functions,
         testing_clusters=testing_clusters
     )
+
+    # Set emissions computation mode from config (default True)
+    try:
+        optimizer.compute_emissions_from_cop = bool(getattr(config.dtn_expansion_optimization, 'compute_emissions_from_cop', True))
+        log().info(f"compute-emissions-from-cop set to {optimizer.compute_emissions_from_cop}")
+    except Exception as e:
+        log().warning(f"Could not read compute-emissions-from-cop from config, defaulting to True. Error: {e}")
+        optimizer.compute_emissions_from_cop = True
 
     # Run the optimization (GA runtime controls with precedence)
     population_size = pick(getattr(config.dtn_expansion_optimization, 'population_size', None), saved.get('population_size'), 50)

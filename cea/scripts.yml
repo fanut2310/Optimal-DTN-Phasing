@@ -349,7 +349,8 @@ Energy Supply System Optimisation:
                   'dtn-expansion-optimization:pump-operation-hours', 'dtn-expansion-optimization:pump-efficiency',
                   'dtn-expansion-optimization:pump-load-factor', 'dtn-expansion-optimization:pump-capex-a', 'dtn-expansion-optimization:pump-capex-b',
                   'dtn-expansion-optimization:cooling-cop', 'dtn-expansion-optimization:ghg-budget-per-phase', 
-                  'dtn-expansion-optimization:multi-objective-mode', 'dtn-expansion-optimization:multi-objective-functions' ]
+                  'dtn-expansion-optimization:multi-objective-mode', 'dtn-expansion-optimization:multi-objective-functions',
+                  'dtn-expansion-optimization:compute-emissions-from-cop' ]
     input-files:
       - [get_street_network]
       - [get_total_demand]
@@ -436,7 +437,8 @@ Energy Supply System Optimisation:
                   'dtn-expansion-optimization:multi-objective-mode',
                   'dtn-expansion-optimization:multi-objective-functions',
                   'dtn-expansion-optimization:population-size',
-                  'dtn-expansion-optimization:num-generations' ]
+                  'dtn-expansion-optimization:num-generations',
+                  'dtn-expansion-optimization:compute-emissions-from-cop' ]
     input-files:
       - [get_optimization_results_folder]
       - [get_dtn_expansion_optimization_results_folder]

@@ -390,12 +390,29 @@ Energy Supply System Optimisation:
                   'dynamic-dtn-optimization:electricity-demand-reduction',
 
                   # Densification (single percent)
-                  'dynamic-dtn-optimization:densification-percent' ]
+                  'dynamic-dtn-optimization:densification-percent',
+
+                  # Thermal network simulation controls (Part 2 & 3)
+                  'thermal-network:network-model',
+                  'thermal-network:load-max-edge-flowrate-from-previous-run',
+                  'thermal-network:use-representative-week-per-month',
+                  'thermal-network:start-t',
+                  'thermal-network:stop-t',
+                  'thermal-network:min-head-substation',
+                  'thermal-network:hw-friction-coefficient',
+                  'thermal-network:peak-load-velocity',
+                  'thermal-network:equivalent-length-factor',
+                  'thermal-network:peak-load-percentage',
+                  'thermal-network:minimum-mass-flow-iteration-limit',
+                  'thermal-network:minimum-edge-mass-flow',
+                  'thermal-network:diameter-iteration-limit',
+                  'thermal-network:substation-cooling-systems',
+                  'thermal-network:substation-heating-systems',
+                  'thermal-network:temperature-control',
+                  'thermal-network:plant-supply-temperature' ]
     input-files:
-      - [get_street_network]
       - [get_total_demand]
       - [get_zone_geometry]
-      - [get_network_layout_nodes_shapefile, "dynamic-dtn-optimization:network-type"]
       - [get_demand_results_file, building_name]
       - [get_db4_components_conversion_folder]
       - [get_database_components_distribution_thermal_grid]

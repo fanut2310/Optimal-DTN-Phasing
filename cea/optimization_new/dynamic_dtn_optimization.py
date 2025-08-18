@@ -485,16 +485,6 @@ class DynamicDTNOptimizer:
                 if os.path.exists(related_file):
                     shutil.copy2(related_file, target_path / "inputs" / "building-geometry" / f"zone{ext}")
 
-        # Copy network files
-        network_file = source_locator.get_network_layout_edges_shapefile(self.network_type)
-        if os.path.exists(network_file):
-            target_network_dir = target_path / "inputs" / "networks"
-            shutil.copy2(network_file, target_network_dir / f"{self.network_type}.shp")
-            # Copy related files (.dbf, .shx, etc.)
-            for ext in ['.dbf', '.shx', '.prj', '.cpg']:
-                related_file = network_file.replace('.shp', ext)
-                if os.path.exists(related_file):
-                    shutil.copy2(related_file, target_network_dir / f"{self.network_type}{ext}")
 
         # Copy Total_demand.csv file which is required for thermal network simulation
         total_demand_file = source_locator.get_total_demand()
@@ -1225,6 +1215,12 @@ class DynamicDTNOptimizer:
         tn_config = self._create_config_copy()
         tn_config.scenario = temp_scenario_dir
         tn_config.thermal_network.network_type = self.network_type
+        # Dynamic Part 1 always recalculates edge flows when rerunning TN Part 2
+        try:
+            tn_config.thermal_network.load_max_edge_flowrate_from_previous_run = False
+            self.logger.info("Dynamic DTN Part 1: Forcing thermal-network:load-max-edge-flowrate-from-previous-run = False to recompute edge flows.")
+        except Exception:
+            pass
 
         # Diagnostics: more verbose logs and no multiprocessing buffering
         # (prevents Windows child process issues and shows progress)

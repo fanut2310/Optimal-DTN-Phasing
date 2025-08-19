@@ -394,6 +394,7 @@ Energy Supply System Optimisation:
 
                   # Thermal network simulation controls (Part 2 & 3)
                   'thermal-network:network-model',
+                  'thermal-network:disconnected-buildings',
                   'thermal-network:load-max-edge-flowrate-from-previous-run',
                   'thermal-network:use-representative-week-per-month',
                   'thermal-network:start-t',

@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 import re
 import sys
+import logging
 
 import cea.config
 import cea.inputlocator
@@ -618,7 +619,26 @@ def prepare_inputs_of_representative_weeks(thermal_network):
     thermal_network.T_ground_K = [value for index, value in enumerate(thermal_network.T_ground_K) if
                                   index in hours_list]
     for building in thermal_network.buildings_demands.keys():
-        thermal_network.buildings_demands[building] = thermal_network.buildings_demands[building].iloc[hours_list]
+        df = thermal_network.buildings_demands[building]
+        if df is None or (hasattr(df, 'empty') and df.empty):
+            logging.getLogger('cea').error(
+                f"Representative weeks: empty demand DataFrame for building '{building}'. "
+                f"Ensure this consumer has valid hourly demand data (heating/DHW) or add it to disconnected-buildings. "
+                f"Also verify thermal-network:substation-heating-systems matches available streams (e.g., ['shu','ww']).")
+            raise ValueError(f"Empty demand for building {building} under representative weeks.")
+        # Slice representative weeks
+        df = df.iloc[hours_list]
+        # Validate resulting length
+        try:
+            df_len = len(df)
+        except Exception:
+            df_len = -1
+        if df_len != 2016:
+            logging.getLogger('cea').error(
+                f"Representative weeks: sliced demand for building '{building}' has {df_len} rows; expected 2016. "
+                f"Check start-t/stop-t and representative-week settings, and demand outputs.")
+            raise ValueError(f"Invalid representative-week slice for building {building}: {df_len} rows (expected 2016).")
+        thermal_network.buildings_demands[building] = df
         thermal_network.buildings_demands[building].index = range(0, 2016)
     thermal_network.t_target_supply_C = thermal_network.t_target_supply_C.iloc[hours_list]
     thermal_network.t_target_supply_C.index = range(0, 2016)

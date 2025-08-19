@@ -1294,10 +1294,54 @@ class DTNExpansionOptimizer:
         emis_pump_t = (pump_electricity_kwh * ef_grid) / 1000.0
 
         # Aggregate
-        total_t = float(df['Emis_total_t'].sum()) + emis_pump_t
+        total_no_pump = float(df['Emis_total_t'].sum())
+        total_t = total_no_pump + emis_pump_t
         gfa = float(df['GFA_m2'].sum())
         kg_per_m2_yr = (total_t * 1000.0 / gfa) if gfa > 0 else 0.0
-        return total_t, kg_per_m2_yr
+
+        # Build breakdown and EF mapping for diagnostics
+        emis_breakdown = {
+            'emis_cooling_t': float(df['Emis_cool_t'].sum()),
+            'emis_heating_t': float(df['Emis_hs_t'].sum()),
+            'emis_dhw_t': float(df['Emis_dhw_t'].sum()),
+            'emis_electricity_t': float(df['Emis_el_t'].sum()),
+            'emis_pump_t': float(emis_pump_t),
+            'emis_total_t': float(total_t),
+            'ef_grid_kg_per_kwh': float(ef_grid),
+        }
+        # PV or SOLAR EF if available
+        try:
+            if 'PV' in ef_simple['code'].values:
+                emis_breakdown['ef_pv_kg_per_kwh'] = float(ef_kg_per_kwh('PV'))
+            elif 'SOLAR' in ef_simple['code'].values:
+                emis_breakdown['ef_pv_kg_per_kwh'] = float(ef_kg_per_kwh('SOLAR'))
+        except Exception:
+            pass
+        # Add EF mapping for feedstocks used this phase (hs/dhw/cs)
+        used_feedstocks = set(str(x).upper() for x in pd.concat([
+            df['feedstock_cs'], df['feedstock_hs'], df['feedstock_dhw']
+        ]).dropna().unique().tolist())
+        feedstock_efs = {}
+        for fs in sorted(used_feedstocks):
+            try:
+                feedstock_efs[fs] = float(ef_kg_per_kwh(fs))
+            except Exception:
+                # Skip unknowns
+                continue
+        # Store as JSON string for CSV friendliness
+        try:
+            import json as _json
+            emis_breakdown['feedstock_efs_json'] = _json.dumps(feedstock_efs)
+        except Exception:
+            emis_breakdown['feedstock_efs_json'] = str(feedstock_efs)
+
+        # Debug log one-line breakdown
+        log().debug(f"Emissions breakdown: COOL={emis_breakdown['emis_cooling_t']:.2f} t, "
+                    f"HS={emis_breakdown['emis_heating_t']:.2f} t, DHW={emis_breakdown['emis_dhw_t']:.2f} t, "
+                    f"EL={emis_breakdown['emis_electricity_t']:.2f} t, PUMP={emis_breakdown['emis_pump_t']:.2f} t, "
+                    f"TOTAL={emis_breakdown['emis_total_t']:.2f} t")
+
+        return total_t, kg_per_m2_yr, emis_breakdown
 
     def calculate_district_emissions_new(self):
         """
@@ -1350,6 +1394,9 @@ class DTNExpansionOptimizer:
         original_supply_df.to_csv(phase0_supply_path, index=False)
         log().debug(f"Created phase 0 supply file: {phase0_supply_path}")
 
+        # Prepare per-phase breakdown collection
+        breakdown_rows = []
+
         # Load demand once for GFA denominators
         _demand_df = pd.read_csv(self.locator.get_total_demand())
         _total_gfa_const = float(_demand_df['GFA_m2'].sum())
@@ -1358,7 +1405,11 @@ class DTNExpansionOptimizer:
         # Phase 0 emissions: COP-based if enabled, else use LCA operation
         if self.compute_emissions_from_cop:
             # District-wide scope: ALL buildings
-            total_ghg, _ = self._compute_phase_emissions_from_cop(phase0_supply_path, scope_buildings=None, pump_electricity_kwh=0.0)
+            total_ghg, _, breakdown = self._compute_phase_emissions_from_cop(phase0_supply_path, scope_buildings=None, pump_electricity_kwh=0.0)
+            # Collect breakdown row for phase 0
+            row0 = {'phase': 0, 'cumulative_clusters': '0'}
+            row0.update(breakdown)
+            breakdown_rows.append(row0)
         else:
             from cea.analysis.lca.operation import lca_operation
             lca_operation(self.locator, custom_supply_path=str(phase0_supply_path))
@@ -1447,7 +1498,12 @@ class DTNExpansionOptimizer:
                     raise
                 pump_electricity_kwh = pump_electricity_wh / 1000.0
                 # District-wide emissions for ALL buildings
-                total_ghg, _ = self._compute_phase_emissions_from_cop(phase_supply_path, scope_buildings=None, pump_electricity_kwh=pump_electricity_kwh)
+                total_ghg, _, breakdown = self._compute_phase_emissions_from_cop(phase_supply_path, scope_buildings=None, pump_electricity_kwh=pump_electricity_kwh)
+                # Collect breakdown row for this phase
+                cum_clusters_str = '+'.join(map(str, sorted(set(connected_clusters))))
+                rowp = {'phase': phase, 'cumulative_clusters': cum_clusters_str}
+                rowp.update(breakdown)
+                breakdown_rows.append(rowp)
             else:
                 # Run LCA operation module with the phase-specific supply file
                 from cea.analysis.lca.operation import lca_operation
@@ -1469,6 +1525,16 @@ class DTNExpansionOptimizer:
                 'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': per_total,
                 'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': per_connected
             }
+
+        # Write breakdown CSV if available
+        try:
+            if breakdown_rows:
+                breakdown_df = pd.DataFrame(breakdown_rows)
+                breakdown_file = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "emissions_breakdown_by_phase.csv"
+                breakdown_df.to_csv(breakdown_file, index=False)
+                log().debug(f"Saved emissions breakdown by phase to {breakdown_file}")
+        except Exception as e:
+            log().warning(f"Could not write emissions breakdown CSV: {e}")
 
         return results
 

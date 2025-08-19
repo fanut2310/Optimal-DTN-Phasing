@@ -612,12 +612,24 @@ def output_hex_specs_at_nodes(substation_HEX_Q, thermal_network):
 
 
 def prepare_inputs_of_representative_weeks(thermal_network):
-    hours_list = chain(range(0, 168), range(744, 912), range(1416, 1584), range(2160, 2328), range(2880, 3048),
-                       range(3624, 3792), range(4344, 4512), range(5088, 5256), range(5832, 6000), range(6522, 6690),
-                       range(7296, 7464), range(8016, 8184))
+    # materialize indices to avoid exhausting iterators when used multiple times
+    hours_list = list(chain(
+        range(0, 168),        # Jan
+        range(744, 912),      # Feb
+        range(1416, 1584),    # Mar
+        range(2160, 2328),    # Apr
+        range(2880, 3048),    # May
+        range(3624, 3792),    # Jun
+        range(4344, 4512),    # Jul
+        range(5088, 5256),    # Aug
+        range(5832, 6000),    # Sep
+        range(6522, 6690),    # Oct
+        range(7296, 7464),    # Nov
+        range(8016, 8184)     # Dec
+    ))
     # cut out relevant parts of all dataframes
-    thermal_network.T_ground_K = [value for index, value in enumerate(thermal_network.T_ground_K) if
-                                  index in hours_list]
+    # T_ground_K is a Python list; slice by precomputed indices
+    thermal_network.T_ground_K = [thermal_network.T_ground_K[i] for i in hours_list]
     for building in thermal_network.buildings_demands.keys():
         df = thermal_network.buildings_demands[building]
         if df is None or (hasattr(df, 'empty') and df.empty):

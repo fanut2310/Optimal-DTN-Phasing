@@ -461,12 +461,7 @@ def thermal_network_main(locator, thermal_network, processes=1):
         if thermal_network.use_representative_week_per_month:
             # need to repeat lines to make sure our outputs have 8760 timesteps. Otherwise plots
             # and network optimization will fail as they expect 8760 timesteps.
-            edge_mass_flow_for_csv = pd.DataFrame(thermal_network.edge_mass_flow_df)
-            # we need to extrapolate 8760 datapoints from 2016 points from our representative weeks.
-            # To do this, the initial dataset is repeated 4 times, the remaining values are filled with the average values of all above.
-            edge_mass_flow_for_csv = pd.concat([edge_mass_flow_for_csv] * 4, ignore_index=True)
-            while len(edge_mass_flow_for_csv.index) < HOURS_IN_YEAR:
-                edge_mass_flow_for_csv = edge_mass_flow_for_csv.append(edge_mass_flow_for_csv.mean(), ignore_index=True)
+            edge_mass_flow_for_csv = extrapolate_datapoints_for_representative_weeks(thermal_network.edge_mass_flow_df)
             edge_mass_flow_for_csv.to_csv(
                 thermal_network.locator.get_nominal_edge_mass_flow_csv_file(thermal_network.network_type,
                                                                             thermal_network.network_name), index=False)
@@ -950,11 +945,37 @@ def save_all_results_to_csv(csv_outputs, thermal_network):
 
 
 def extrapolate_datapoints_for_representative_weeks(representative_week_data):
-    representative_week_df = pd.DataFrame(representative_week_data)
-    representative_week_df = pd.concat([representative_week_df] * 4, ignore_index=True)
-    while len(representative_week_df.index) < HOURS_IN_YEAR:
-        representative_week_df = representative_week_df.append(representative_week_df.mean(), ignore_index=True)
-    return representative_week_df
+    """
+    Expand 2016-hour representative-week data to a full year (8760 hours) without using deprecated pandas APIs.
+
+    Logic:
+    - Repeat the 2016-hour dataset 4 times => 8064 rows
+    - Fill the remaining rows (8760 - 8064 = 696) with the column-wise mean values
+    - If input happens to be longer than expected after repetition, truncate to 8760
+
+    Returns a DataFrame with the same columns and row order preserved.
+    """
+    df = pd.DataFrame(representative_week_data)
+
+    # Repeat 4 times
+    df = pd.concat([df] * 4, ignore_index=True)
+
+    # Adjust length to HOURS_IN_YEAR
+    current_len = len(df)
+    target_len = HOURS_IN_YEAR
+    if current_len < target_len:
+        missing = target_len - current_len
+        # numeric_only=True ensures non-numeric columns are ignored in the mean
+        mean_row = df.mean(numeric_only=True)
+        filler = pd.DataFrame([mean_row] * missing)
+        # Reindex to preserve original column order and include any non-numeric columns as NaN
+        filler = filler.reindex(columns=df.columns)
+        df = pd.concat([df, filler], ignore_index=True)
+    elif current_len > target_len:
+        # Truncate any excess rows just in case
+        df = df.iloc[:target_len].reset_index(drop=True)
+
+    return df
 
 
 

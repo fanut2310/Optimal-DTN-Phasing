@@ -1222,11 +1222,21 @@ class DynamicDTNOptimizer:
         except Exception:
             pass
 
-        # Diagnostics: more verbose logs and no multiprocessing buffering
-        # (prevents Windows child process issues and shows progress)
-        tn_config.general.debug = True
+        # Honor user-configured debug & multiprocessing settings from the CLI
         try:
-            tn_config.general.multiprocessing = False
+            tn_config.general.debug = bool(getattr(self.config.general, "debug", False))
+        except Exception:
+            pass
+
+        try:
+            tn_config.general.multiprocessing = bool(getattr(self.config.general, "multiprocessing", True))
+        except Exception:
+            pass
+
+        try:
+            tn_config.general.number_of_cpus_to_keep_free = getattr(
+                self.config.general, "number_of_cpus_to_keep_free", 1
+            )
         except Exception:
             pass
 

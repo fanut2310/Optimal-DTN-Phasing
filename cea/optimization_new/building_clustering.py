@@ -451,34 +451,199 @@ def final_force_assign(df, max_distance=200, avoid_cluster0=True):
     return df
 
 
-def create_micro_clusters_for_noise(df, start_from_next=True, log_diagnostics=True):
+def _nearest_distances_to_nonzero_and_c0(df):
     """
-    Convert any remaining noise points (-1) into singleton clusters.
-    Guarantees zero -1 without long-distance snapping and leaves cluster 0 reserved.
+    For diagnostics: for each -1 building, compute distance to nearest non-zero
+    cluster member and to nearest cluster-0 member (if any). Returns list of dicts.
     """
-    df = df.copy()
-    if 'cluster' not in df.columns:
-        return df
+    import numpy as np
+    from scipy.spatial import cKDTree
 
-    labels = df['cluster'].values.copy()
+    if 'cluster' not in df.columns:
+        return []
+
+    coords = df[['x', 'y']].values
+    labels = df['cluster'].values
+    names = df['name'].astype(str).values if 'name' in df.columns else np.arange(len(df)).astype(str)
+
     noise_idx = np.where(labels == -1)[0]
     if noise_idx.size == 0:
-        return df
+        return []
 
-    next_id = int(df['cluster'].max()) + 1 if start_from_next else 1
-    created = 0
+    # Non-zero members
+    nz_idx = np.where(labels >= 1)[0]
+    tree_nz = cKDTree(coords[nz_idx]) if nz_idx.size else None
+
+    # Cluster 0 members
+    c0_idx = np.where(labels == 0)[0]
+    tree_c0 = cKDTree(coords[c0_idx]) if c0_idx.size else None
+
+    diagnostics = []
     for i in noise_idx:
-        bname = str(df.iloc[i]['name']) if 'name' in df.columns else str(i)
-        labels[i] = next_id
-        created += 1
-        if log_diagnostics:
-            print(f"final-fallback: {bname} -1 -> new cluster {next_id} (singleton micro-cluster)")
-        next_id += 1
+        row = {'building': names[i]}
+        if tree_nz:
+            d, j = tree_nz.query(coords[i], k=1)
+            row['d_nearest_nonzero_m'] = float(d)
+            row['nearest_nonzero_building'] = names[nz_idx[j]]
+        else:
+            row['d_nearest_nonzero_m'] = None
+            row['nearest_nonzero_building'] = None
 
-    df['cluster'] = labels
-    remaining = int((df['cluster'] == -1).sum())
-    print(f"final-fallback: created {created} singleton micro-clusters; remaining -1: {remaining}")
-    return df
+        if tree_c0:
+            d0, j0 = tree_c0.query(coords[i], k=1)
+            row['d_nearest_c0_m'] = float(d0)
+            row['nearest_c0_building'] = names[c0_idx[j0]]
+        else:
+            row['d_nearest_c0_m'] = None
+            row['nearest_c0_building'] = None
+
+        diagnostics.append(row)
+    return diagnostics
+
+
+def suggest_parameter_tweaks(algorithm,
+                             noise_reassign_distance,
+                             min_samples,
+                             min_cluster_size,
+                             spatial_weight,
+                             cluster_selection_method,
+                             ensure_min_use_types,
+                             max_demand_ratio,
+                             pin_existing_to_cluster0,
+                             notes=None):
+    """
+    Build a concise suggestions string tailored to the current settings.
+    """
+    algo = (algorithm or '').lower()
+    lines = []
+    lines.append("Suggested adjustments to resolve -1 (try 1–2 at a time):")
+
+    if algo == 'hdbscan':
+        # Reassignment radius tuning
+        if noise_reassign_distance is not None:
+            if noise_reassign_distance < 120:
+                lines.append(f"- Increase noise-reassign-distance to 150–180 m (current: {noise_reassign_distance}).")
+            elif 120 <= noise_reassign_distance < 180:
+                lines.append(f"- Slightly raise noise-reassign-distance to 170–200 m (current: {noise_reassign_distance}).")
+            else:
+                lines.append(f"- You already use a relatively large noise-reassign-distance ({noise_reassign_distance}).")
+        else:
+            lines.append("- Set noise-reassign-distance to 150–180 m (e.g., 150).")
+
+        # Density parameters
+        if min_samples is None:
+            lines.append("- Set min-samples=4–6 (None can be permissive in some cases).")
+        elif min_samples > 7:
+            lines.append(f"- Reduce min-samples to 4–6 to lower initial noise (current: {min_samples}).")
+        else:
+            lines.append(f"- If many points are still noise, try min-samples around 4–5 (current: {min_samples}).")
+
+        if min_cluster_size and min_cluster_size > 6:
+            lines.append(f"- Reduce min-cluster-size to 4–6 for more localized dense regions (current: {min_cluster_size}).")
+
+        # Spatial emphasis
+        if spatial_weight is not None:
+            if spatial_weight < 50:
+                lines.append(f"- Increase spatial-weight to 60–75 for more spatially compact clusters (current: {spatial_weight}).")
+            else:
+                lines.append(f"- spatial-weight {spatial_weight} is already high; keep it for road-respecting clusters.")
+
+        # Selection method
+        if (cluster_selection_method or '').lower() != 'leaf':
+            lines.append(f"- Use cluster-selection-method=leaf for more granular, compact clusters (current: {cluster_selection_method}).")
+
+        # Attribute constraints
+        if ensure_min_use_types:
+            lines.append("- Disable ensure-min-use-types or set min-use-types-per-cluster=1 to avoid attribute pulls.")
+        if max_demand_ratio is not None and max_demand_ratio < 2.5:
+            lines.append(f"- Relax max-demand-ratio to 2.5–3.5 (current: {max_demand_ratio}).")
+
+        # Pinning note
+        if pin_existing_to_cluster0:
+            lines.append("- Keep pinning to 0 if required, but note it can stretch cluster 0; radius increase may be needed.")
+
+        lines.append("- If a few points remain isolated even after tuning, consider a small post pass to attach by nearest neighbor within 150–180 m.")
+
+    elif algo == 'kmeans':
+        lines.append("- KMeans assigns every point to a cluster by design; -1 usually indicates a post-process filter expelled points.")
+        lines.append("- Disable/relax any isolation filters or reassignment limits that set labels back to -1.")
+        if spatial_weight is not None and spatial_weight < 50:
+            lines.append(f"- Increase spatial-weight to 50–60 for more compact clusters (current: {spatial_weight}).")
+        lines.append("- Ensure pinning/cluster-0 reservation doesn't inadvertently expel non-DTN buildings as -1.")
+
+    else:
+        lines.append("- Unknown algorithm; verify 'building-clustering:clustering-algorithm' in config (kmeans|hdbscan).")
+
+    if notes:
+        lines.append("")
+        lines.append("Diagnostics:")
+        lines.extend([f"- {n}" for n in notes])
+
+    return "\n".join(lines)
+
+
+def validate_no_noise(final_df,
+                      algorithm,
+                      noise_reassign_distance,
+                      min_samples,
+                      min_cluster_size,
+                      spatial_weight,
+                      cluster_selection_method,
+                      ensure_min_use_types,
+                      max_demand_ratio,
+                      pin_existing_to_cluster0):
+    """
+    Fail-fast: if any cluster == -1 remains, print diagnostics and suggestions, then exit with error.
+    Call this before saving outputs.
+    """
+    import numpy as np
+
+    if 'cluster' not in final_df.columns:
+        return  # nothing to validate
+
+    n_noise = int((final_df['cluster'] == -1).sum())
+    if n_noise == 0:
+        return
+
+    # Diagnostics: list some -1 buildings and distances
+    diags = _nearest_distances_to_nonzero_and_c0(final_df)
+    notes = []
+    if diags:
+        for d in diags[:10]:  # limit printed diagnostics
+            b = d.get('building')
+            d_nz = d.get('d_nearest_nonzero_m')
+            d_c0 = d.get('d_nearest_c0_m')
+            if d_nz is not None:
+                notes.append(f"{b}: nearest non-zero {d_nz:.1f} m; nearest cluster 0 {d_c0:.1f} m")
+            else:
+                notes.append(f"{b}: no non-zero cluster available; nearest cluster 0 {d_c0:.1f} m")
+
+    msg = []
+    msg.append("ERROR: Some buildings remain unassigned (cluster = -1).")
+    msg.append(f"- Count of -1 buildings: {n_noise}")
+    if notes:
+        msg.append("- Example nearest-neighbor diagnostics:")
+        msg.extend([f"  • {n}" for n in notes])
+
+    suggestions = suggest_parameter_tweaks(
+        algorithm=algorithm,
+        noise_reassign_distance=noise_reassign_distance,
+        min_samples=min_samples,
+        min_cluster_size=min_cluster_size,
+        spatial_weight=spatial_weight,
+        cluster_selection_method=cluster_selection_method,
+        ensure_min_use_types=ensure_min_use_types,
+        max_demand_ratio=max_demand_ratio,
+        pin_existing_to_cluster0=pin_existing_to_cluster0,
+        notes=None
+    )
+
+    msg.append("")
+    msg.append(suggestions)
+    print("\n".join(msg))
+
+    # Stop execution with non-zero exit so upstream tooling / pipelines can detect failure
+    raise SystemExit(1)
 
 # For spatial-only feature preparation
 def prepare_features(merged_df, heat_col='QH_sys_MWhyr', spatial_weight=25.0,
@@ -1179,8 +1344,19 @@ def cluster_buildings(buildings_shp, demand_df, locator,
     # Final forced assignment for any remaining noise (-1) within the configured distance
     final_df = final_force_assign(final_df, max_distance=noise_reassign_distance, avoid_cluster0=True)
 
-    # Convert any leftover -1 into singleton micro-clusters (guarantee zero -1)
-    final_df = create_micro_clusters_for_noise(final_df)
+    # Fail-fast if -1 remains: print suggestions and abort so user can adjust parameters
+    validate_no_noise(
+        final_df=final_df,
+        algorithm=clustering_algorithm,
+        noise_reassign_distance=noise_reassign_distance,
+        min_samples=min_samples,
+        min_cluster_size=min_cluster_size,
+        spatial_weight=spatial_weight,
+        cluster_selection_method=cluster_selection_method,
+        ensure_min_use_types=ensure_min_use_types,
+        max_demand_ratio=max_demand_ratio,
+        pin_existing_to_cluster0=pin_existing_to_cluster0
+    )
 
     # Save results
     out_csv, out_shp = save_results(final_df, locator)

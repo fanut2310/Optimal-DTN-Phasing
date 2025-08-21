@@ -450,6 +450,36 @@ def final_force_assign(df, max_distance=200, avoid_cluster0=True):
     print(f"Final force-assign: reassigned {reassigned}; remaining -1: {remaining}")
     return df
 
+
+def create_micro_clusters_for_noise(df, start_from_next=True, log_diagnostics=True):
+    """
+    Convert any remaining noise points (-1) into singleton clusters.
+    Guarantees zero -1 without long-distance snapping and leaves cluster 0 reserved.
+    """
+    df = df.copy()
+    if 'cluster' not in df.columns:
+        return df
+
+    labels = df['cluster'].values.copy()
+    noise_idx = np.where(labels == -1)[0]
+    if noise_idx.size == 0:
+        return df
+
+    next_id = int(df['cluster'].max()) + 1 if start_from_next else 1
+    created = 0
+    for i in noise_idx:
+        bname = str(df.iloc[i]['name']) if 'name' in df.columns else str(i)
+        labels[i] = next_id
+        created += 1
+        if log_diagnostics:
+            print(f"final-fallback: {bname} -1 -> new cluster {next_id} (singleton micro-cluster)")
+        next_id += 1
+
+    df['cluster'] = labels
+    remaining = int((df['cluster'] == -1).sum())
+    print(f"final-fallback: created {created} singleton micro-clusters; remaining -1: {remaining}")
+    return df
+
 # For spatial-only feature preparation
 def prepare_features(merged_df, heat_col='QH_sys_MWhyr', spatial_weight=25.0,
                      use_type_weight=1.0, year_weight=1.0,
@@ -1148,6 +1178,9 @@ def cluster_buildings(buildings_shp, demand_df, locator,
 
     # Final forced assignment for any remaining noise (-1) within the configured distance
     final_df = final_force_assign(final_df, max_distance=noise_reassign_distance, avoid_cluster0=True)
+
+    # Convert any leftover -1 into singleton micro-clusters (guarantee zero -1)
+    final_df = create_micro_clusters_for_noise(final_df)
 
     # Save results
     out_csv, out_shp = save_results(final_df, locator)

@@ -363,6 +363,93 @@ def reassign_noise(df, max_distance=200):
     print("DEBUG: After reassignment in function, number of noise points (-1):", sum(df['cluster'] == -1))
     return df
 
+
+def reserve_cluster_zero(df):
+    """
+    Ensure only buildings flagged as in_existing_DTN remain in cluster 0.
+    Any non-listed building with cluster == 0 is moved to the nearest non-zero cluster
+    based on nearest-member distance. Returns a modified copy of df.
+    """
+    if 'in_existing_DTN' not in df.columns:
+        return df
+    moved = 0
+    df = df.copy()
+    # Indices of illegal members in cluster 0
+    illegal_mask = (df['cluster'] == 0) & (~df['in_existing_DTN'].astype(bool))
+    if not illegal_mask.any():
+        return df
+
+    coords_all = df[['x', 'y']].values
+    idx_all = np.arange(len(df))
+
+    # Candidate indices to snap to: clusters >= 1
+    candidate_mask = df['cluster'] >= 1
+    if not candidate_mask.any():
+        # Fallback: if no non-zero clusters exist, move to cluster 1
+        df.loc[illegal_mask, 'cluster'] = 1
+        print(f"reserve_cluster_zero: moved {illegal_mask.sum()} buildings from 0 to 1 (no other clusters found).")
+        return df
+
+    candidate_idx = np.where(candidate_mask)[0]
+    tree = cKDTree(coords_all[candidate_idx])
+
+    illegal_idx = np.where(illegal_mask)[0]
+    for i in illegal_idx:
+        p = coords_all[i]
+        dist, j = tree.query(p, k=1)
+        target_row = candidate_idx[j]
+        new_label = int(df.iloc[target_row]['cluster'])
+        old_label = int(df.iloc[i]['cluster'])
+        df.iat[i, df.columns.get_loc('cluster')] = new_label
+        moved += 1
+        print(f"reserve-cluster-0: {df.iloc[i]['name']} moved {old_label} -> {new_label} (nearest-member distance {dist:.1f} m)")
+
+    print(f"reserve-cluster-0: moved {moved} non-listed buildings out of cluster 0.")
+    return df
+
+
+def final_force_assign(df, max_distance=200, avoid_cluster0=True):
+    """
+    Final pass to assign any remaining noise points (-1) to the nearest existing cluster member
+    within max_distance. Optionally avoids assigning to cluster 0.
+    """
+    df = df.copy()
+    if 'cluster' not in df.columns:
+        return df
+    coords = df[['x', 'y']].values
+    labels = df['cluster'].values.copy()
+
+    # Build candidate mask
+    candidate_mask = labels >= 0
+    if avoid_cluster0:
+        candidate_mask &= labels != 0
+
+    if not np.any(candidate_mask):
+        return df
+
+    candidate_idx = np.where(candidate_mask)[0]
+    tree = cKDTree(coords[candidate_idx])
+
+    noise_idx = np.where(labels == -1)[0]
+    if noise_idx.size == 0:
+        return df
+
+    reassigned = 0
+    for i in noise_idx:
+        p = coords[i]
+        dist, j = tree.query(p, k=1)
+        if dist <= max_distance:
+            target_row = candidate_idx[j]
+            new_label = int(labels[target_row])
+            labels[i] = new_label
+            reassigned += 1
+            print(f"final-force-assign: {df.iloc[i]['name']} -1 -> {new_label} (nearest-member distance {dist:.1f} m)")
+
+    df['cluster'] = labels
+    remaining = int(np.sum(df['cluster'] == -1))
+    print(f"Final force-assign: reassigned {reassigned}; remaining -1: {remaining}")
+    return df
+
 # For spatial-only feature preparation
 def prepare_features(merged_df, heat_col='QH_sys_MWhyr', spatial_weight=25.0,
                      use_type_weight=1.0, year_weight=1.0,
@@ -1055,6 +1142,12 @@ def cluster_buildings(buildings_shp, demand_df, locator,
                 print("Pinning requested, but none of the provided existing DTN buildings were found in the merged dataset.")
         except Exception as e:
             print(f"Warning: pin_existing_to_cluster0 encountered an issue: {e}")
+
+    # Enforce cluster-0 reservation strictly for existing DTN buildings
+    final_df = reserve_cluster_zero(final_df)
+
+    # Final forced assignment for any remaining noise (-1) within the configured distance
+    final_df = final_force_assign(final_df, max_distance=noise_reassign_distance, avoid_cluster0=True)
 
     # Save results
     out_csv, out_shp = save_results(final_df, locator)

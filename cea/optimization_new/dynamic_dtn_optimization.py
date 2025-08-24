@@ -507,6 +507,7 @@ class DynamicDTNOptimizer:
         (target_path / "inputs" / "database" / "COMPONENTS" / "DISTRIBUTION").mkdir(parents=True, exist_ok=True)
         (target_path / "inputs" / "database" / "COMPONENTS" / "FEEDSTOCKS").mkdir(parents=True, exist_ok=True)
         (target_path / "inputs" / "database" / "COMPONENTS" / "FEEDSTOCKS" / "FEEDSTOCKS_LIBRARY").mkdir(parents=True, exist_ok=True)
+        (target_path / "inputs" / "database" / "ASSEMBLIES" / "SUPPLY").mkdir(parents=True, exist_ok=True)
 
         # Copy all CONVERSION files (including HEAT_EXCHANGERS.csv, HYDRAULICS.csv, VAPOR_COMPRESSION.csv, COOLING_TOWER.csv)
         conversion_folder = source_locator.get_db4_components_conversion_folder()
@@ -559,6 +560,50 @@ class DynamicDTNOptimizer:
                     self.logger.info(f"Copied {file} from {source_file}")
         else:
             self.logger.warning(f"Feedstocks library folder not found at {feedstocks_library_folder}")
+
+        # Copy ASSEMBLIES/SUPPLY files required by the LCA module
+        try:
+            heating_csv = source_locator.get_database_assemblies_supply_heating()
+            supply_src_dir = os.path.dirname(heating_csv)
+        except Exception:
+            # Fallback to standard folder path
+            supply_src_dir = os.path.join(source_scenario, 'inputs', 'database', 'ASSEMBLIES', 'SUPPLY')
+        supply_dst_dir = target_path / 'inputs' / 'database' / 'ASSEMBLIES' / 'SUPPLY'
+        if os.path.exists(supply_src_dir):
+            self.logger.info(f"Copying ASSEMBLIES/SUPPLY files from {supply_src_dir}")
+            for file in os.listdir(supply_src_dir):
+                if file.lower().endswith('.csv'):
+                    src = os.path.join(supply_src_dir, file)
+                    dst = supply_dst_dir / file
+                    try:
+                        shutil.copy2(src, dst)
+                        self.logger.info(f"Copied {file} from {src}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to copy {src} -> {dst}: {e}")
+        else:
+            self.logger.warning(f"ASSEMBLIES/SUPPLY folder not found at {supply_src_dir}")
+
+        # Optionally copy inputs/archetypes (not strictly required for LCA, but useful for completeness)
+        try:
+            arche_src = os.path.join(source_scenario, 'inputs', 'archetypes')
+            arche_dst = target_path / 'inputs' / 'archetypes'
+            if os.path.exists(arche_src):
+                self.logger.info(f"Copying archetypes folder from {arche_src}")
+                for root, dirs, files in os.walk(arche_src):
+                    rel = os.path.relpath(root, arche_src)
+                    dst_root = arche_dst / rel if rel != '.' else arche_dst
+                    dst_root.mkdir(parents=True, exist_ok=True)
+                    for f in files:
+                        srcf = os.path.join(root, f)
+                        dstf = dst_root / f
+                        try:
+                            shutil.copy2(srcf, dstf)
+                        except Exception as e:
+                            self.logger.warning(f"Failed to copy archetype file {srcf} -> {dstf}: {e}")
+            else:
+                self.logger.info("No inputs/archetypes folder found in source scenario (skip).")
+        except Exception as e:
+            self.logger.warning(f"Error while copying archetypes: {e}")
 
         # Copy thermal network files from the original scenario
         source_thermal_network_dir = Path(source_locator.get_thermal_network_folder()) / self.network_type

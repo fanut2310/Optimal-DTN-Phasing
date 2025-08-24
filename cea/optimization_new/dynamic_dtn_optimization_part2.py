@@ -1369,33 +1369,44 @@ class DTNExpansionOptimizer:
             row0 = {'phase': 0, 'cumulative_clusters': '0'}
             row0.update(breakdown)
             breakdown_rows.append(row0)
+            # In COP mode we don't compute connected-only explicitly here; fall back to total for intensity
+            connected_ghg = total_ghg
         else:
             from cea.analysis.lca.operation import lca_operation
             temp_demand_path = self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand()
             log().info(f"Running LCA operation for phase 0 with:")
             log().info(f"  - Supply path: {phase0_supply_path}")
             log().info(f"  - Demand path: {temp_demand_path}")
-            lca_operation(self.locator, custom_supply_path=str(phase0_supply_path), custom_demand_path=temp_demand_path)
+            # Run LCA using a temp scenario locator so outputs are written under temp_scenario
+            temp_locator = cea.inputlocator.InputLocator(self.locator.get_dynamic_dtn_optimization_temp_scenario_folder())
+            lca_operation(temp_locator, custom_supply_path=str(phase0_supply_path), custom_demand_path=temp_demand_path)
 
-            # Load LCA results (ALL buildings)
-            lca_results_path = self.locator.get_dynamic_dtn_optimization_temp_scenario_lca_operation_file()
+            # Load LCA results (ALL buildings) from temp scenario
+            lca_results_path = temp_locator.get_lca_operation()
             log().info(f"Loading LCA results from: {lca_results_path}")
             lca_operation_results = pd.read_csv(lca_results_path)
             log().info(f"Loaded LCA results with {len(lca_operation_results)} buildings")
             total_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())
+            # Connected-only emissions for Phase 0 (cluster 0)
+            name_col = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
+            if not name_col:
+                raise ValueError("LCA file missing building name column (expected 'name' or 'Name')")
+            conn_set = set(self._get_buildings_in_specific_cluster(0))
+            mask_conn = lca_operation_results[name_col].astype(str).isin(conn_set)
+            connected_ghg = float(lca_operation_results.loc[mask_conn, 'GHG_sys_tonCO2'].sum())
+            # No hybrid replacement for Phase 0; preserve raw LCA totals for comparability
 
         # Compute GFA denominators for phase 0
         _connected_buildings_p0 = set(self._get_buildings_in_specific_cluster(0))
         _connected_gfa_p0 = float(sum(_name_to_gfa.get(b, 0.0) for b in _connected_buildings_p0))
-        per_connected = (total_ghg * 1000.0 / _connected_gfa_p0) if _connected_gfa_p0 > 0 else 0.0
+        per_connected = (connected_ghg * 1000.0 / _connected_gfa_p0) if _connected_gfa_p0 > 0 else 0.0
         per_total = (total_ghg * 1000.0 / _total_gfa_const) if _total_gfa_const > 0 else 0.0
 
-        # Store results for phase 0 (keep legacy key mapped to connected intensity)
+        # Store results for phase 0 (drop legacy per_gfa column)
         results[0] = {
             'district_operation_emission [t CO2eq/yr]': total_ghg,
             'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': per_connected,
-            'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': per_total,
-            'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': per_connected
+            'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': per_total
         }
 
         # Get cluster assignments from current individual
@@ -1470,33 +1481,53 @@ class DTNExpansionOptimizer:
                 rowp = {'phase': phase, 'cumulative_clusters': cum_clusters_str}
                 rowp.update(breakdown)
                 breakdown_rows.append(rowp)
+                # In COP mode, approximate connected-only emissions with total for intensity
+                connected_ghg = total_ghg
             else:
-                # Run LCA operation module with the phase-specific supply file
+                # Run LCA operation module with the phase-specific supply file on temp scenario
                 from cea.analysis.lca.operation import lca_operation
                 temp_demand_path = self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand()
                 log().info(f"Running LCA operation for phase {phase} with:")
                 log().info(f"  - Supply path: {phase_supply_path}")
                 log().info(f"  - Demand path: {temp_demand_path}")
-                lca_operation(self.locator, custom_supply_path=str(phase_supply_path), custom_demand_path=temp_demand_path)
+                temp_locator = cea.inputlocator.InputLocator(self.locator.get_dynamic_dtn_optimization_temp_scenario_folder())
+                lca_operation(temp_locator, custom_supply_path=str(phase_supply_path), custom_demand_path=temp_demand_path)
 
-                # Load LCA results and use ALL buildings
-                lca_results_path = self.locator.get_dynamic_dtn_optimization_temp_scenario_lca_operation_file()
+                # Load LCA results from temp scenario and compute totals and connected-only emissions
+                lca_results_path = temp_locator.get_lca_operation()
                 log().info(f"Loading LCA results from: {lca_results_path}")
                 lca_operation_results = pd.read_csv(lca_results_path)
                 log().info(f"Loaded LCA results with {len(lca_operation_results)} buildings")
                 total_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())
+                name_col = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
+                if not name_col:
+                    raise ValueError("LCA file missing building name column (expected 'name' or 'Name')")
+                conn_set = set(connected_buildings)
+                mask_conn = lca_operation_results[name_col].astype(str).isin(conn_set)
+                connected_ghg = float(lca_operation_results.loc[mask_conn, 'GHG_sys_tonCO2'].sum())
+                # Hybrid adjustment: replace connected-only LCA emissions with COP-based estimation and adjust district total
+                try:
+                    cop_conn_total, _, _ = self._compute_phase_emissions_from_cop(
+                        phase_supply_path,
+                        scope_buildings=list(conn_set),
+                        pump_electricity_kwh=0.0,
+                        custom_demand_path=temp_demand_path
+                    )
+                    total_ghg = total_ghg - connected_ghg + float(cop_conn_total)
+                    connected_ghg = float(cop_conn_total)
+                except Exception as e:
+                    log().warning(f"Hybrid COP adjustment for phase {phase} failed; using LCA-only connected emissions. Error: {e}")
 
             # Compute GFA denominators for this phase
             _connected_gfa = float(sum(_name_to_gfa.get(b, 0.0) for b in set(connected_buildings)))
-            per_connected = (total_ghg * 1000.0 / _connected_gfa) if _connected_gfa > 0 else 0.0
+            per_connected = (connected_ghg * 1000.0 / _connected_gfa) if _connected_gfa > 0 else 0.0
             per_total = (total_ghg * 1000.0 / _total_gfa_const) if _total_gfa_const > 0 else 0.0
 
-            # Store results for this phase (include new columns and legacy mapping)
+            # Store results for this phase (drop legacy per_gfa column)
             results[phase] = {
                 'district_operation_emission [t CO2eq/yr]': total_ghg,
                 'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': per_connected,
-                'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': per_total,
-                'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': per_connected
+                'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': per_total
             }
 
         # Write breakdown CSV if available
@@ -3485,8 +3516,6 @@ class DTNExpansionOptimizer:
                 'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]', 0),
             'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': district_emissions.get(0, {}).get(
                 'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]', 0),
-            'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': district_emissions.get(0, {}).get(
-                'district_operation_emission_per_gfa [kg CO2eq/yr/m2]', 0),
             'new_cluster(s)_discounted_roi [-]': 0,  # Will be calculated if data is available
             'overall_discounted_roi [-]': 0,  # Will be calculated if data is available
             'new_cluster(s)_npv [USD]': 0,  # Will be calculated if data is available
@@ -3499,84 +3528,117 @@ class DTNExpansionOptimizer:
             f'overall_linear_{demand_type}_density [MWh/km/yr]': 0  # Will be calculated if data is available
         }
 
-        # Try to get metrics for cluster 0 if available
-        cluster0_key = '0'
-        if cluster0_key in self.cluster_metrics:
-            metrics = self.cluster_metrics[cluster0_key]
-            annual_demand = metrics.get(f'total_annual_{demand_type}_MWh', 0)
-            pipe_length = metrics.get('total_pipe_length_m', 0)
-
-            # Update phase 0 metrics
-            # Get required pipes for cluster 0 using the same method as for other phases
-            required_pipes = self.get_required_pipes_for_clusters((0,))
-            pipe_length_recalculated = required_pipes['length_m'].sum()
-
-            phase0_result['new_cluster(s)_pipe_length [m]'] = pipe_length_recalculated
-            phase0_result['cumulative_pipe_length [m]'] = pipe_length_recalculated
-            phase0_result[f'new_cluster(s)_annual_{demand_type} [MWh/yr]'] = annual_demand
-            phase0_result[f'cumulative_annual_{demand_type} [MWh/yr]'] = annual_demand
-            phase0_result[f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]'] = metrics.get(
-                f'linear_{demand_type}_density_MWh_per_km', 0)
-            # Recalculate overall linear heat density for consistency
-            if pipe_length_recalculated > 0:
-                phase0_result[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = annual_demand / (
-                            pipe_length_recalculated / 1000)
+        # Try to freeze Phase 0 to baseline results; else use header-only semantics
+        try:
+            baseline_file = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / f"dtn_expansion_opt_results_{self.network_type}.csv"
+            if baseline_file.exists():
+                base_df = pd.read_csv(baseline_file)
+                base0 = None
+                if 'phase' in base_df.columns:
+                    try:
+                        base0 = base_df.loc[base_df['phase'].astype(str) == '0']
+                    except Exception:
+                        base0 = base_df.loc[base_df['phase'] == 0]
+                    if base0 is not None and base0.empty:
+                        base0 = None
+                if base0 is None and 'year' in base_df.columns:
+                    base0 = base_df[base_df['year'].astype(str).str.contains('Year 0', na=False)]
+                if base0 is not None and not base0.empty:
+                    base0d = base0.iloc[0].to_dict()
+                    keys_to_copy = [
+                        'new_cluster(s)_capex [USD]',
+                        'cumulative_capex [USD]',
+                        'new_cluster(s)_total_expenditure [USD]',
+                        'cumulative_total_expenditure [USD]',
+                        'new_cluster(s)_revenue [USD]',
+                        'cumulative_revenue [USD]',
+                        'new_cluster(s)_om_cost [USD]',
+                        'cumulative_om_cost [USD]',
+                        'new_cluster(s)_npv [USD]',
+                        'overall_npv [USD]',
+                        'new_cluster(s)_discounted_roi [-]',
+                        'overall_discounted_roi [-]',
+                        'new_cluster(s)_pipe_length [m]',
+                        'cumulative_pipe_length [m]',
+                        f'new_cluster(s)_annual_{demand_type} [MWh/yr]',
+                        f'cumulative_annual_{demand_type} [MWh/yr]',
+                        f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]',
+                        f'overall_linear_{demand_type}_density [MWh/km/yr]',
+                    ]
+                    for k in keys_to_copy:
+                        if k in base0d:
+                            phase0_result[k] = base0d[k]
+                    # Set cumulative pipe length tracker
+                    try:
+                        cumulative_pipe_length = float(phase0_result.get('cumulative_pipe_length [m]', phase0_result.get('new_cluster(s)_pipe_length [m]', 0)))
+                    except Exception:
+                        cumulative_pipe_length = 0
+                else:
+                    log().warning("Baseline Phase 0 row not found; keeping header-only Phase 0 with zeros.")
             else:
-                phase0_result[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = metrics.get(
-                    f'linear_{demand_type}_density_MWh_per_km', 0)
+                log().warning(f"Baseline results not found at {baseline_file}; keeping header-only Phase 0 with zeros.")
+        except Exception as e:
+            log().warning(f"Could not load/copy baseline Phase 0 row: {e}. Keeping header-only Phase 0.")
 
-            # Calculate CAPEX components for cluster 0
-            pipe_capex = self.calculate_detailed_capex((0,))
-            hex_capex = self.calculate_hex_costs((0,))
-            pump_capex, pump_electricity = self.calculate_pump_costs((0,))
-            cooling_plant_capex = 0
-            cooling_plant_electricity = 0
-            if self.network_type == 'DC':
-                cooling_plant_capex, cooling_plant_electricity = self.calculate_cooling_plant_costs((0,))
-
-            # Calculate total CAPEX
-            total_capex = pipe_capex + hex_capex + pump_capex + cooling_plant_capex
-
-            # ---- phase-0 financials -----------------------------------------
-            total_capex_p0 = pipe_capex + hex_capex + pump_capex + cooling_plant_capex
-            phase0_result['new_cluster(s)_capex [USD]'] = total_capex_p0
-            phase0_result['cumulative_capex [USD]'] = total_capex_p0
-
-            # Total expenditure for phase 0 is just CAPEX (no O&M)
-            total_expend_p0 = self._calculate_phase_total_expenditure((0,), 0)
-            phase0_result['new_cluster(s)_total_expenditure [USD]'] = total_expend_p0
-            phase0_result['cumulative_total_expenditure [USD]'] = total_expend_p0
-
-            # For phase 0, revenue should be 0 (no duration, so no "annual demand" and "heat sales")
-            annual_revenue = 0
-
-            # Set revenue to 0 for phase 0
-            phase0_result['new_cluster(s)_revenue [USD]'] = annual_revenue
-            phase0_result['cumulative_revenue [USD]'] = annual_revenue
-
-            # Calculate ROI and NPV for phase 0 - for phase 0, ROI=0 and NPV=-CAPEX
-            roi_p0 = self.calculate_roi((0,), 0)
-            npv_p0 = self.calculate_npv((0,), 0)
-
-            # Update ROI and NPV
-            phase0_result['new_cluster(s)_discounted_roi [-]'] = roi_p0
-            phase0_result['overall_discounted_roi [-]'] = roi_p0
-            phase0_result['new_cluster(s)_npv [USD]'] = npv_p0
-            phase0_result['overall_npv [USD]'] = npv_p0
-
-            # For phase 0, O&M costs are set to 0
-            annual_om_cost = 0
-
-            # Update O&M costs
-            phase0_result['new_cluster(s)_om_cost [USD]'] = annual_om_cost
-            phase0_result['cumulative_om_cost [USD]'] = annual_om_cost
-
-            # Update cumulative pipe length
-            cumulative_pipe_length = pipe_length_recalculated
+        # Emit diagnostics comparing baseline-frozen P0 row vs dynamic rerun P0 technicals (if available)
+        try:
+            diagnostics_rows = []
+            dyn_p0_metrics = self.cluster_metrics.get('0', {})
+            if dyn_p0_metrics:
+                # Determine demand key
+                demand_key_total = f'total_annual_{demand_type}_MWh'
+                dyn_p0_pipe_len = dyn_p0_metrics.get('total_pipe_length_m', None)
+                dyn_p0_ann_demand = dyn_p0_metrics.get(demand_key_total, None)
+                base_p0_pipe_len = phase0_result.get('cumulative_pipe_length [m]', phase0_result.get('new_cluster(s)_pipe_length [m]', None))
+                base_p0_ann_demand = phase0_result.get(f'cumulative_annual_{demand_type} [MWh/yr]', phase0_result.get(f'new_cluster(s)_annual_{demand_type} [MWh/yr]', None))
+                diagnostics_rows.append({
+                    'metric': 'phase0_pipe_length_m',
+                    'baseline_value': base_p0_pipe_len,
+                    'dynamic_value': dyn_p0_pipe_len,
+                    'delta_dynamic_minus_baseline': (float(dyn_p0_pipe_len) - float(base_p0_pipe_len)) if (dyn_p0_pipe_len is not None and base_p0_pipe_len is not None) else None
+                })
+                diagnostics_rows.append({
+                    'metric': f'phase0_cumulative_annual_{demand_type}_MWh',
+                    'baseline_value': base_p0_ann_demand,
+                    'dynamic_value': dyn_p0_ann_demand,
+                    'delta_dynamic_minus_baseline': (float(dyn_p0_ann_demand) - float(base_p0_ann_demand)) if (dyn_p0_ann_demand is not None and base_p0_ann_demand is not None) else None
+                })
+            if diagnostics_rows:
+                diag_df = pd.DataFrame(diagnostics_rows)
+                diag_path = output_dir / 'phase0_freeze_diagnostics.csv'
+                diag_df.to_csv(diag_path, index=False)
+                log().info(f"Wrote Phase 0 freeze diagnostics to {diag_path}")
+        except Exception as e:
+            log().warning(f"Could not write Phase 0 diagnostics: {e}")
 
         results.append(phase0_result)
 
-        # Calculate metrics for each phase
+        # Initialize internal trackers for previous cumulative values to dynamic rerun Phase 0 (if available)
+        prev_cum_pipe_len_internal = None
+        prev_cum_ann_demand_internal = None
+        try:
+            dyn0 = self.cluster_metrics.get('0', {})
+            if dyn0:
+                prev_cum_pipe_len_internal = float(dyn0.get('total_pipe_length_m', 0) or 0)
+                prev_cum_ann_demand_internal = float(dyn0.get(f'total_annual_{demand_type}_MWh', 0) or 0)
+        except Exception:
+            prev_cum_pipe_len_internal = None
+            prev_cum_ann_demand_internal = None
+        # Fallback to baseline-frozen outputs if dynamic values are not available
+        if prev_cum_pipe_len_internal is None:
+            try:
+                prev_cum_pipe_len_internal = float(phase0_result.get('cumulative_pipe_length [m]', phase0_result.get('new_cluster(s)_pipe_length [m]', 0)) or 0)
+            except Exception:
+                prev_cum_pipe_len_internal = 0.0
+        if prev_cum_ann_demand_internal is None:
+            try:
+                prev_cum_ann_demand_internal = float(phase0_result.get(f'cumulative_annual_{demand_type} [MWh/yr]', phase0_result.get(f'new_cluster(s)_annual_{demand_type} [MWh/yr]', 0)) or 0)
+            except Exception:
+                prev_cum_ann_demand_internal = 0.0
+
+        log().info("Phase 0 KPIs frozen to baseline for reporting. Internal deltas initialized from dynamic Phase 0 to avoid negative/biased deltas.")
+
+        # Calculate metrics for each phase using internal trackers for deltas
         for phase, clusters in sorted(solution['phases'].items()):
             # Get buildings in each cluster individually
             newly_connected_buildings = set()
@@ -3613,18 +3675,17 @@ class DTNExpansionOptimizer:
 
             # Calculate new values as the difference between current and previous phase
             # Get the previous phase's cumulative values (phase 0 if this is phase 1)
-            if len(results) > 0:
-                prev_phase_result = results[-1]
-                prev_pipe_length = prev_phase_result.get('cumulative_pipe_length [m]', 0)
-                prev_annual_demand = prev_phase_result.get(f'cumulative_annual_{demand_type} [MWh/yr]', 0)
-            else:
-                # If no previous phase, use zeros
-                prev_pipe_length = 0
-                prev_annual_demand = 0
-
-            # Calculate new values as the difference
+            # Calculate new values as the difference using internal dynamic P0 trackers
+            prev_pipe_length = float(prev_cum_pipe_len_internal or 0)
+            prev_annual_demand = float(prev_cum_ann_demand_internal or 0)
             pipe_length = cumulative_pipe_length - prev_pipe_length
             new_annual_demand = cumulative_annual_demand - prev_annual_demand
+            # Update internal trackers for next phase loop
+            try:
+                prev_cum_pipe_len_internal = float(cumulative_pipe_length or 0)
+                prev_cum_ann_demand_internal = float(cumulative_annual_demand or 0)
+            except Exception:
+                pass
 
             # Calculate overall linear heat density
             overall_linear_density = cumulative_annual_demand / (
@@ -3709,8 +3770,10 @@ class DTNExpansionOptimizer:
                     self.ghg_budget_per_phase) else 'no_limit',
                 'district_operation_emission [t CO2eq/yr]': district_emissions.get(phase, {}).get(
                     'district_operation_emission [t CO2eq/yr]', 0),
-                'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': district_emissions.get(phase, {}).get(
-                    'district_operation_emission_per_gfa [kg CO2eq/yr/m2]', 0),
+                'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': district_emissions.get(phase, {}).get(
+                    'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]', 0),
+                'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': district_emissions.get(phase, {}).get(
+                    'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]', 0),
                 'new_cluster(s)_discounted_roi [-]': roi,
                 'overall_discounted_roi [-]': overall_roi,
                 'new_cluster(s)_npv [USD]': npv,
@@ -3775,8 +3838,6 @@ class DTNExpansionOptimizer:
             'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]', 0),
         'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': district_emissions.get(self.num_phases, {}).get(
             'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]', 0),
-        'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': district_emissions.get(self.num_phases, {}).get(
-            'district_operation_emission_per_gfa [kg CO2eq/yr/m2]', 0),
             'new_cluster(s)_discounted_roi [-]': sum(
                 result['new_cluster(s)_discounted_roi [-]'] * result['new_cluster(s)_capex [USD]'] for result in results
                 if result['phase'] != 0) / sum(
@@ -3811,7 +3872,7 @@ class DTNExpansionOptimizer:
             summary[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = last_phase_result[
                 f'overall_linear_{demand_type}_density [MWh/km/yr]']
         else:
-            # If there are no non-zero phases, use the calculated values
+            # If there are no non-zero phases, use Phase 0 values
             summary['cumulative_cluster(s)'] = '+'.join(map(str, sorted(cumulative_clusters)))
             summary['cumulative_number_of_buildings_connected'] = len(cumulative_buildings)
             summary['cumulative_capex [USD]'] = 0
@@ -3821,9 +3882,11 @@ class DTNExpansionOptimizer:
             summary['cumulative_pipe_length [m]'] = cumulative_pipe_length
             summary[f'cumulative_annual_{demand_type} [MWh/yr]'] = phase0_result.get(
                 f'cumulative_annual_{demand_type} [MWh/yr]', 0)
-            summary[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = 0
-            summary['district_operation_emission [t CO2eq/yr]'] = 0
-            summary['district_operation_emission_per_gfa [kg CO2eq/yr/m2]'] = 0
+            summary[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = phase0_result.get(
+                f'overall_linear_{demand_type}_density [MWh/km/yr]', 0)
+            summary['district_operation_emission [t CO2eq/yr]'] = district_emissions.get(0, {}).get('district_operation_emission [t CO2eq/yr]', 0)
+            summary['district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]'] = district_emissions.get(0, {}).get('district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]', 0)
+            summary['district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]'] = district_emissions.get(0, {}).get('district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]', 0)
 
         # Calculate average newly connected linear heat density (weighted by pipe length) only if not already set
         if summary[f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]'] == 0:

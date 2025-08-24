@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 
 import cea.config
 import cea.inputlocator
@@ -307,6 +308,123 @@ def _compute_genome_deltas(baseline_genome: List[int], rerun_genome: List[int], 
     }
 
 
+def _generate_figures(analysis_dir: Path,
+                      district_deltas: Dict[str, float],
+                      cluster_deltas_df: pd.DataFrame,
+                      baseline_genome: List[int],
+                      rerun_genome: List[int],
+                      clusters_sorted: List[int]) -> None:
+    # Ensure non-interactive backend for headless environments
+    try:
+        plt.switch_backend('Agg')
+    except Exception:
+        pass
+
+    figs_dir = analysis_dir / 'figures'
+    try:
+        figs_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        log().warning(f"Could not create figures folder: {figs_dir}")
+        return
+
+    # 1) District-level totals bar chart
+    try:
+        labels = []
+        base_vals = []
+        mod_vals = []
+        for k_base, k_mod, label in [
+            ('baseline_heating', 'modified_heating', 'Heating'),
+            ('baseline_cooling', 'modified_cooling', 'Cooling'),
+            ('baseline_dhw', 'modified_dhw', 'DHW'),
+            ('baseline_electricity', 'modified_electricity', 'Electricity'),
+        ]:
+            b = district_deltas.get(k_base)
+            m = district_deltas.get(k_mod)
+            if b is not None and m is not None and not (pd.isna(b) or pd.isna(m)):
+                labels.append(label)
+                base_vals.append(float(b))
+                mod_vals.append(float(m))
+        if labels:
+            x = np.arange(len(labels))
+            w = 0.4
+            plt.figure(figsize=(8, 5))
+            plt.bar(x - w/2, base_vals, width=w, label='Baseline')
+            plt.bar(x + w/2, mod_vals, width=w, label='Modified')
+            plt.xticks(x, labels)
+            plt.ylabel('Annual energy (as in Total_demand units)')
+            plt.title('District totals: Baseline vs Modified')
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(figs_dir / 'district_totals_baseline_vs_modified.png', dpi=200)
+            plt.close()
+    except Exception as e:
+        log().warning(f"Failed to create district totals figure: {e}")
+
+    # 2) Cluster-level percent change grouped bars
+    try:
+        if isinstance(cluster_deltas_df, pd.DataFrame) and not cluster_deltas_df.empty:
+            pct_cols = [c for c in cluster_deltas_df.columns if c.endswith('_pct') and any(s in c for s in ['heating','cooling','dhw','electricity'])]
+            if pct_cols and 'cluster' in cluster_deltas_df.columns:
+                dfm = cluster_deltas_df[['cluster'] + pct_cols].copy()
+                # Melt
+                dfm = dfm.melt(id_vars='cluster', var_name='metric', value_name='pct_delta')
+                # Clean names
+                dfm['metric'] = (dfm['metric']
+                                 .str.replace('delta_', '', regex=False)
+                                 .str.replace('_pct', '', regex=False)
+                                 .str.title())
+                # Order clusters
+                try:
+                    heating_abs = dfm[dfm['metric'] == 'Heating'].set_index('cluster')['pct_delta'].abs()
+                    cluster_order = list(heating_abs.sort_values(ascending=False).index)
+                except Exception:
+                    cluster_order = list(dfm.groupby('cluster')['pct_delta'].apply(lambda s: s.abs().mean()).sort_values(ascending=False).index)
+                # Ensure deterministic casting
+                cluster_order = [int(c) if pd.notna(c) else c for c in cluster_order]
+                dfm['cluster'] = pd.Categorical(dfm['cluster'], cluster_order)
+                metrics = sorted(dfm['metric'].dropna().unique().tolist())
+                x = np.arange(len(cluster_order))
+                w = min(0.8/ max(1, len(metrics)), 0.2)
+                plt.figure(figsize=(max(8, len(cluster_order)*0.35), 5))
+                for i, met in enumerate(metrics):
+                    yi = dfm[dfm['metric'] == met].set_index('cluster').reindex(cluster_order)['pct_delta'].values
+                    plt.bar(x + (i - (len(metrics)-1)/2)*w, yi, width=w, label=met)
+                plt.axhline(0, color='k', linewidth=0.8)
+                plt.xticks(x, [str(c) for c in cluster_order], rotation=45)
+                plt.ylabel('Percent change (Δ/Baseline)')
+                plt.title('Cluster-level percent changes')
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(figs_dir / 'cluster_level_percent_changes.png', dpi=200)
+                plt.close()
+    except Exception as e:
+        log().warning(f"Failed to create cluster-level figure: {e}")
+
+    # 3) Genome phase change plot (optional)
+    try:
+        if baseline_genome and rerun_genome and clusters_sorted:
+            n = min(len(baseline_genome), len(rerun_genome), len(clusters_sorted))
+            if n > 0:
+                base = list(map(int, baseline_genome[:n]))
+                new = list(map(int, rerun_genome[:n]))
+                cl = list(map(int, clusters_sorted[:n]))
+                plt.figure(figsize=(max(8, n*0.3), 4))
+                plt.plot(cl, base, marker='o', label='Baseline phase')
+                plt.plot(cl, new, marker='s', label='Rerun phase')
+                for k in range(n):
+                    if base[k] != new[k]:
+                        plt.plot([cl[k], cl[k]], [base[k], new[k]], color='gray', linewidth=0.8)
+                plt.xlabel('Cluster ID')
+                plt.ylabel('Phase')
+                plt.title('Genome phase changes by cluster')
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(figs_dir / 'genome_phase_changes.png', dpi=200)
+                plt.close()
+    except Exception as e:
+        log().warning(f"Failed to create genome phase figure: {e}")
+
+
 def main(config):
     logger = log()
     logger.info("=" * 80)
@@ -418,6 +536,19 @@ def main(config):
         logger.info(f"Saved JSON summary to {json_summary_path}")
     except Exception as e:
         logger.warning(f"Failed to save JSON summary: {e}")
+
+    # Generate figures (non-blocking, best-effort)
+    try:
+        _generate_figures(
+            analysis_dir=analysis_dir,
+            district_deltas=district_deltas,
+            cluster_deltas_df=cluster_deltas_df,
+            baseline_genome=baseline_genome,
+            rerun_genome=rerun_genome,
+            clusters_sorted=clusters_sorted
+        )
+    except Exception as e:
+        logger.warning(f"Plot generation failed: {e}")
 
     logger.info("Sensitivity analysis (core) completed.")
     return None

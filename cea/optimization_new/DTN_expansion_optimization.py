@@ -1410,25 +1410,34 @@ class DTNExpansionOptimizer:
             row0 = {'phase': 0, 'cumulative_clusters': '0'}
             row0.update(breakdown)
             breakdown_rows.append(row0)
+            # In COP mode, approximate connected-only emissions with total for intensity
+            connected_ghg = total_ghg
         else:
             from cea.analysis.lca.operation import lca_operation
             lca_operation(self.locator, custom_supply_path=str(phase0_supply_path))
             lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
-            # District-wide scope (do not filter to testing clusters here)
+            # District-wide total emissions
             total_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())
+            # Connected-only emissions for Phase 0 (cluster 0)
+            name_col = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
+            if not name_col:
+                raise ValueError("LCA file missing building name column (expected 'name' or 'Name')")
+            conn_set = set(self._get_buildings_in_specific_cluster(0))
+            mask_conn = lca_operation_results[name_col].astype(str).isin(conn_set)
+            connected_ghg = float(lca_operation_results.loc[mask_conn, 'GHG_sys_tonCO2'].sum())
+            # No hybrid replacement for Phase 0; preserve raw LCA totals for comparability
 
         # Compute GFA denominators
         _connected_buildings_p0 = set(self._get_buildings_in_specific_cluster(0))
         _connected_gfa_p0 = float(sum(_name_to_gfa.get(b, 0.0) for b in _connected_buildings_p0))
-        per_connected = (total_ghg * 1000.0 / _connected_gfa_p0) if _connected_gfa_p0 > 0 else 0.0
+        per_connected = (connected_ghg * 1000.0 / _connected_gfa_p0) if _connected_gfa_p0 > 0 else 0.0
         per_total = (total_ghg * 1000.0 / _total_gfa_const) if _total_gfa_const > 0 else 0.0
 
-        # Store results for phase 0 (keep legacy key mapped to connected intensity)
+        # Store results for phase 0 (drop legacy per_gfa)
         results[0] = {
             'district_operation_emission [t CO2eq/yr]': total_ghg,
             'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': per_connected,
-            'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': per_total,
-            'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': per_connected
+            'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': per_total
         }
 
         # Get cluster assignments from current individual
@@ -1509,21 +1518,26 @@ class DTNExpansionOptimizer:
                 from cea.analysis.lca.operation import lca_operation
                 lca_operation(self.locator, custom_supply_path=str(phase_supply_path))
 
-                # Load LCA results and use ALL buildings
+                # Load LCA results, compute totals and connected-only emissions
                 lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
                 total_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())
+                name_col = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
+                if not name_col:
+                    raise ValueError("LCA file missing building name column (expected 'name' or 'Name')")
+                conn_set = set(connected_buildings)
+                mask_conn = lca_operation_results[name_col].astype(str).isin(conn_set)
+                connected_ghg = float(lca_operation_results.loc[mask_conn, 'GHG_sys_tonCO2'].sum())
 
             # Compute GFA denominators for this phase
             _connected_gfa = float(sum(_name_to_gfa.get(b, 0.0) for b in set(connected_buildings)))
-            per_connected = (total_ghg * 1000.0 / _connected_gfa) if _connected_gfa > 0 else 0.0
+            per_connected = (connected_ghg * 1000.0 / _connected_gfa) if _connected_gfa > 0 else 0.0
             per_total = (total_ghg * 1000.0 / _total_gfa_const) if _total_gfa_const > 0 else 0.0
 
-            # Store results for this phase (include new columns and legacy mapping)
+            # Store results for this phase (drop legacy per_gfa column)
             results[phase] = {
                 'district_operation_emission [t CO2eq/yr]': total_ghg,
                 'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': per_connected,
-                'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': per_total,
-                'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': per_connected
+                'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': per_total
             }
 
         # Write breakdown CSV if available
@@ -3447,7 +3461,6 @@ class DTNExpansionOptimizer:
             'district_operation_emission [t CO2eq/yr]': district_emissions.get(0, {}).get('district_operation_emission [t CO2eq/yr]', 0),
             'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': district_emissions.get(0, {}).get('district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]', 0),
             'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': district_emissions.get(0, {}).get('district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]', 0),
-            'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': district_emissions.get(0, {}).get('district_operation_emission_per_gfa [kg CO2eq/yr/m2]', 0),
             'new_cluster(s)_discounted_roi [-]': 0,  # Will be calculated if data is available
             'overall_discounted_roi [-]': 0,  # Will be calculated if data is available
             'new_cluster(s)_npv [USD]': 0,  # Will be calculated if data is available
@@ -3661,7 +3674,6 @@ class DTNExpansionOptimizer:
                 'district_operation_emission [t CO2eq/yr]': district_emissions.get(phase, {}).get('district_operation_emission [t CO2eq/yr]', 0),
                 'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': district_emissions.get(phase, {}).get('district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]', 0),
                 'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': district_emissions.get(phase, {}).get('district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]', 0),
-                'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': district_emissions.get(phase, {}).get('district_operation_emission_per_gfa [kg CO2eq/yr/m2]', 0),
                 'new_cluster(s)_discounted_roi [-]': roi,
                 'overall_discounted_roi [-]': overall_roi,
                 'new_cluster(s)_npv [USD]': npv,
@@ -3711,7 +3723,6 @@ class DTNExpansionOptimizer:
             'district_operation_emission [t CO2eq/yr]': district_emissions.get(self.num_phases, {}).get('district_operation_emission [t CO2eq/yr]', 0),
             'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': district_emissions.get(self.num_phases, {}).get('district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]', 0),
                         'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': district_emissions.get(self.num_phases, {}).get('district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]', 0),
-                        'district_operation_emission_per_gfa [kg CO2eq/yr/m2]': district_emissions.get(self.num_phases, {}).get('district_operation_emission_per_gfa [kg CO2eq/yr/m2]', 0),
             'new_cluster(s)_discounted_roi [-]': sum(result['new_cluster(s)_discounted_roi [-]'] * result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) / sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) if sum(result['new_cluster(s)_capex [USD]'] for result in results if result['phase'] != 0) > 0 else 0,
             'new_cluster(s)_npv [USD]': sum(result['new_cluster(s)_npv [USD]'] for result in results if result['phase'] != 0),
             'new_cluster(s)_pipe_length [m]': sum(result.get('new_cluster(s)_pipe_length [m]', result.get('newly_added_pipe_length [m]', 0)) for result in results if result['phase'] != 0),
@@ -3734,7 +3745,7 @@ class DTNExpansionOptimizer:
             summary[f'cumulative_annual_{demand_type} [MWh/yr]'] = last_phase_result[f'cumulative_annual_{demand_type} [MWh/yr]']
             summary[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = last_phase_result[f'overall_linear_{demand_type}_density [MWh/km/yr]']
         else:
-            # If there are no non-zero phases, use the calculated values
+            # If there are no non-zero phases, use Phase 0 values
             summary['cumulative_cluster(s)'] = '+'.join(map(str, sorted(cumulative_clusters)))
             summary['cumulative_number_of_buildings_connected'] = len(cumulative_buildings)
             summary['cumulative_capex [USD]'] = 0
@@ -3743,9 +3754,11 @@ class DTNExpansionOptimizer:
             summary['overall_npv [USD]'] = 0
             summary['cumulative_pipe_length [m]'] = cumulative_pipe_length
             summary[f'cumulative_annual_{demand_type} [MWh/yr]'] = phase0_result.get(f'cumulative_annual_{demand_type} [MWh/yr]', 0)
-            summary[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = 0
-            summary['district_operation_emission [t CO2eq/yr]'] = 0
-            summary['district_operation_emission_per_gfa [kg CO2eq/yr/m2]'] = 0
+            summary[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = phase0_result.get(
+                f'overall_linear_{demand_type}_density [MWh/km/yr]', 0)
+            summary['district_operation_emission [t CO2eq/yr]'] = district_emissions.get(0, {}).get('district_operation_emission [t CO2eq/yr]', 0)
+            summary['district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]'] = district_emissions.get(0, {}).get('district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]', 0)
+            summary['district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]'] = district_emissions.get(0, {}).get('district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]', 0)
 
         # Calculate average newly connected linear heat density (weighted by pipe length) only if not already set
         if summary[f'new_cluster(s)_linear_{demand_type}_density [MWh/km/yr]'] == 0:

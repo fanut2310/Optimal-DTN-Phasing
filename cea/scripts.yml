@@ -432,7 +432,7 @@ Energy Supply System Optimisation:
       Please run Dynamic DTN Optimization Part 1 with the same network type before running this module.
     interfaces: [ cli, dashboard ]
     module: cea.optimization_new.dynamic_dtn_optimization_part2
-    parameters: [ 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free',
+    parameters: [ 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free', 'general:debug',
                   'dynamic-dtn-optimization:network-type', 'dtn-expansion-optimization:testing-clusters',
                   'dtn-expansion-optimization:num-phases',
                   'dtn-expansion-optimization:phase-durations',

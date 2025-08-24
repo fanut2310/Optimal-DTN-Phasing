@@ -86,14 +86,52 @@ def setup_creator(multi_objective=False, objective_function='NPV', multi_objecti
 
 def log():
     """
-    Get the logger for this module.
+    Get the logger for this module and ensure it can print to console even if the
+    environment didn't pre-configure handlers (fail-safe for CLI runs).
 
     Returns:
     --------
     logging.Logger
         The logger for this module
     """
-    return logging.getLogger("cea.optimization.dynamic_dtn_optimization_part2")
+    lg = logging.getLogger("cea.optimization.dynamic_dtn_optimization_part2")
+    # Attach a console handler once if none present (prevents silent logs)
+    if not lg.handlers:
+        try:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter("%(asctime)s | %(levelname)5s | %(message)s", datefmt="%H:%M:%S")
+            handler.setFormatter(formatter)
+            lg.addHandler(handler)
+        except Exception:
+            pass
+    # Prevent duplicate prints via root / 'cea' handlers
+    lg.propagate = False
+    return lg
+
+# I/O logging helpers for fail-fast path validation in temp scenario
+from pathlib import Path as _PathForIO
+
+def _assert_under_temp(path: _PathForIO, temp_root: _PathForIO, what: str):
+    """Ensure a given path is located under the dynamic temp scenario root."""
+    p = _PathForIO(path)
+    tr = _PathForIO(temp_root)
+    if tr not in p.parents and p != tr:
+        raise AssertionError(f"{what} is not under temp scenario! Got: {p}, temp root: {tr}")
+
+
+def _log_io(action: str, path: _PathForIO, level: str = "debug", extra: Optional[dict] = None):
+    msg = f"[IO] {action}: {path}"
+    if extra:
+        tail = " ".join([f"{k}={v}" for k, v in extra.items()])
+        msg = f"{msg} | {tail}"
+    if level.lower() == "debug":
+        log().debug(msg)
+    elif level.lower() == "warning":
+        log().warning(msg)
+    elif level.lower() == "error":
+        log().error(msg)
+    else:
+        log().info(msg)
 
 
 def _read_shp_force_2d(path: Path):
@@ -390,18 +428,29 @@ class DTNExpansionOptimizer:
 
     def _load_cluster_data(self):
         """Load cluster data from cluster_edges.csv and cluster_nodes.csv."""
-        # Load cluster assignments
+        # Load cluster assignments with fail-fast checks
+        temp_root = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_folder())
+
         cluster_edges_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_edges.csv"
-        log().info(f"Loading cluster edges (temp scenario) from: {cluster_edges_path}")
+        _log_io("READ cluster_edges", cluster_edges_path)
+        _assert_under_temp(cluster_edges_path, temp_root, "cluster_edges")
+        if not cluster_edges_path.exists():
+            raise FileNotFoundError(f"Missing required temp file: cluster_edges.csv at {cluster_edges_path}")
         self.cluster_edges = pd.read_csv(cluster_edges_path)
 
         cluster_nodes_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_nodes.csv"
-        log().info(f"Loading cluster nodes (temp scenario) from: {cluster_nodes_path}")
+        _log_io("READ cluster_nodes", cluster_nodes_path)
+        _assert_under_temp(cluster_nodes_path, temp_root, "cluster_nodes")
+        if not cluster_nodes_path.exists():
+            raise FileNotFoundError(f"Missing required temp file: cluster_nodes.csv at {cluster_nodes_path}")
         self.cluster_nodes = pd.read_csv(cluster_nodes_path)
 
         # Load total demand
         total_demand_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand())
-        log().info(f"Loading total demand (temp scenario) from: {total_demand_path}")
+        _log_io("READ temp Total_demand", total_demand_path)
+        _assert_under_temp(total_demand_path, temp_root, "temp Total_demand")
+        if not total_demand_path.exists():
+            raise FileNotFoundError(f"Temp Total_demand.csv missing at {total_demand_path}")
         self.total_demand = pd.read_csv(total_demand_path)
 
         # If testing_clusters is specified, use only those clusters
@@ -1344,11 +1393,17 @@ class DTNExpansionOptimizer:
 
         # Create directory for phase-specific supply files
         phase_files_dir = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_phase_supply_files_folder())
+        temp_root = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_folder())
+        _assert_under_temp(phase_files_dir, temp_root, "phase supply folder")
+        _log_io("ENSURE DIR phase supply", phase_files_dir)
         phase_files_dir.mkdir(parents=True, exist_ok=True)
-        log().info(f"Creating phase supply files directory at: {phase_files_dir}")
+        log().debug(f"Creating phase supply files directory at: {phase_files_dir}")
+        _log_io("PHASE SUPPLY ROOT", phase_files_dir)
 
         # Create phase 0 supply file (original)
         phase0_supply_path = phase_files_dir / "phase0_supply.csv"
+        _assert_under_temp(phase0_supply_path, temp_root, "phase0 supply file")
+        _log_io("WRITE phase0_supply", phase0_supply_path)
         original_supply_df.to_csv(phase0_supply_path, index=False)
         log().debug(f"Created phase 0 supply file at: {phase0_supply_path}")
 
@@ -1374,37 +1429,74 @@ class DTNExpansionOptimizer:
         else:
             from cea.analysis.lca.operation import lca_operation
             temp_demand_path = self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand()
-            log().info(f"Running LCA operation for phase 0 with:")
+            log().info("Running LCA operation for phase 0 with:")
             log().info(f"  - Supply path: {phase0_supply_path}")
             log().info(f"  - Demand path: {temp_demand_path}")
             # Run LCA using a temp scenario locator so outputs are written under temp_scenario
             temp_locator = cea.inputlocator.InputLocator(self.locator.get_dynamic_dtn_optimization_temp_scenario_folder())
+            _assert_under_temp(phase0_supply_path, temp_root, "LCA supply path (phase 0)")
+            _assert_under_temp(_PathForIO(temp_demand_path), temp_root, "LCA demand path (phase 0)")
+            _log_io("CALL LCA phase0", _PathForIO(temp_locator.scenario), extra={"supply": str(phase0_supply_path), "demand": str(temp_demand_path)})
             lca_operation(temp_locator, custom_supply_path=str(phase0_supply_path), custom_demand_path=temp_demand_path)
 
             # Load LCA results (ALL buildings) from temp scenario
             lca_results_path = temp_locator.get_lca_operation()
-            log().info(f"Loading LCA results from: {lca_results_path}")
+            _assert_under_temp(_PathForIO(lca_results_path), temp_root, "LCA results (phase 0)")
+            _log_io("READ LCA results phase0", _PathForIO(lca_results_path))
             lca_operation_results = pd.read_csv(lca_results_path)
             log().info(f"Loaded LCA results with {len(lca_operation_results)} buildings")
             total_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())
-            # Connected-only emissions for Phase 0 (cluster 0)
+            # Connected-only emissions for Phase 0 (cluster 0) with normalized name matching
             name_col = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
             if not name_col:
                 raise ValueError("LCA file missing building name column (expected 'name' or 'Name')")
-            conn_set = set(self._get_buildings_in_specific_cluster(0))
-            mask_conn = lca_operation_results[name_col].astype(str).isin(conn_set)
+            conn_set_raw = set(self._get_buildings_in_specific_cluster(0))
+            conn_set_norm = {str(b).strip().upper() for b in conn_set_raw}
+            lca_names_norm = lca_operation_results[name_col].astype(str).str.strip().str.upper()
+            mask_conn = lca_names_norm.isin(conn_set_norm)
             connected_ghg = float(lca_operation_results.loc[mask_conn, 'GHG_sys_tonCO2'].sum())
+            # Diagnostics for Phase 0 matching
+            try:
+                diag_dir = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_phase_supply_files_folder())
+                _assert_under_temp(diag_dir, temp_root, "phase supply folder (diag)")
+                expected_names = sorted(conn_set_norm)
+                matched_names = sorted(set(lca_names_norm[mask_conn].tolist()))
+                pd.DataFrame({'expected_conn_name': expected_names,
+                              'matched': [n in matched_names for n in expected_names]}).to_csv(
+                    diag_dir / 'phase0_conn_name_match.csv', index=False)
+                pd.DataFrame([{
+                    'phase': 0,
+                    'connected_expected_count': len(expected_names),
+                    'connected_matched_in_lca': int(mask_conn.sum()),
+                    'connected_ghg_t': connected_ghg,
+                    'district_total_ghg_t': total_ghg
+                }]).to_csv(diag_dir / 'phase0_conn_match_summary.csv', index=False)
+                log().info(f"[Diag] Phase 0 name-match diagnostics written to {diag_dir}")
+            except Exception as e:
+                log().warning(f"Could not write Phase 0 name-match diagnostics: {e}")
             # No hybrid replacement for Phase 0; preserve raw LCA totals for comparability
 
         # Compute GFA denominators for phase 0
         _connected_buildings_p0 = set(self._get_buildings_in_specific_cluster(0))
-        _connected_gfa_p0 = float(sum(_name_to_gfa.get(b, 0.0) for b in _connected_buildings_p0))
-        per_connected = (connected_ghg * 1000.0 / _connected_gfa_p0) if _connected_gfa_p0 > 0 else 0.0
-        per_total = (total_ghg * 1000.0 / _total_gfa_const) if _total_gfa_const > 0 else 0.0
+        if not self.compute_emissions_from_cop and 'GFA_m2' in lca_operation_results.columns:
+            try:
+                name_col_gfa = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
+                mask_conn_gfa = lca_operation_results[name_col_gfa].astype(str).isin(_connected_buildings_p0) if name_col_gfa else pd.Series(False, index=lca_operation_results.index)
+                connected_gfa_lca = float(lca_operation_results.loc[mask_conn_gfa, 'GFA_m2'].sum())
+                total_gfa_lca = float(lca_operation_results['GFA_m2'].sum())
+            except Exception:
+                connected_gfa_lca = float(sum(_name_to_gfa.get(b, 0.0) for b in _connected_buildings_p0))
+                total_gfa_lca = _total_gfa_const
+        else:
+            connected_gfa_lca = float(sum(_name_to_gfa.get(b, 0.0) for b in _connected_buildings_p0))
+            total_gfa_lca = _total_gfa_const
+        per_connected = (connected_ghg * 1000.0 / connected_gfa_lca) if connected_gfa_lca > 0 else 0.0
+        per_total = (total_ghg * 1000.0 / total_gfa_lca) if total_gfa_lca > 0 else 0.0
 
-        # Store results for phase 0 (drop legacy per_gfa column)
+        # Store results for phase 0
         results[0] = {
             'district_operation_emission [t CO2eq/yr]': total_ghg,
+            'connected_clusters_operation_emissions [t CO2eq/yr]': connected_ghg,
             'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': per_connected,
             'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': per_total
         }
@@ -1462,6 +1554,8 @@ class DTNExpansionOptimizer:
 
             # Save the phase-specific supply file
             phase_supply_path = phase_files_dir / f"phase{phase}_supply.csv"
+            _assert_under_temp(phase_supply_path, temp_root, "phase supply file")
+            _log_io("WRITE phase_supply", phase_supply_path, extra={"phase": phase})
             phase_supply_df.to_csv(phase_supply_path, index=False)
             log().debug(f"Created phase {phase} supply file: {phase_supply_path}")
 
@@ -1491,41 +1585,46 @@ class DTNExpansionOptimizer:
                 log().info(f"  - Supply path: {phase_supply_path}")
                 log().info(f"  - Demand path: {temp_demand_path}")
                 temp_locator = cea.inputlocator.InputLocator(self.locator.get_dynamic_dtn_optimization_temp_scenario_folder())
+                _assert_under_temp(phase_supply_path, temp_root, "LCA supply path (phase)")
+                _assert_under_temp(_PathForIO(temp_demand_path), temp_root, "LCA demand path (phase)")
+                _log_io("CALL LCA phase", _PathForIO(temp_locator.scenario), extra={"phase": phase, "supply": str(phase_supply_path), "demand": str(temp_demand_path)})
                 lca_operation(temp_locator, custom_supply_path=str(phase_supply_path), custom_demand_path=temp_demand_path)
 
                 # Load LCA results from temp scenario and compute totals and connected-only emissions
                 lca_results_path = temp_locator.get_lca_operation()
-                log().info(f"Loading LCA results from: {lca_results_path}")
+                _assert_under_temp(_PathForIO(lca_results_path), temp_root, "LCA results (phase)")
+                _log_io("READ LCA results phase", _PathForIO(lca_results_path), extra={"phase": phase})
                 lca_operation_results = pd.read_csv(lca_results_path)
                 log().info(f"Loaded LCA results with {len(lca_operation_results)} buildings")
                 total_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())
                 name_col = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
                 if not name_col:
                     raise ValueError("LCA file missing building name column (expected 'name' or 'Name')")
-                conn_set = set(connected_buildings)
-                mask_conn = lca_operation_results[name_col].astype(str).isin(conn_set)
+                # Normalize names for robust matching
+                conn_set_raw = set(connected_buildings)
+                conn_set_norm = {str(b).strip().upper() for b in conn_set_raw}
+                lca_names_norm = lca_operation_results[name_col].astype(str).str.strip().str.upper()
+                mask_conn = lca_names_norm.isin(conn_set_norm)
                 connected_ghg = float(lca_operation_results.loc[mask_conn, 'GHG_sys_tonCO2'].sum())
-                # Hybrid adjustment: replace connected-only LCA emissions with COP-based estimation and adjust district total
-                try:
-                    cop_conn_total, _, _ = self._compute_phase_emissions_from_cop(
-                        phase_supply_path,
-                        scope_buildings=list(conn_set),
-                        pump_electricity_kwh=0.0,
-                        custom_demand_path=temp_demand_path
-                    )
-                    total_ghg = total_ghg - connected_ghg + float(cop_conn_total)
-                    connected_ghg = float(cop_conn_total)
-                except Exception as e:
-                    log().warning(f"Hybrid COP adjustment for phase {phase} failed; using LCA-only connected emissions. Error: {e}")
 
             # Compute GFA denominators for this phase
-            _connected_gfa = float(sum(_name_to_gfa.get(b, 0.0) for b in set(connected_buildings)))
-            per_connected = (connected_ghg * 1000.0 / _connected_gfa) if _connected_gfa > 0 else 0.0
-            per_total = (total_ghg * 1000.0 / _total_gfa_const) if _total_gfa_const > 0 else 0.0
+            if (not self.compute_emissions_from_cop) and 'GFA_m2' in lca_operation_results.columns:
+                try:
+                    connected_gfa_lca = float(lca_operation_results.loc[mask_conn, 'GFA_m2'].sum())
+                    total_gfa_lca = float(lca_operation_results['GFA_m2'].sum())
+                except Exception:
+                    connected_gfa_lca = float(sum(_name_to_gfa.get(b, 0.0) for b in set(connected_buildings)))
+                    total_gfa_lca = _total_gfa_const
+            else:
+                connected_gfa_lca = float(sum(_name_to_gfa.get(b, 0.0) for b in set(connected_buildings)))
+                total_gfa_lca = _total_gfa_const
+            per_connected = (connected_ghg * 1000.0 / connected_gfa_lca) if connected_gfa_lca > 0 else 0.0
+            per_total = (total_ghg * 1000.0 / total_gfa_lca) if total_gfa_lca > 0 else 0.0
 
             # Store results for this phase (drop legacy per_gfa column)
             results[phase] = {
                 'district_operation_emission [t CO2eq/yr]': total_ghg,
+                'connected_clusters_operation_emissions [t CO2eq/yr]': connected_ghg,
                 'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': per_connected,
                 'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': per_total
             }
@@ -1536,6 +1635,8 @@ class DTNExpansionOptimizer:
                 breakdown_df = pd.DataFrame(breakdown_rows)
                 # Save into the same folder as phase supply files
                 breakdown_file = phase_files_dir / "emissions_breakdown_by_phase.csv"
+                _assert_under_temp(breakdown_file, temp_root, "emissions breakdown file")
+                _log_io("WRITE emissions breakdown", breakdown_file)
                 breakdown_df.to_csv(breakdown_file, index=False)
                 log().debug(f"Saved emissions breakdown by phase to {breakdown_file}")
         except Exception as e:
@@ -2499,6 +2600,9 @@ class DTNExpansionOptimizer:
         # Force output into the dynamic temp scenario dtn_expansion folder
         output_dir = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder())
         output_dir.mkdir(parents=True, exist_ok=True)
+        temp_root = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_folder())
+        _assert_under_temp(output_dir, temp_root, "all_evaluated_individuals output folder")
+        _log_io("ENSURE DIR all_evaluated_individuals", output_dir)
 
         # Create a list to store all individual metrics
         all_metrics = []
@@ -2575,6 +2679,8 @@ class DTNExpansionOptimizer:
 
         # Save to CSV
         csv_file = output_dir / f"all_evaluated_individuals_{self.network_type}.csv"
+        _assert_under_temp(csv_file, temp_root, "all_evaluated_individuals CSV")
+        _log_io("WRITE all_evaluated_individuals", csv_file)
         df.to_csv(csv_file, index=False)
 
         log().info(f"Metrics for all {len(all_metrics)} evaluated individuals saved to {csv_file}")
@@ -3360,6 +3466,9 @@ class DTNExpansionOptimizer:
         # Force output into the dynamic temp scenario dtn_expansion folder
         output_dir = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder())
         output_dir.mkdir(parents=True, exist_ok=True)
+        temp_root = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_folder())
+        _assert_under_temp(output_dir, temp_root, "results folder")
+        _log_io("ENSURE DIR results", output_dir)
 
         # Calculate district emissions using the new methodology
         district_emissions = self.calculate_district_emissions_new()
@@ -3512,8 +3621,6 @@ class DTNExpansionOptimizer:
             'ghg_cap [t CO2eq/yr]': '-',  # No GHG cap for existing DTN
             'district_operation_emission [t CO2eq/yr]': district_emissions.get(0, {}).get(
                 'district_operation_emission [t CO2eq/yr]', 0),
-            'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': district_emissions.get(0, {}).get(
-                'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]', 0),
             'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': district_emissions.get(0, {}).get(
                 'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]', 0),
             'new_cluster(s)_discounted_roi [-]': 0,  # Will be calculated if data is available
@@ -3770,8 +3877,6 @@ class DTNExpansionOptimizer:
                     self.ghg_budget_per_phase) else 'no_limit',
                 'district_operation_emission [t CO2eq/yr]': district_emissions.get(phase, {}).get(
                     'district_operation_emission [t CO2eq/yr]', 0),
-                'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': district_emissions.get(phase, {}).get(
-                    'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]', 0),
                 'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': district_emissions.get(phase, {}).get(
                     'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]', 0),
                 'new_cluster(s)_discounted_roi [-]': roi,
@@ -3834,8 +3939,6 @@ class DTNExpansionOptimizer:
             'ghg_cap [t CO2eq/yr]': self.ghg_budget_per_phase[-1] if self.ghg_budget_per_phase else '-',
             'district_operation_emission [t CO2eq/yr]': district_emissions.get(self.num_phases, {}).get(
             'district_operation_emission [t CO2eq/yr]', 0),
-        'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': district_emissions.get(self.num_phases, {}).get(
-            'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]', 0),
         'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': district_emissions.get(self.num_phases, {}).get(
             'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]', 0),
             'new_cluster(s)_discounted_roi [-]': sum(
@@ -3885,7 +3988,6 @@ class DTNExpansionOptimizer:
             summary[f'overall_linear_{demand_type}_density [MWh/km/yr]'] = phase0_result.get(
                 f'overall_linear_{demand_type}_density [MWh/km/yr]', 0)
             summary['district_operation_emission [t CO2eq/yr]'] = district_emissions.get(0, {}).get('district_operation_emission [t CO2eq/yr]', 0)
-            summary['district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]'] = district_emissions.get(0, {}).get('district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]', 0)
             summary['district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]'] = district_emissions.get(0, {}).get('district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]', 0)
 
         # Calculate average newly connected linear heat density (weighted by pipe length) only if not already set
@@ -3944,6 +4046,8 @@ class DTNExpansionOptimizer:
         # Save metadata to a separate CSV
         metadata_df = pd.DataFrame([metadata])
         metadata_file = output_dir / "optimization_settings.csv"
+        _assert_under_temp(metadata_file, temp_root, "metadata CSV")
+        _log_io("WRITE optimization_settings CSV", metadata_file)
         metadata_df.to_csv(metadata_file, index=False)
 
         # Apply formatting to specific columns
@@ -3975,10 +4079,29 @@ class DTNExpansionOptimizer:
 
         # Save results to CSV with network-type specific filename
         results_file = output_dir / f"dtn_expansion_opt_results_{self.network_type}.csv"
+        _assert_under_temp(results_file, temp_root, "results CSV")
+        _log_io("WRITE results CSV", results_file)
         results_df.to_csv(results_file, index=False)
 
         # Save detailed results
         detailed_results_file = self.save_detailed_results(results, output_dir)
+        _assert_under_temp(detailed_results_file, temp_root, "detailed results CSV")
+        _log_io("WROTE detailed results CSV", detailed_results_file)
+
+        # IO Ledger summary
+        try:
+            io_ledger = {
+                "temp_root": str(temp_root),
+                "phase_supply_dir": str(self.locator.get_dynamic_dtn_optimization_temp_scenario_phase_supply_files_folder()),
+                "cluster_nodes": str(Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_nodes.csv"),
+                "cluster_edges": str(Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_edges.csv"),
+                "results_csv": str(results_file),
+                "detailed_results_csv": str(detailed_results_file),
+                "metadata_csv": str(metadata_file),
+            }
+            log().info("IO Ledger (Dynamic Part 2):\n" + "\n".join([f"  - {k}: {v}" for k, v in io_ledger.items()]))
+        except Exception:
+            pass
 
         log().info(f"Optimization results saved to {results_file}")
         log().info(f"Detailed optimization results saved to {detailed_results_file}")
@@ -4436,6 +4559,47 @@ def main(config):
     None
     """
     start = time.time()
+
+    # Configure logging levels: keep HTTP/urllib3 noise suppressed; show our IO at INFO; enable module DEBUG when requested
+    try:
+        debug_flag = bool(getattr(config.general, 'debug', False))
+    except Exception:
+        debug_flag = False
+    import logging as _logging_cfg
+    # Always keep root at INFO to avoid 3rd-party DEBUG noise (e.g., urllib3)
+    try:
+        _logging_cfg.getLogger().setLevel(_logging_cfg.INFO)
+    except Exception:
+        pass
+    # Set our module and the 'cea' namespace to DEBUG when requested, else INFO
+    desired_level = _logging_cfg.DEBUG if debug_flag else _logging_cfg.INFO
+    try:
+        log().setLevel(desired_level)
+        _logging_cfg.getLogger('cea').setLevel(desired_level)
+    except Exception:
+        pass
+    # Silence noisy third-party debug logs explicitly
+    for noisy in (
+        'urllib3',
+        'urllib3.connectionpool',
+        'requests',
+        'requests.packages.urllib3',
+        'matplotlib',
+    ):
+        try:
+            _logging_cfg.getLogger(noisy).setLevel(_logging_cfg.WARNING)
+        except Exception:
+            pass
+    # Ensure at least one console handler exists (fail-safe)
+    try:
+        root_logger = _logging_cfg.getLogger()
+        if not root_logger.handlers:
+            _logging_cfg.basicConfig(level=_logging_cfg.INFO,
+                                     format="%(asctime)s | %(levelname)5s | %(message)s",
+                                     datefmt="%H:%M:%S")
+    except Exception:
+        pass
+    log().info(f"Debug mode is {'ON' if debug_flag else 'OFF'}; module log level set to {'DEBUG' if debug_flag else 'INFO'} (HTTP client debug logs suppressed).")
 
     # Get the scenario and locator
     scenario = config.scenario

@@ -336,7 +336,7 @@ Energy Supply System Optimisation:
       Note: Buildings in cluster 0 (existing DTN) should ideally use DISTRICT scale supply systems for heating, cooling, and DHW.
     interfaces: [ cli, dashboard ]
     module: cea.optimization_new.DTN_expansion_optimization
-    parameters: [ 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free',
+    parameters: [ 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free', 'general:debug',
                   'dtn-expansion-optimization:cluster0_district_scale_warning', 'dtn-expansion-optimization:network-type', 
                   'dtn-expansion-optimization:testing-clusters', 'dtn-expansion-optimization:chosen-buildings',
                   'dtn-expansion-optimization:run-optimization', 'dtn-expansion-optimization:capex-budget-per-phase', 
@@ -456,7 +456,18 @@ Energy Supply System Optimisation:
                   'dtn-expansion-optimization:multi-objective-functions',
                   'dtn-expansion-optimization:population-size',
                   'dtn-expansion-optimization:num-generations',
-                  'dtn-expansion-optimization:compute-emissions-from-cop' ]
+                  'dtn-expansion-optimization:compute-emissions-from-cop',
+                  'dtn-expansion-optimization:capex-per-phase-relaxing-pct',
+                  'dtn-expansion-optimization:total-exp-per-phase-relaxing-pct',
+                  'dtn-expansion-optimization:enforce-final-cumulative-capex',
+                  'dtn-expansion-optimization:final-cumulative-capex-budget-total',
+                  'dtn-expansion-optimization:enforce-final-cumulative-total-exp',
+                  'dtn-expansion-optimization:final-cumulative-total-exp-budget-total',
+                  'dtn-expansion-optimization:lock-committed-early-phases',
+                  'dtn-expansion-optimization:locked-phase-indices',
+                  'dtn-expansion-optimization:lock-reference-genome',
+                  'dtn-expansion-optimization:custom-locked-genome'
+                  ]
     input-files:
       - [get_optimization_results_folder]
       - [get_dtn_expansion_optimization_results_folder]

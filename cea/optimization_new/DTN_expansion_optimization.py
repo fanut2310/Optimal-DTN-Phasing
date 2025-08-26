@@ -1455,22 +1455,22 @@ class DTNExpansionOptimizer:
             'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': per_total
         }
 
-        # Get cluster assignments from current individual
-        if hasattr(self, 'current_individual') and self.current_individual:
-            # Use the current individual's phase assignments
-            cluster_phase_map = {cluster: p for cluster, p in zip(self.all_clusters, self.current_individual)}
-            clusters_by_phase = {}
-            for phase in range(1, self.num_phases + 1):
-                clusters_by_phase[phase] = [cluster for cluster, p in cluster_phase_map.items() if p == phase]
-        elif hasattr(self, 'solution') and self.solution and 'genome' in self.solution:
+        # Get cluster assignments from the final best genome if available; else fall back to current individual
+        if hasattr(self, 'solution') and self.solution and 'genome' in self.solution and self.solution['genome']:
             # Use the solution's genome if available
             cluster_phase_map = {cluster: p for cluster, p in zip(self.all_clusters, self.solution['genome'])}
             clusters_by_phase = {}
             for phase in range(1, self.num_phases + 1):
                 clusters_by_phase[phase] = [cluster for cluster, p in cluster_phase_map.items() if p == phase]
+        elif hasattr(self, 'current_individual') and self.current_individual:
+            # Use the current individual's phase assignments
+            cluster_phase_map = {cluster: p for cluster, p in zip(self.all_clusters, self.current_individual)}
+            clusters_by_phase = {}
+            for phase in range(1, self.num_phases + 1):
+                clusters_by_phase[phase] = [cluster for cluster, p in cluster_phase_map.items() if p == phase]
         else:
             # Fallback: distribute all_clusters evenly across phases
-            log().warning("No current_individual or solution genome found, using fallback cluster distribution")
+            log().warning("No final solution genome or current_individual found, using fallback cluster distribution")
             clusters_by_phase = {}
             clusters_per_phase = max(1, len(self.all_clusters) // self.num_phases)
             for phase in range(1, self.num_phases + 1):
@@ -1500,13 +1500,15 @@ class DTNExpansionOptimizer:
                 buildings = self._get_buildings_in_specific_cluster(cluster)
                 connected_buildings.extend(buildings)
 
-            # Update supply systems for connected buildings
-            for building in connected_buildings:
-                building_idx = phase_supply_df[phase_supply_df['name'] == building].index
-                if len(building_idx) > 0:
-                    phase_supply_df.loc[building_idx, 'supply_type_hs'] = district_heating_system
-                    phase_supply_df.loc[building_idx, 'supply_type_cs'] = district_cooling_system
-                    phase_supply_df.loc[building_idx, 'supply_type_dhw'] = district_dhw_system
+            # Update supply systems for connected buildings (normalize names for robust matching)
+            phase_supply_df['__name_norm__'] = phase_supply_df['name'].astype(str).str.strip().str.upper()
+            connected_norm = {str(b).strip().upper() for b in connected_buildings}
+            mask_conn = phase_supply_df['__name_norm__'].isin(connected_norm)
+            phase_supply_df.loc[mask_conn, 'supply_type_hs'] = district_heating_system
+            phase_supply_df.loc[mask_conn, 'supply_type_cs'] = district_cooling_system
+            phase_supply_df.loc[mask_conn, 'supply_type_dhw'] = district_dhw_system
+            # Clean helper column
+            phase_supply_df.drop(columns='__name_norm__', inplace=True, errors='ignore')
 
             # Save the phase-specific supply file
             phase_supply_path = phase_files_dir / f"phase{phase}_supply.csv"
@@ -3339,6 +3341,20 @@ class DTNExpansionOptimizer:
         output_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder())
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Sync to final best genome (if provided) so emissions and files reflect the chosen solution
+        try:
+            if isinstance(solution, dict):
+                self.solution = solution
+                if 'genome' in solution and solution['genome']:
+                    self.current_individual = list(solution['genome'])
+                    log().info(f"[FINAL] Best genome (objective={self.objective_function}): {solution['genome']}")
+                    if 'phases' in solution and isinstance(solution['phases'], dict):
+                        for ph in range(1, self.num_phases + 1):
+                            clusters_ph = solution['phases'].get(ph, [])
+                            log().info(f"[FINAL] Phase {ph}: Connecting clusters {clusters_ph}")
+        except Exception:
+            pass
+
         # Calculate district emissions using the new methodology
         district_emissions = self.calculate_district_emissions_new()
 
@@ -3873,6 +3889,21 @@ class DTNExpansionOptimizer:
         log().info(f"Optimization results saved to {results_file}")
         log().info(f"Detailed optimization results saved to {detailed_results_file}")
         log().info(f"Optimization settings saved to {metadata_file}")
+
+        # Q7: Cleanup empty legacy phase_* directories (keep phase_supply_files) in baseline results folder
+        try:
+            dtn_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder())
+            for p in dtn_dir.glob("phase_*"):
+                if p.name == "phase_supply_files":
+                    continue
+                if p.is_dir():
+                    try:
+                        next(p.iterdir())
+                    except StopIteration:
+                        p.rmdir()
+                        log().info(f"Removed empty legacy directory: {p}")
+        except Exception:
+            pass
 
         return results_file
 

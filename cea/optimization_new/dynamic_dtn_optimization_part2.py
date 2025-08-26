@@ -243,7 +243,20 @@ class DTNExpansionOptimizer:
                  pump_capex_a: float = 1230, pump_capex_b: float = 0.65,
                  cooling_cop: float = 4.0, ghg_budget_per_phase: Optional[List[float]] = None,
                  multi_objective_mode: bool = False, multi_objective_functions: Optional[List[str]] = None,
-                 testing_clusters=None):
+                 testing_clusters=None,
+                 # New parameters for Q2/Q3
+                 capex_per_phase_softening_pct: float = 0.20,
+                 total_exp_per_phase_softening_pct: float = 0.20,
+                 enforce_final_cumulative_capex: bool = True,
+                 final_cumulative_capex_budget_total: Optional[float] = None,
+                 enforce_final_cumulative_total_exp: bool = True,
+                 final_cumulative_total_exp_budget_total: Optional[float] = None,
+                 lock_committed_early_phases: bool = True,
+                 locked_phase_indices: Optional[List[int]] = None,
+                 lock_reference_genome: str = 'baseline-dtn-opt',
+                 custom_locked_genome: Optional[List[int]] = None,
+                 # Soft per-phase ceiling (always hard-penalized on exceedance)
+                 enforce_per_phase_soft_ceiling: bool = True):
         """
         Initialize the DTN expansion optimizer.
 
@@ -338,6 +351,50 @@ class DTNExpansionOptimizer:
         self.multi_objective_functions = multi_objective_functions
         self.testing_clusters = testing_clusters
 
+        # ---------------- New Q2/Q3 parameters ----------------
+        self.capex_per_phase_softening_pct = float(capex_per_phase_softening_pct if capex_per_phase_softening_pct is not None else 0.20)
+        self.total_exp_per_phase_softening_pct = float(total_exp_per_phase_softening_pct if total_exp_per_phase_softening_pct is not None else 0.20)
+        self.enforce_final_cumulative_capex = bool(enforce_final_cumulative_capex)
+        self.enforce_final_cumulative_total_exp = bool(enforce_final_cumulative_total_exp)
+        # Derive final cumulative totals if not provided (0 or None => auto-sum of original budgets)
+        try:
+            self.final_cumulative_capex_budget_total = float(final_cumulative_capex_budget_total) if final_cumulative_capex_budget_total not in (None, "", []) else None
+        except Exception:
+            self.final_cumulative_capex_budget_total = None
+        try:
+            self.final_cumulative_total_exp_budget_total = float(final_cumulative_total_exp_budget_total) if final_cumulative_total_exp_budget_total not in (None, "", []) else None
+        except Exception:
+            self.final_cumulative_total_exp_budget_total = None
+        # Auto-compute totals from per-phase arrays if needed and available
+        if self.final_cumulative_capex_budget_total in (None, 0) and self.capex_budget_per_phase and all(np.isfinite(x) for x in self.capex_budget_per_phase if x is not None):
+            try:
+                self.final_cumulative_capex_budget_total = float(sum([x for x in self.capex_budget_per_phase if x not in (None, float('inf'))]))
+            except Exception:
+                self.final_cumulative_capex_budget_total = None
+        if self.final_cumulative_total_exp_budget_total in (None, 0) and self.total_expenditure_budget_per_phase and all(np.isfinite(x) for x in self.total_expenditure_budget_per_phase if x is not None):
+            try:
+                self.final_cumulative_total_exp_budget_total = float(sum([x for x in self.total_expenditure_budget_per_phase if x not in (None, float('inf'))]))
+            except Exception:
+                self.final_cumulative_total_exp_budget_total = None
+        # Compute soft per-phase arrays for reporting (not enforced)
+        try:
+            self.capex_soft_per_phase = [ (1.0 + self.capex_per_phase_softening_pct) * b if (b is not None and np.isfinite(b)) else b for b in (self.capex_budget_per_phase or []) ]
+        except Exception:
+            self.capex_soft_per_phase = self.capex_budget_per_phase
+        try:
+            self.total_exp_soft_per_phase = [ (1.0 + self.total_exp_per_phase_softening_pct) * b if (b is not None and np.isfinite(b)) else b for b in (self.total_expenditure_budget_per_phase or []) ]
+        except Exception:
+            self.total_exp_soft_per_phase = self.total_expenditure_budget_per_phase
+        # Locking parameters (build map later after clusters are loaded)
+        self.lock_committed_early_phases = bool(lock_committed_early_phases)
+        self.lock_reference_genome = str(lock_reference_genome) if lock_reference_genome is not None else 'baseline-dtn-opt'
+        self._locked_phase_indices_cfg = list(locked_phase_indices) if locked_phase_indices else [1]
+        self._custom_locked_genome_cfg = list(custom_locked_genome) if custom_locked_genome else []
+        self.locked_clusters_phase: Dict[int, int] = {}
+        # Per-phase ceiling: always treated as hard if enabled
+        self.enforce_per_phase_soft_ceiling = bool(enforce_per_phase_soft_ceiling)
+        # ------------------------------------------------------
+
         # Set up the creator based on optimization mode and selected objectives
         setup_creator(multi_objective_mode, objective_function, multi_objective_functions)
 
@@ -346,6 +403,9 @@ class DTNExpansionOptimizer:
 
         # Load cluster data
         self._load_cluster_data()
+
+        # Build lock map now that clusters are known
+        self._build_lock_map()
 
         # Create a mapping from cluster combinations to their metrics
         self.cluster_metrics = self._create_cluster_metrics_mapping()
@@ -359,6 +419,48 @@ class DTNExpansionOptimizer:
         # Initialize DEAP toolbox
         self.toolbox = base.Toolbox()
         self._setup_genetic_algorithm()
+
+    def _build_lock_map(self):
+        """Build mapping of cluster->locked phase from configured reference genome after clusters are known."""
+        self.locked_clusters_phase = {}
+        if not getattr(self, 'lock_committed_early_phases', False):
+            return
+        locked_phases = set(self._locked_phase_indices_cfg or [1])
+        genome_source = (self.lock_reference_genome or 'baseline-dtn-opt').lower()
+        baseline_genome: List[int] = []
+        try:
+            if genome_source == 'custom' and self._custom_locked_genome_cfg:
+                baseline_genome = [int(x) for x in self._custom_locked_genome_cfg]
+            else:
+                baseline_csv = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / f"all_evaluated_individuals_{self.network_type}.csv"
+                if baseline_csv.exists():
+                    df = pd.read_csv(baseline_csv)
+                    if 'genome' in df.columns:
+                        if 'fitness_NPV' in df.columns:
+                            best_row = df.loc[df['fitness_NPV'].idxmax()]
+                        elif 'fitness_ROI' in df.columns:
+                            best_row = df.loc[df['fitness_ROI'].idxmax()]
+                        else:
+                            best_row = df.iloc[0]
+                        g = best_row['genome']
+                        if isinstance(g, list):
+                            baseline_genome = [int(x) for x in g]
+                        else:
+                            try:
+                                baseline_genome = [int(x) for x in str(g).replace('[','').replace(']','').split(',') if str(x).strip() != '']
+                            except Exception:
+                                baseline_genome = []
+                else:
+                    log().warning(f"Baseline optimization results not found at {baseline_csv}; locking disabled.")
+        except Exception as e:
+            log().warning(f"Failed to build lock map from reference genome: {e}")
+            baseline_genome = []
+        if baseline_genome and len(baseline_genome) == len(self.all_clusters):
+            for cluster, phase in zip(self.all_clusters, baseline_genome):
+                if int(phase) in locked_phases:
+                    self.locked_clusters_phase[int(cluster)] = int(phase)
+        elif baseline_genome:
+            log().warning("Reference genome length mismatch; locking disabled.")
 
     def _get_energy_price(self):
         """
@@ -431,19 +533,40 @@ class DTNExpansionOptimizer:
         # Load cluster assignments with fail-fast checks
         temp_root = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_folder())
 
-        cluster_edges_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_edges.csv"
-        _log_io("READ cluster_edges", cluster_edges_path)
-        _assert_under_temp(cluster_edges_path, temp_root, "cluster_edges")
-        if not cluster_edges_path.exists():
-            raise FileNotFoundError(f"Missing required temp file: cluster_edges.csv at {cluster_edges_path}")
-        self.cluster_edges = pd.read_csv(cluster_edges_path)
+        # Prefer baseline DTN mapping for consistency (authoritative cluster mapping)
+        baseline_edges_path = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "cluster_edges.csv"
+        baseline_nodes_path = Path(self.locator.get_dtn_cluster_nodes_file())
 
-        cluster_nodes_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_nodes.csv"
-        _log_io("READ cluster_nodes", cluster_nodes_path)
-        _assert_under_temp(cluster_nodes_path, temp_root, "cluster_nodes")
-        if not cluster_nodes_path.exists():
-            raise FileNotFoundError(f"Missing required temp file: cluster_nodes.csv at {cluster_nodes_path}")
-        self.cluster_nodes = pd.read_csv(cluster_nodes_path)
+        if baseline_edges_path.exists():
+            _log_io("READ cluster_edges (baseline)", baseline_edges_path)
+            self.cluster_edges = pd.read_csv(baseline_edges_path)
+        else:
+            cluster_edges_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_edges.csv"
+            _log_io("READ cluster_edges (temp)", cluster_edges_path)
+            _assert_under_temp(cluster_edges_path, temp_root, "cluster_edges")
+            if not cluster_edges_path.exists():
+                raise FileNotFoundError(f"Missing required temp file: cluster_edges.csv at {cluster_edges_path}")
+            self.cluster_edges = pd.read_csv(cluster_edges_path)
+
+        if baseline_nodes_path.exists():
+            _log_io("READ cluster_nodes (baseline)", baseline_nodes_path)
+            self.cluster_nodes = pd.read_csv(baseline_nodes_path)
+        else:
+            cluster_nodes_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_nodes.csv"
+            _log_io("READ cluster_nodes (temp)", cluster_nodes_path)
+            _assert_under_temp(cluster_nodes_path, temp_root, "cluster_nodes")
+            if not cluster_nodes_path.exists():
+                raise FileNotFoundError(f"Missing required temp file: cluster_nodes.csv at {cluster_nodes_path}")
+            self.cluster_nodes = pd.read_csv(cluster_nodes_path)
+
+        # Build authoritative building universe U from baseline mapping (CONSUMER only if available)
+        try:
+            nodes_df = self.cluster_nodes.copy()
+            if 'type' in nodes_df.columns:
+                nodes_df = nodes_df[nodes_df['type'] == 'CONSUMER']
+            self._universe_U_names = sorted(nodes_df['building'].astype(str).unique().tolist())
+        except Exception:
+            self._universe_U_names = []
 
         # Load total demand
         total_demand_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand())
@@ -614,10 +737,12 @@ class DTNExpansionOptimizer:
         clusters_to_connect = set(cluster_set).union({0})
 
         # Get buildings in the clusters
-        buildings = self.cluster_nodes[
-            (self.cluster_nodes['cluster'].isin(clusters_to_connect)) &
-            (self.cluster_nodes['type'] == 'CONSUMER')
-            ]['building'].tolist()
+        df_nodes = self.cluster_nodes
+        if 'type' in df_nodes.columns:
+            mask = (df_nodes['cluster'].isin(clusters_to_connect)) & (df_nodes['type'] == 'CONSUMER')
+        else:
+            mask = (df_nodes['cluster'].isin(clusters_to_connect))
+        buildings = df_nodes.loc[mask, 'building'].tolist()
 
         return buildings
 
@@ -1410,15 +1535,20 @@ class DTNExpansionOptimizer:
         # Prepare per-phase breakdown collection
         breakdown_rows = []
 
-        # Load demand once for GFA denominators (temp scenario)
+        # Load demand once for GFA denominators (temp scenario); restrict denominators to the authoritative universe U
         _demand_df = pd.read_csv(self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand())
-        _total_gfa_const = float(_demand_df['GFA_m2'].sum())
+        _universe = list(getattr(self, '_universe_U_names', []) or [])
+        if _universe:
+            _total_gfa_const = float(_demand_df.loc[_demand_df['name'].isin(_universe), 'GFA_m2'].sum())
+        else:
+            _total_gfa_const = float(_demand_df['GFA_m2'].sum())
         _name_to_gfa = dict(zip(_demand_df['name'], _demand_df['GFA_m2']))
 
         # Phase 0 emissions: COP-based if enabled, else use LCA operation with temp demand
         if self.compute_emissions_from_cop:
             # District-wide scope: ALL buildings
-            total_ghg, _, breakdown = self._compute_phase_emissions_from_cop(phase0_supply_path, scope_buildings=None, pump_electricity_kwh=0.0,
+            _universe_list = list(getattr(self, '_universe_U_names', []) or [])
+            total_ghg, _, breakdown = self._compute_phase_emissions_from_cop(phase0_supply_path, scope_buildings=_universe_list if _universe_list else None, pump_electricity_kwh=0.0,
                                                                              custom_demand_path=self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand())
             # Collect breakdown row for phase 0
             row0 = {'phase': 0, 'cumulative_clusters': '0'}
@@ -1445,14 +1575,20 @@ class DTNExpansionOptimizer:
             _log_io("READ LCA results phase0", _PathForIO(lca_results_path))
             lca_operation_results = pd.read_csv(lca_results_path)
             log().info(f"Loaded LCA results with {len(lca_operation_results)} buildings")
-            total_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())
-            # Connected-only emissions for Phase 0 (cluster 0) with normalized name matching
+            # Determine name column and build normalized series
             name_col = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
             if not name_col:
                 raise ValueError("LCA file missing building name column (expected 'name' or 'Name')")
+            lca_names_norm = lca_operation_results[name_col].astype(str).str.strip().str.upper()
+            # Universe mask (baseline CONSUMER buildings only) if available
+            universe_raw = list(getattr(self, '_universe_U_names', []) or [])
+            universe_norm = {str(b).strip().upper() for b in universe_raw}
+            mask_total = lca_names_norm.isin(universe_norm) if universe_norm else pd.Series(True, index=lca_operation_results.index)
+            # Total GHG limited to U
+            total_ghg = float(lca_operation_results.loc[mask_total, 'GHG_sys_tonCO2'].sum())
+            # Connected-only emissions for Phase 0 (cluster 0) with normalized name matching
             conn_set_raw = set(self._get_buildings_in_specific_cluster(0))
             conn_set_norm = {str(b).strip().upper() for b in conn_set_raw}
-            lca_names_norm = lca_operation_results[name_col].astype(str).str.strip().str.upper()
             mask_conn = lca_names_norm.isin(conn_set_norm)
             connected_ghg = float(lca_operation_results.loc[mask_conn, 'GHG_sys_tonCO2'].sum())
             # Diagnostics for Phase 0 matching
@@ -1501,20 +1637,20 @@ class DTNExpansionOptimizer:
             'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': per_total
         }
 
-        # Get cluster assignments from current individual
-        if hasattr(self, 'current_individual') and self.current_individual:
-            cluster_phase_map = {cluster: p for cluster, p in zip(self.all_clusters, self.current_individual)}
+        # Get cluster assignments from the final best genome if available; else fall back to current individual
+        if hasattr(self, 'solution') and self.solution and 'genome' in self.solution and self.solution['genome']:
+            cluster_phase_map = {cluster: p for cluster, p in zip(self.all_clusters, self.solution['genome'])}
             clusters_by_phase = {}
             for phase in range(1, self.num_phases + 1):
                 clusters_by_phase[phase] = [cluster for cluster, p in cluster_phase_map.items() if p == phase]
-        elif hasattr(self, 'solution') and self.solution and 'genome' in self.solution:
-            cluster_phase_map = {cluster: p for cluster, p in zip(self.all_clusters, self.solution['genome'])}
+        elif hasattr(self, 'current_individual') and self.current_individual:
+            cluster_phase_map = {cluster: p for cluster, p in zip(self.all_clusters, self.current_individual)}
             clusters_by_phase = {}
             for phase in range(1, self.num_phases + 1):
                 clusters_by_phase[phase] = [cluster for cluster, p in cluster_phase_map.items() if p == phase]
         else:
             # Fallback: distribute all_clusters evenly across phases
-            log().warning("No current_individual or solution genome found, using fallback cluster distribution")
+            log().warning("No final solution genome or current_individual found, using fallback cluster distribution")
             clusters_by_phase = {}
             clusters_per_phase = max(1, len(self.all_clusters) // self.num_phases)
             for phase in range(1, self.num_phases + 1):
@@ -1544,13 +1680,15 @@ class DTNExpansionOptimizer:
                 buildings = self._get_buildings_in_specific_cluster(cluster)
                 connected_buildings.extend(buildings)
 
-            # Update supply systems for connected buildings
-            for building in connected_buildings:
-                building_idx = phase_supply_df[phase_supply_df['name'] == building].index
-                if len(building_idx) > 0:
-                    phase_supply_df.loc[building_idx, 'supply_type_hs'] = district_heating_system
-                    phase_supply_df.loc[building_idx, 'supply_type_cs'] = district_cooling_system
-                    phase_supply_df.loc[building_idx, 'supply_type_dhw'] = district_dhw_system
+            # Update supply systems for connected buildings (normalize names for robust matching)
+            phase_supply_df['__name_norm__'] = phase_supply_df['name'].astype(str).str.strip().str.upper()
+            connected_norm = {str(b).strip().upper() for b in connected_buildings}
+            mask_conn = phase_supply_df['__name_norm__'].isin(connected_norm)
+            phase_supply_df.loc[mask_conn, 'supply_type_hs'] = district_heating_system
+            phase_supply_df.loc[mask_conn, 'supply_type_cs'] = district_cooling_system
+            phase_supply_df.loc[mask_conn, 'supply_type_dhw'] = district_dhw_system
+            # Clean helper column
+            phase_supply_df.drop(columns='__name_norm__', inplace=True, errors='ignore')
 
             # Save the phase-specific supply file
             phase_supply_path = phase_files_dir / f"phase{phase}_supply.csv"
@@ -1568,7 +1706,8 @@ class DTNExpansionOptimizer:
                     raise
                 pump_electricity_kwh = pump_electricity_wh / 1000.0
                 # District-wide emissions for ALL buildings
-                total_ghg, _, breakdown = self._compute_phase_emissions_from_cop(phase_supply_path, scope_buildings=None, pump_electricity_kwh=pump_electricity_kwh,
+                _universe_list = list(getattr(self, '_universe_U_names', []) or [])
+                total_ghg, _, breakdown = self._compute_phase_emissions_from_cop(phase_supply_path, scope_buildings=_universe_list if _universe_list else None, pump_electricity_kwh=pump_electricity_kwh,
                                                                                 custom_demand_path=self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand())
                 # Collect breakdown row for this phase
                 cum_clusters_str = '+'.join(map(str, sorted(set(connected_clusters))))
@@ -1596,14 +1735,19 @@ class DTNExpansionOptimizer:
                 _log_io("READ LCA results phase", _PathForIO(lca_results_path), extra={"phase": phase})
                 lca_operation_results = pd.read_csv(lca_results_path)
                 log().info(f"Loaded LCA results with {len(lca_operation_results)} buildings")
-                total_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())
                 name_col = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
                 if not name_col:
                     raise ValueError("LCA file missing building name column (expected 'name' or 'Name')")
-                # Normalize names for robust matching
+                # Normalize names and build universe mask
+                lca_names_norm = lca_operation_results[name_col].astype(str).str.strip().str.upper()
+                universe_raw = list(getattr(self, '_universe_U_names', []) or [])
+                universe_norm = {str(b).strip().upper() for b in universe_raw}
+                mask_total = lca_names_norm.isin(universe_norm) if universe_norm else pd.Series(True, index=lca_operation_results.index)
+                # Total GHG limited to U
+                total_ghg = float(lca_operation_results.loc[mask_total, 'GHG_sys_tonCO2'].sum())
+                # Connected-only emissions for this phase
                 conn_set_raw = set(connected_buildings)
                 conn_set_norm = {str(b).strip().upper() for b in conn_set_raw}
-                lca_names_norm = lca_operation_results[name_col].astype(str).str.strip().str.upper()
                 mask_conn = lca_names_norm.isin(conn_set_norm)
                 connected_ghg = float(lca_operation_results.loc[mask_conn, 'GHG_sys_tonCO2'].sum())
 
@@ -1611,7 +1755,7 @@ class DTNExpansionOptimizer:
             if (not self.compute_emissions_from_cop) and 'GFA_m2' in lca_operation_results.columns:
                 try:
                     connected_gfa_lca = float(lca_operation_results.loc[mask_conn, 'GFA_m2'].sum())
-                    total_gfa_lca = float(lca_operation_results['GFA_m2'].sum())
+                    total_gfa_lca = float(lca_operation_results.loc[mask_total, 'GFA_m2'].sum())
                 except Exception:
                     connected_gfa_lca = float(sum(_name_to_gfa.get(b, 0.0) for b in set(connected_buildings)))
                     total_gfa_lca = _total_gfa_const
@@ -1972,7 +2116,15 @@ class DTNExpansionOptimizer:
                 # Distribute phases more evenly
                 phase = random.randint(1, self.num_phases)
                 ind.append(phase)
-            return creator.Individual(ind)
+            ind = creator.Individual(ind)
+            # Apply locks if configured
+            if getattr(self, 'lock_committed_early_phases', False) and getattr(self, 'locked_clusters_phase', None):
+                cluster_to_index = {c: i for i, c in enumerate(self.all_clusters)}
+                for c, p in self.locked_clusters_phase.items():
+                    idx = cluster_to_index.get(c, None)
+                    if idx is not None:
+                        ind[idx] = int(p)
+            return ind
 
         # Register the custom individual creation function
         self.toolbox.register("individual", custom_individual)
@@ -1982,129 +2134,76 @@ class DTNExpansionOptimizer:
         def custom_population(n):
             pop = []
 
+            def _apply_locks(ind):
+                try:
+                    if getattr(self, 'lock_committed_early_phases', False) and getattr(self, 'locked_clusters_phase', None):
+                        cluster_to_index = {c: i for i, c in enumerate(self.all_clusters)}
+                        for c, p in self.locked_clusters_phase.items():
+                            idx = cluster_to_index.get(c, None)
+                            if idx is not None:
+                                ind[idx] = int(p)
+                except Exception:
+                    pass
+                return ind
+
             # Add some individuals with all clusters in the last phase
-            # This ensures at least one solution that likely respects budget constraints
             last_phase_ind = creator.Individual([self.num_phases] * len(self.all_clusters))
+            last_phase_ind = _apply_locks(last_phase_ind)
             pop.append(last_phase_ind)
 
             # Add some individuals with clusters evenly distributed across phases
-            for i in range(min(n // 4, 5)):  # Add up to 5 or n/4, whichever is smaller
+            for i in range(min(n // 4, 5)):
                 even_dist_ind = creator.Individual([])
                 for j in range(len(self.all_clusters)):
-                    # Distribute clusters evenly across phases
                     phase = (j % self.num_phases) + 1
                     even_dist_ind.append(phase)
+                even_dist_ind = _apply_locks(even_dist_ind)
                 pop.append(even_dist_ind)
 
             # Add some individuals with progressive phase assignments
-            # (earlier clusters in earlier phases)
             prog_ind = creator.Individual([])
-            clusters_per_phase = len(self.all_clusters) // self.num_phases
+            clusters_per_phase = max(1, len(self.all_clusters) // self.num_phases)
             for j in range(len(self.all_clusters)):
                 phase = min(j // clusters_per_phase + 1, self.num_phases)
                 prog_ind.append(phase)
+            prog_ind = _apply_locks(prog_ind)
             pop.append(prog_ind)
 
             # Fill the rest with random individuals
             while len(pop) < n:
-                pop.append(self.toolbox.individual())
+                ind = self.toolbox.individual()
+                ind = _apply_locks(ind)
+                pop.append(ind)
 
             return pop
 
         # Override the population creation function
         self.toolbox.register("population", custom_population)
 
-        # Define a repair function to fix budget constraint violations
+        # Define a repair function to enforce genome validity and locks (no per-phase budget moves)
         def repair_individual(individual):
             """
-            Repair function to fix individuals that violate budget constraints.
-            Moves clusters from earlier phases to later phases when budget is exceeded.
+            Repair function: keep genes within [1, num_phases] and re-apply locking of committed phases.
+            Per-phase budget moves are intentionally disabled (Q2: only final cumulative budgets are enforced).
             """
-            # Convert to cluster-phase mapping
-            cluster_phase_map = {cluster: phase for cluster, phase in zip(self.all_clusters, individual)}
-
-            # Group clusters by phase
-            clusters_by_phase = {}
-            for cluster, phase in cluster_phase_map.items():
-                if phase > 0:  # Skip unconnected clusters (phase 0)
-                    if phase not in clusters_by_phase:
-                        clusters_by_phase[phase] = []
-                    clusters_by_phase[phase].append(cluster)
-
-            # Check budget constraints for each phase, starting from phase 1
-            for phase in range(1, self.num_phases + 1):
-                if phase not in clusters_by_phase:
-                    continue
-
-                clusters = clusters_by_phase[phase]
-
-                # Calculate CAPEX for this phase
-                capex, _ = self._calculate_phase_capex(clusters, phase)
-
-                # Check if CAPEX budget is exceeded
-                if self.capex_budget_per_phase and phase - 1 < len(self.capex_budget_per_phase) and capex > \
-                        self.capex_budget_per_phase[phase - 1]:
-                    # Sort clusters by ROI (lower ROI first to be moved)
-                    sorted_clusters = sorted(clusters, key=lambda c: self.calculate_roi((c,), phase))
-
-                    # Move clusters to later phases until budget is satisfied
-                    for cluster in sorted_clusters:
-                        # Don't move if we're already in the last phase
-                        if phase == self.num_phases:
-                            break
-
-                        # Move this cluster to the next phase
-                        idx = self.all_clusters.index(cluster)
-                        individual[idx] = phase + 1
-
-                        # Update clusters_by_phase
-                        clusters_by_phase[phase].remove(cluster)
-                        if phase + 1 not in clusters_by_phase:
-                            clusters_by_phase[phase + 1] = []
-                        clusters_by_phase[phase + 1].append(cluster)
-
-                        # Recalculate CAPEX
-                        capex, _ = self._calculate_phase_capex(clusters_by_phase[phase], phase)
-
-                        # Check if we're now under budget
-                        if capex <= self.capex_budget_per_phase[phase - 1]:
-                            break
-
-                # Also check total expenditure budget
-                if phase in clusters_by_phase:
-                    clusters = clusters_by_phase[phase]
-                    total_expenditure = self._calculate_phase_total_expenditure(clusters, phase)
-
-                    # Check if total expenditure budget is exceeded
-                    if self.total_expenditure_budget_per_phase and phase - 1 < len(
-                            self.total_expenditure_budget_per_phase) and total_expenditure > \
-                            self.total_expenditure_budget_per_phase[phase - 1]:
-                        # Sort clusters by ROI (lower ROI first to be moved)
-                        sorted_clusters = sorted(clusters, key=lambda c: self.calculate_roi((c,), phase))
-
-                        # Move clusters to later phases until budget is satisfied
-                        for cluster in sorted_clusters:
-                            # Don't move if we're already in the last phase
-                            if phase == self.num_phases:
-                                break
-
-                            # Move this cluster to the next phase
-                            idx = self.all_clusters.index(cluster)
-                            individual[idx] = phase + 1
-
-                            # Update clusters_by_phase
-                            clusters_by_phase[phase].remove(cluster)
-                            if phase + 1 not in clusters_by_phase:
-                                clusters_by_phase[phase + 1] = []
-                            clusters_by_phase[phase + 1].append(cluster)
-
-                            # Recalculate total expenditure
-                            total_expenditure = self._calculate_phase_total_expenditure(clusters_by_phase[phase], phase)
-
-                            # Check if we're now under budget
-                            if total_expenditure <= self.total_expenditure_budget_per_phase[phase - 1]:
-                                break
-
+            # Clamp genes to valid phase range (robust cast)
+            for i, g in enumerate(individual):
+                try:
+                    gg = int(round(g))
+                except Exception:
+                    gg = 1
+                if gg < 1:
+                    gg = 1
+                elif gg > self.num_phases:
+                    gg = self.num_phases
+                individual[i] = gg
+            # Re-apply locks
+            if getattr(self, 'lock_committed_early_phases', False) and getattr(self, 'locked_clusters_phase', None):
+                cluster_to_index = {c: i for i, c in enumerate(self.all_clusters)}
+                for c, p in self.locked_clusters_phase.items():
+                    idx = cluster_to_index.get(c, None)
+                    if idx is not None:
+                        individual[idx] = int(p)
             return individual
 
         # Register genetic operators
@@ -2118,21 +2217,38 @@ class DTNExpansionOptimizer:
         def repair_decorator(func):
             def wrapper(*args, **kwargs):
                 result = func(*args, **kwargs)
-                # Handle both mutation (returns tuple) and crossover (returns list)
+
+                # If the underlying operator returns a tuple (DEAP convention)
                 if isinstance(result, tuple):
-                    # For mutation: result is (individual,)
-                    individual = result[0]
-                    # Apply repair to the individual
-                    repaired = repair_individual(individual)
-                    # Copy the repaired values back to the original individual
-                    individual[:] = repaired
-                    return result
-                else:
-                    # For crossover: result is a list of individuals
-                    for ind in result:
+                    # Mutation typically returns a single-individual tuple
+                    if len(result) == 1:
+                        ind = result[0]
                         repaired = repair_individual(ind)
                         ind[:] = repaired
+                        return (ind,)
+                    # Crossover typically returns a pair of individuals
+                    elif len(result) == 2:
+                        ind1, ind2 = result
+                        rep1 = repair_individual(ind1); ind1[:] = rep1
+                        rep2 = repair_individual(ind2); ind2[:] = rep2
+                        return (ind1, ind2)
+                    else:
+                        # Fallback: repair all and return a tuple of same length
+                        repaired_inds = []
+                        for ind in result:
+                            rep = repair_individual(ind); ind[:] = rep
+                            repaired_inds.append(ind)
+                        return tuple(repaired_inds)
+
+                # If a list is returned (rare for DEAP mate/mutate, but safe to support)
+                if isinstance(result, list):
+                    for i, ind in enumerate(result):
+                        rep = repair_individual(ind); ind[:] = rep
+                        result[i] = ind
                     return result
+
+                # Unexpected type: return as-is
+                return result
 
             return wrapper
 
@@ -2251,39 +2367,65 @@ class DTNExpansionOptimizer:
             total_roi += roi
             total_npv += npv
 
-        # Check CAPEX budget constraints
-        budget_violated = False
-        violation_amount = 0
+        # Per-phase relaxed ceilings: hard violation (dominant penalty) or mild penalty
+        per_phase_soft_violated = False
+        soft_excess_sum = 0.0
+        try:
+            if getattr(self, 'enforce_per_phase_soft_ceiling', False):
+                cap_soft = getattr(self, 'capex_soft_per_phase', []) or []
+                te_soft = getattr(self, 'total_exp_soft_per_phase', []) or []
+                for p_idx in range(self.num_phases):
+                    # CAPEX soft exceedance
+                    if p_idx < len(phase_capex) and p_idx < len(cap_soft):
+                        cap_limit = cap_soft[p_idx]
+                        if cap_limit is not None and np.isfinite(cap_limit):
+                            if float(phase_capex[p_idx]) > float(cap_limit):
+                                per_phase_soft_violated = True
+                            soft_excess_sum += max(0.0, float(phase_capex[p_idx]) - float(cap_limit))
+                    # Total Expenditure soft exceedance
+                    if p_idx < len(phase_total_expenditure) and p_idx < len(te_soft):
+                        te_limit = te_soft[p_idx]
+                        if te_limit is not None and np.isfinite(te_limit):
+                            if float(phase_total_expenditure[p_idx]) > float(te_limit):
+                                per_phase_soft_violated = True
+                            soft_excess_sum += max(0.0, float(phase_total_expenditure[p_idx]) - float(te_limit))
+                # Apply penalties: always dominant (baseline-like)
+                if per_phase_soft_violated:
+                    total_roi = -1000
+                    total_npv = -1000000
+                    weighted_emissions = 10_000_000.0
+        except Exception:
+            # Be robust: never fail evaluation due to penalty computation
+            pass
 
-        for phase in range(self.num_phases):
-            if phase < len(phase_capex) and self.capex_budget_per_phase and phase_capex[phase] > \
-                    self.capex_budget_per_phase[phase]:
-                # Apply penalty for exceeding CAPEX budget
-                violation_amount += phase_capex[phase] - self.capex_budget_per_phase[phase]
-                log().info(
-                    f"Individual {ind_tuple} exceeds CAPEX budget in phase {phase + 1}: {phase_capex[phase]} > {self.capex_budget_per_phase[phase]}")
+        # Final cumulative budget checks only (Q2): per-phase budgets are NOT enforced here
+        budget_violated = False
+        violation_amount = 0.0
+
+        total_capex_sum = float(sum(phase_capex)) if phase_capex else 0.0
+        total_totexp_sum = float(sum(phase_total_expenditure)) if phase_total_expenditure else 0.0
+
+        if getattr(self, 'enforce_final_cumulative_capex', False) and (self.final_cumulative_capex_budget_total not in (None, 0)):
+            if total_capex_sum > self.final_cumulative_capex_budget_total:
+                violation_amount += (total_capex_sum - self.final_cumulative_capex_budget_total)
+                log().info(f"Individual {ind_tuple} exceeds FINAL cumulative CAPEX budget: {total_capex_sum} > {self.final_cumulative_capex_budget_total}")
                 budget_violated = True
 
-        # Check total expenditure budget constraints
-        for phase in range(self.num_phases):
-            if phase < len(phase_total_expenditure) and self.total_expenditure_budget_per_phase and \
-                    phase_total_expenditure[phase] > self.total_expenditure_budget_per_phase[phase]:
-                # Apply penalty for exceeding total expenditure budget
-                violation_amount += phase_total_expenditure[phase] - self.total_expenditure_budget_per_phase[phase]
-                log().info(
-                    f"Individual {ind_tuple} exceeds total expenditure budget in phase {phase + 1}: {phase_total_expenditure[phase]} > {self.total_expenditure_budget_per_phase[phase]}")
+        if getattr(self, 'enforce_final_cumulative_total_exp', False) and (self.final_cumulative_total_exp_budget_total not in (None, 0)):
+            if total_totexp_sum > self.final_cumulative_total_exp_budget_total:
+                violation_amount += (total_totexp_sum - self.final_cumulative_total_exp_budget_total)
+                log().info(f"Individual {ind_tuple} exceeds FINAL cumulative Total Expenditure budget: {total_totexp_sum} > {self.final_cumulative_total_exp_budget_total}")
                 budget_violated = True
 
         # Apply penalties if budget is violated
         if budget_violated:
-            # Base penalty
+            # Base penalty (make clearly dominated)
             total_roi = -1000
             total_npv = -1000000
 
-            # For emissions objective, use a much larger penalty
-            # Make penalty proportional to the violation amount
-            penalty_factor = max(1, violation_amount / 1000000)  # Scale based on violation amount
-            weighted_emissions = 10000000 * penalty_factor  # Much larger penalty for emissions
+            # For emissions objective, use a much larger penalty proportional to violation amount
+            penalty_factor = max(1.0, violation_amount / 1_000_000.0)
+            weighted_emissions = 10_000_000.0 * penalty_factor
 
         # Check GHG budget constraints if specified (apply in both single and multi-objective modes)
         if self.ghg_budget_per_phase:
@@ -2562,6 +2704,13 @@ class DTNExpansionOptimizer:
                 'fitness': best_individual.fitness.values[0],
                 'phases': {}
             }
+
+            # Sync internal state to final best genome for downstream emissions/saving
+            try:
+                self.solution = solution
+                self.current_individual = list(best_individual)
+            except Exception:
+                pass
 
             # Group clusters by phase
             for cluster, phase in solution['cluster_phase_map'].items():
@@ -3470,8 +3619,37 @@ class DTNExpansionOptimizer:
         _assert_under_temp(output_dir, temp_root, "results folder")
         _log_io("ENSURE DIR results", output_dir)
 
+        # Sync to final best genome (if provided) so emissions and files reflect the chosen solution
+        try:
+            if isinstance(solution, dict):
+                self.solution = solution
+                if 'genome' in solution and solution['genome']:
+                    self.current_individual = list(solution['genome'])
+                    log().info(f"[FINAL] Best genome (objective={self.objective_function}): {solution['genome']}")
+                    if 'phases' in solution and isinstance(solution['phases'], dict):
+                        for ph in range(1, self.num_phases + 1):
+                            clusters_ph = solution['phases'].get(ph, [])
+                            log().info(f"[FINAL] Phase {ph}: Connecting clusters {clusters_ph}")
+        except Exception:
+            pass
+
         # Calculate district emissions using the new methodology
         district_emissions = self.calculate_district_emissions_new()
+
+        # Write final-best metadata JSON for traceability
+        try:
+            meta = {
+                "objective_function": self.objective_function,
+                "genome": solution.get('genome', []) if isinstance(solution, dict) else None,
+                "clusters": self.all_clusters,
+                "num_phases": self.num_phases,
+            }
+            meta_path = output_dir / "final_best_genome.json"
+            with open(meta_path, "w") as f:
+                json.dump(meta, f, indent=2)
+            log().info(f"[FINAL] Wrote {meta_path}")
+        except Exception:
+            pass
 
         # Check if this is a multi-objective result (list of solutions)
         if isinstance(solution, list):
@@ -4107,6 +4285,21 @@ class DTNExpansionOptimizer:
         log().info(f"Detailed optimization results saved to {detailed_results_file}")
         log().info(f"Optimization settings saved to {metadata_file}")
 
+        # Q7: Cleanup empty legacy phase_* directories (keep phase_supply_files)
+        try:
+            dtn_dir = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder())
+            for p in dtn_dir.glob("phase_*"):
+                if p.name == "phase_supply_files":
+                    continue
+                if p.is_dir():
+                    try:
+                        next(p.iterdir())
+                    except StopIteration:
+                        p.rmdir()
+                        log().info(f"Removed empty legacy directory: {p}")
+        except Exception:
+            pass
+
         return results_file
 
 
@@ -4150,14 +4343,28 @@ class PipeLayoutGenerator:
         # Log the start of loading inputs
         log().info(f"Loading inputs for phase {self.phase}...")
         
-        # Load cluster assignments
-        cluster_edges_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_edges.csv"
-        log().info(f"Loading cluster edges (temp scenario) from: {cluster_edges_path}")
-        self.cluster_edges = pd.read_csv(cluster_edges_path)
+        # Load cluster assignments (prefer baseline mapping for consistency)
+        baseline_edges_path = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "cluster_edges.csv"
+        baseline_nodes_path = Path(self.locator.get_dtn_cluster_nodes_file())
+        if baseline_edges_path.exists():
+            log().info(f"Loading cluster edges (baseline) from: {baseline_edges_path}")
+            self.cluster_edges = pd.read_csv(baseline_edges_path)
+        else:
+            cluster_edges_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_edges.csv"
+            log().info(f"Loading cluster edges (temp scenario) from: {cluster_edges_path}")
+            self.cluster_edges = pd.read_csv(cluster_edges_path)
 
-        cluster_nodes_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_nodes.csv"
-        log().info(f"Loading cluster nodes (temp scenario) from: {cluster_nodes_path}")
-        self.cluster_nodes = pd.read_csv(cluster_nodes_path)
+        if baseline_nodes_path.exists():
+            log().info(f"Loading cluster nodes (baseline) from: {baseline_nodes_path}")
+            self.cluster_nodes = pd.read_csv(baseline_nodes_path)
+        else:
+            cluster_nodes_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_nodes.csv"
+            log().info(f"Loading cluster nodes (temp scenario) from: {cluster_nodes_path}")
+            self.cluster_nodes = pd.read_csv(cluster_nodes_path)
+        
+        # Filter to CONSUMER nodes when available
+        if 'type' in self.cluster_nodes.columns:
+            self.cluster_nodes = self.cluster_nodes[self.cluster_nodes['type'] == 'CONSUMER']
         
         # Load edge-node matrix
         edge_node_path = Path(self.locator.get_thermal_network_edge_node_matrix_file(self.network_type))
@@ -4416,6 +4623,80 @@ class PipeLayoutGenerator:
         return metrics_df
 
 
+def _detect_unmodified_clusters(locator, network_type, cluster_nodes_df, eps=1e-6):
+    import pandas as _pd
+    base_td = _pd.read_csv(locator.get_total_demand())
+    temp_td = _pd.read_csv(locator.get_dynamic_dtn_optimization_temp_scenario_total_demand())
+    nodes = cluster_nodes_df.copy()
+    if 'type' in nodes.columns:
+        nodes = nodes[nodes['type'] == 'CONSUMER']
+    # choose energy columns by network type
+    if str(network_type).upper() == 'DH':
+        base_td['__Q__'] = base_td.get('Qhs_sys_MWhyr', 0).abs().fillna(0.0) + base_td.get('Qww_sys_MWhyr', 0).abs().fillna(0.0)
+        temp_td['__Q__'] = temp_td.get('Qhs_sys_MWhyr', 0).abs().fillna(0.0) + temp_td.get('Qww_sys_MWhyr', 0).abs().fillna(0.0)
+    else:
+        base_td['__Q__'] = base_td.get('Qcs_sys_MWhyr', 0).abs().fillna(0.0) + base_td.get('Qcre_sys_MWhyr', 0).abs().fillna(0.0) + base_td.get('Qcdata_sys_MWhyr', 0).abs().fillna(0.0)
+        temp_td['__Q__'] = temp_td.get('Qcs_sys_MWhyr', 0).abs().fillna(0.0) + temp_td.get('Qcre_sys_MWhyr', 0).abs().fillna(0.0) + temp_td.get('Qcdata_sys_MWhyr', 0).abs().fillna(0.0)
+    # map building to cluster
+    b2c = dict(zip(nodes['building'].astype(str), nodes['cluster'].astype(int)))
+    base_sum = base_td.groupby(base_td['name'].astype(str).map(b2c)).agg({'__Q__': 'sum'})
+    temp_sum = temp_td.groupby(temp_td['name'].astype(str).map(b2c)).agg({'__Q__': 'sum'})
+    comp = base_sum.join(temp_sum, lsuffix='_base', rsuffix='_temp').fillna(0.0)
+    unmodified = []
+    for cid, row in comp.iterrows():
+        if _pd.isna(cid):
+            continue
+        cid_int = int(cid)
+        # always treat cluster 0 as unmodified reference
+        if cid_int == 0:
+            unmodified.append(0)
+            continue
+        b = float(row.get('__Q___base', 0.0))
+        m = float(row.get('__Q___temp', 0.0))
+        if b == 0.0 and m == 0.0:
+            unmodified.append(cid_int)
+        else:
+            if abs(m - b) <= eps * max(1.0, abs(b)):
+                unmodified.append(cid_int)
+    return sorted(set(unmodified))
+
+def _compare_unmodified_combinations(locator, network_type, cluster_nodes_df, updated_metrics_df, tol_rel=1e-6, tol_abs=1e-6, max_order=2):
+    import pandas as _pd
+    from itertools import combinations as _combinations
+    baseline_metrics_file = Path(locator.get_dtn_expansion_optimization_results_folder()) / "clusters_metrics.csv"
+    if not baseline_metrics_file.exists():
+        log().info(f"No baseline clusters_metrics found at {baseline_metrics_file}; skipping sanity check.")
+        return
+    base_df = _pd.read_csv(baseline_metrics_file)
+    unmod = _detect_unmodified_clusters(locator, network_type, cluster_nodes_df)
+    # Build keys to check
+    keys_to_check = set(['0'])
+    for c in unmod:
+        if c == 0:
+            continue
+        keys_to_check.add('+'.join(map(str, sorted([0, c]))))
+    if max_order >= 2:
+        for c1, c2 in _combinations([c for c in unmod if c != 0], 2):
+            keys_to_check.add('+'.join(map(str, sorted([0, c1, c2]))))
+    demand_col = 'total_annual_Qh_MWh' if str(network_type).upper() == 'DH' else 'total_annual_Qc_MWh'
+    for key in sorted(keys_to_check):
+        rb = base_df[base_df['clusters'] == key]
+        ru = updated_metrics_df[updated_metrics_df['clusters'] == key]
+        if rb.empty or ru.empty:
+            log().error(f"[Sanity] Missing combination '{key}' in {'baseline' if rb.empty else 'updated'} metrics.")
+            raise RuntimeError(f"Missing combination '{key}' in {'baseline' if rb.empty else 'updated'} metrics.")
+        bL = float(rb['total_pipe_length_m'].iloc[0])
+        uL = float(ru['total_pipe_length_m'].iloc[0])
+        if abs(bL - uL) > tol_abs:
+            log().error(f"[Sanity] Pipe length mismatch for '{key}': baseline={bL}, updated={uL}")
+            raise RuntimeError(f"Pipe length mismatch for '{key}'. Please re-check Part 1 outputs or mapping.")
+        bQ = float(rb[demand_col].iloc[0])
+        uQ = float(ru[demand_col].iloc[0])
+        if not (abs(uQ - bQ) <= max(tol_abs, tol_rel * max(1.0, abs(bQ)))):
+            log().error(f"[Sanity] Demand mismatch for '{key}': baseline={bQ}, updated={uQ}")
+            raise RuntimeError(f"Demand mismatch for '{key}'. Unmodified combos should match baseline. Check Part 1 export.")
+    log().info(f"Sanity check passed for {len(keys_to_check)} unmodified combinations (incl. 0).")
+
 def generate_updated_metrics(locator, network_type, testing_clusters=None):
     """
     Generate updated metrics based on demand files in the temp scenario.
@@ -4456,22 +4737,36 @@ def generate_updated_metrics(locator, network_type, testing_clusters=None):
     # Create a custom PipeLayoutGenerator that uses the temp scenario's total demand file
     class CustomPipeLayoutGenerator(PipeLayoutGenerator):
         def _load_inputs(self):
-            """Override to ensure we use the temp scenario's total demand file."""
-            # Load cluster assignments using direct path methods
-            cluster_edges_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_edges.csv"
-            log().info(f"Loading cluster edges from: {cluster_edges_path}")
-            self.cluster_edges = pd.read_csv(cluster_edges_path)
+            """Override to ensure we use the temp scenario's total demand file, but baseline cluster mapping."""
+            # Prefer baseline cluster assignments for consistency
+            baseline_edges_path = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "cluster_edges.csv"
+            baseline_nodes_path = Path(self.locator.get_dtn_cluster_nodes_file())
+            if baseline_edges_path.exists():
+                log().info(f"Loading cluster edges (baseline) from: {baseline_edges_path}")
+                self.cluster_edges = pd.read_csv(baseline_edges_path)
+            else:
+                cluster_edges_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_edges.csv"
+                log().info(f"Loading cluster edges (temp scenario) from: {cluster_edges_path}")
+                self.cluster_edges = pd.read_csv(cluster_edges_path)
 
-            cluster_nodes_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_nodes.csv"
-            log().info(f"Loading cluster nodes (temp scenario) from: {cluster_nodes_path}")
-            self.cluster_nodes = pd.read_csv(cluster_nodes_path)
+            if baseline_nodes_path.exists():
+                log().info(f"Loading cluster nodes (baseline) from: {baseline_nodes_path}")
+                self.cluster_nodes = pd.read_csv(baseline_nodes_path)
+            else:
+                cluster_nodes_path = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "cluster_nodes.csv"
+                log().info(f"Loading cluster nodes (temp scenario) from: {cluster_nodes_path}")
+                self.cluster_nodes = pd.read_csv(cluster_nodes_path)
+
+            # Filter to CONSUMER nodes when available
+            if 'type' in self.cluster_nodes.columns:
+                self.cluster_nodes = self.cluster_nodes[self.cluster_nodes['type'] == 'CONSUMER']
 
             # Load edge-node matrix
             edge_node_path = Path(self.locator.get_thermal_network_edge_node_matrix_file(self.network_type))
             log().info(f"Loading edge-node matrix from: {edge_node_path}")
             self.edge_node_matrix = pd.read_csv(edge_node_path, index_col=0)
 
-            # CRITICAL CHANGE: Explicitly use the temp scenario's total demand file
+            # Use the temp scenario's total demand file
             total_demand_path = temp_total_demand
             log().info(f"Loading total demand from temp scenario: {total_demand_path}")
 
@@ -4537,7 +4832,15 @@ def generate_updated_metrics(locator, network_type, testing_clusters=None):
     log().info("Generating pipe layouts with temp scenario demand files...")
     metrics_df = generator.generate_pipe_layouts()
 
-    # Save the updated metrics
+    # Q6: Sanity check for unmodified combinations (0, 0+c, 0+c1+c2) vs baseline; stop on mismatch
+    try:
+        log().info("Running sanity check for unmodified cluster combinations against baseline metrics...")
+        _compare_unmodified_combinations(locator, network_type, generator.cluster_nodes, metrics_df)
+    except Exception as e:
+        log().error(f"Sanity check failed: {e}")
+        raise
+
+    # Save the updated metrics (overwrite)
     output_file = output_dir / "clusters_metrics_updated.csv"
     metrics_df.to_csv(output_file, index=False)
     log().info(f"Saved updated metrics to {output_file}")
@@ -4622,6 +4925,22 @@ def main(config):
 
     log().info(f"Found temporary scenario at: {temp_scenario_path}")
 
+    # Q4: Mirror baseline cluster mapping files into temp_scenario for diagnostics (authoritative mapping is baseline)
+    try:
+        from shutil import copyfile as _copyfile
+        temp_dtn_dir = Path(locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder())
+        temp_dtn_dir.mkdir(parents=True, exist_ok=True)
+        baseline_nodes = Path(locator.get_dtn_cluster_nodes_file())
+        baseline_edges = Path(locator.get_dtn_expansion_optimization_results_folder()) / "cluster_edges.csv"
+        if baseline_nodes.exists():
+            _copyfile(baseline_nodes, temp_dtn_dir / "cluster_nodes.csv")
+            log().info(f"Copied baseline cluster_nodes.csv to {temp_dtn_dir}")
+        if baseline_edges.exists():
+            _copyfile(baseline_edges, temp_dtn_dir / "cluster_edges.csv")
+            log().info(f"Copied baseline cluster_edges.csv to {temp_dtn_dir}")
+    except Exception as e:
+        log().warning(f"Could not mirror baseline cluster mapping files to temp_scenario: {e}")
+
     # Parse testing clusters from config
     testing_clusters_str = config.dtn_expansion_optimization.testing_clusters
     if testing_clusters_str:
@@ -4629,22 +4948,13 @@ def main(config):
     else:
         testing_clusters = None
 
-    # Load the metrics DataFrame from the dynamic DTN optimization updated metrics file
-    log().info("Checking for dynamic DTN optimization updated metrics file")
-    metrics_file = Path(locator.get_dynamic_dtn_optimization_updated_metrics_file())
-
-    # Generate the updated metrics file if it doesn't exist
-    if not metrics_file.exists():
-        log().info(f"Updated metrics file not found: {metrics_file}")
-        log().info("Generating updated metrics file...")
-        metrics_df = generate_updated_metrics(
-            locator=locator,
-            network_type=network_type,
-            testing_clusters=testing_clusters
-        )
-    else:
-        log().info(f"Loading metrics from: {metrics_file}")
-        metrics_df = pd.read_csv(metrics_file)
+    # Always regenerate updated metrics (overwrite mode) from temp scenario demand files (Q3)
+    log().info("Regenerating updated metrics from temp scenario demand (overwrite mode)")
+    metrics_df = generate_updated_metrics(
+        locator=locator,
+        network_type=network_type,
+        testing_clusters=testing_clusters
+    )
 
     # Load saved DTN optimization settings (if available) and resolve parameters with precedence
     saved = {}
@@ -4684,6 +4994,67 @@ def main(config):
 
     ghg_budget_str = getattr(config.dtn_expansion_optimization, 'ghg_budget_per_phase', None)
     ghg_budget_per_phase = [float(b.strip()) for b in str(ghg_budget_str).split(',') if str(b).strip()] if ghg_budget_str else saved.get('ghg_budget_per_phase')
+
+    # Q2/Q3 additional parameters (relaxing pct with legacy fallback)
+    capex_per_phase_relaxing_pct_cfg = getattr(config.dtn_expansion_optimization, 'capex_per_phase_relaxing_pct', None)
+    if capex_per_phase_relaxing_pct_cfg in (None, ''):
+        capex_per_phase_relaxing_pct_cfg = getattr(config.dtn_expansion_optimization, 'capex_per_phase_softening_pct', None)
+    capex_per_phase_relaxing_pct_saved = saved.get('capex_per_phase_relaxing_pct', saved.get('capex_per_phase_softening_pct'))
+    capex_per_phase_softening_pct = pick(capex_per_phase_relaxing_pct_cfg, capex_per_phase_relaxing_pct_saved, 0.20)
+
+    total_exp_per_phase_relaxing_pct_cfg = getattr(config.dtn_expansion_optimization, 'total_exp_per_phase_relaxing_pct', None)
+    if total_exp_per_phase_relaxing_pct_cfg in (None, ''):
+        total_exp_per_phase_relaxing_pct_cfg = getattr(config.dtn_expansion_optimization, 'total_exp_per_phase_softening_pct', None)
+    total_exp_per_phase_relaxing_pct_saved = saved.get('total_exp_per_phase_relaxing_pct', saved.get('total_exp_per_phase_softening_pct'))
+    total_exp_per_phase_softening_pct = pick(total_exp_per_phase_relaxing_pct_cfg, total_exp_per_phase_relaxing_pct_saved, 0.20)
+
+    enforce_final_cumulative_capex = bool(pick(getattr(config.dtn_expansion_optimization, 'enforce_final_cumulative_capex', None), saved.get('enforce_final_cumulative_capex'), True))
+    enforce_final_cumulative_total_exp = bool(pick(getattr(config.dtn_expansion_optimization, 'enforce_final_cumulative_total_exp', None), saved.get('enforce_final_cumulative_total_exp'), True))
+
+    final_cumulative_capex_budget_total = pick(getattr(config.dtn_expansion_optimization, 'final_cumulative_capex_budget_total', None), saved.get('final_cumulative_capex_budget_total'), 0)
+    final_cumulative_total_exp_budget_total = pick(getattr(config.dtn_expansion_optimization, 'final_cumulative_total_exp_budget_total', None), saved.get('final_cumulative_total_exp_budget_total'), 0)
+    try:
+        final_cumulative_capex_budget_total = float(final_cumulative_capex_budget_total) if str(final_cumulative_capex_budget_total) not in ("", "None") else 0
+    except Exception:
+        final_cumulative_capex_budget_total = 0
+    try:
+        final_cumulative_total_exp_budget_total = float(final_cumulative_total_exp_budget_total) if str(final_cumulative_total_exp_budget_total) not in ("", "None") else 0
+    except Exception:
+        final_cumulative_total_exp_budget_total = 0
+
+    lock_committed_early_phases = bool(pick(getattr(config.dtn_expansion_optimization, 'lock_committed_early_phases', None), saved.get('lock_committed_early_phases'), True))
+    lock_reference_genome = str(pick(getattr(config.dtn_expansion_optimization, 'lock_reference_genome', None), saved.get('lock_reference_genome'), 'baseline-dtn-opt'))
+
+    locked_phase_indices_raw = pick(getattr(config.dtn_expansion_optimization, 'locked_phase_indices', None), saved.get('locked_phase_indices'), '1')
+    if isinstance(locked_phase_indices_raw, str):
+        locked_phase_indices = [int(x.strip()) for x in locked_phase_indices_raw.split(',') if x.strip() != '']
+    elif isinstance(locked_phase_indices_raw, list):
+        locked_phase_indices = [int(x) for x in locked_phase_indices_raw]
+    else:
+        locked_phase_indices = [1]
+
+    custom_locked_genome_raw = pick(getattr(config.dtn_expansion_optimization, 'custom_locked_genome', None), saved.get('custom_locked_genome'), '')
+    custom_locked_genome = []
+    if isinstance(custom_locked_genome_raw, str) and custom_locked_genome_raw:
+        try:
+            s = str(custom_locked_genome_raw).strip()
+            if s.startswith('[') and s.endswith(']'):
+                s = s[1:-1]
+            custom_locked_genome = [int(x.strip()) for x in s.split(',') if x.strip() != '']
+        except Exception:
+            custom_locked_genome = []
+    elif isinstance(custom_locked_genome_raw, list):
+        try:
+            custom_locked_genome = [int(x) for x in custom_locked_genome_raw]
+        except Exception:
+            custom_locked_genome = []
+
+    # Per-phase ceiling enforcement is always ON (hidden from GUI)
+    enforce_per_phase_soft_ceiling = True
+    try:
+        log().info("Per-phase relaxed ceiling enforcement is forced to True (hidden from GUI)")
+    except Exception:
+        pass
 
     log().info("Creating optimizer with original locator (using direct path methods)")
 
@@ -4746,7 +5117,19 @@ def main(config):
         ghg_budget_per_phase=ghg_budget_per_phase,
         multi_objective_mode=multi_objective_mode,
         multi_objective_functions=multi_objective_functions,
-        testing_clusters=testing_clusters
+        testing_clusters=testing_clusters,
+        # New Q2/Q3
+        capex_per_phase_softening_pct=float(capex_per_phase_softening_pct),
+        total_exp_per_phase_softening_pct=float(total_exp_per_phase_softening_pct),
+        enforce_final_cumulative_capex=bool(enforce_final_cumulative_capex),
+        final_cumulative_capex_budget_total=float(final_cumulative_capex_budget_total),
+        enforce_final_cumulative_total_exp=bool(enforce_final_cumulative_total_exp),
+        final_cumulative_total_exp_budget_total=float(final_cumulative_total_exp_budget_total),
+        lock_committed_early_phases=bool(lock_committed_early_phases),
+        locked_phase_indices=locked_phase_indices,
+        lock_reference_genome=str(lock_reference_genome),
+        custom_locked_genome=custom_locked_genome,
+        enforce_per_phase_soft_ceiling=bool(enforce_per_phase_soft_ceiling)
     )
 
     # Set emissions computation mode from config (default True)

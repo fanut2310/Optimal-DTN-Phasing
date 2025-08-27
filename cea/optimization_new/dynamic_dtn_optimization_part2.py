@@ -256,7 +256,13 @@ class DTNExpansionOptimizer:
                  lock_reference_genome: str = 'baseline-dtn-opt',
                  custom_locked_genome: Optional[List[int]] = None,
                  # Soft per-phase ceiling (always hard-penalized on exceedance)
-                 enforce_per_phase_soft_ceiling: bool = True):
+                 enforce_per_phase_soft_ceiling: bool = True,
+                 # GA hyperparameters
+                 ga_crossover_probability: float = 0.5,
+                 ga_mutation_probability: float = 0.2,
+                 ga_tournament_size: int = 3,
+                 ga_mutation_indpb: float = 0.4,
+                 ga_random_seed: int = 0):
         """
         Initialize the DTN expansion optimizer.
 
@@ -393,6 +399,29 @@ class DTNExpansionOptimizer:
         self.locked_clusters_phase: Dict[int, int] = {}
         # Per-phase ceiling: always treated as hard if enabled
         self.enforce_per_phase_soft_ceiling = bool(enforce_per_phase_soft_ceiling)
+        # ------------------------------------------------------
+
+        # ---------------- GA hyperparameters ----------------
+        try:
+            self.ga_crossover_probability = float(ga_crossover_probability if ga_crossover_probability is not None else 0.5)
+            self.ga_mutation_probability = float(ga_mutation_probability if ga_mutation_probability is not None else 0.2)
+            self.ga_tournament_size = int(ga_tournament_size if ga_tournament_size is not None else 3)
+            self.ga_mutation_indpb = float(ga_mutation_indpb if ga_mutation_indpb is not None else 0.4)
+            self.ga_random_seed = int(ga_random_seed if ga_random_seed is not None else 0)
+        except Exception:
+            self.ga_crossover_probability = 0.5
+            self.ga_mutation_probability = 0.2
+            self.ga_tournament_size = 3
+            self.ga_mutation_indpb = 0.4
+            self.ga_random_seed = 0
+        # Apply RNG seed if provided (>0)
+        try:
+            if int(self.ga_random_seed) > 0:
+                random.seed(int(self.ga_random_seed))
+                np.random.seed(int(self.ga_random_seed))
+                log().info(f"GA RNG seeded with {self.ga_random_seed}")
+        except Exception:
+            pass
         # ------------------------------------------------------
 
         # Set up the creator based on optimization mode and selected objectives
@@ -2210,8 +2239,8 @@ class DTNExpansionOptimizer:
         self.toolbox.register("evaluate", self._evaluate_individual)
         self.toolbox.register("mate", tools.cxTwoPoint)
         self.toolbox.register("mutate", tools.mutUniformInt, low=1, up=self.num_phases,
-                              indpb=0.4)  # Increased mutation rate
-        self.toolbox.register("select", tools.selTournament, tournsize=3)
+                              indpb=getattr(self, 'ga_mutation_indpb', 0.4))  # configurable mutation rate
+        self.toolbox.register("select", tools.selTournament, tournsize=getattr(self, 'ga_tournament_size', 3))
 
         # Define a repair decorator that wraps the genetic operators
         def repair_decorator(func):
@@ -2607,7 +2636,7 @@ class DTNExpansionOptimizer:
             # Use the custom evaluation function in the algorithm
             algorithms.eaMuPlusLambda(pop, self.toolbox, mu=population_size,
                                       lambda_=population_size,
-                                      cxpb=0.5, mutpb=0.2,
+                                      cxpb=getattr(self, 'ga_crossover_probability', 0.5), mutpb=getattr(self, 'ga_mutation_probability', 0.2),
                                       ngen=num_generations,
                                       stats=None, halloffame=pareto, verbose=True)
 
@@ -2689,7 +2718,7 @@ class DTNExpansionOptimizer:
             stats.register("max", np.max)
 
             # Use the custom evaluation function in the algorithm
-            pop, logbook = algorithms.eaSimple(pop, self.toolbox, cxpb=0.5, mutpb=0.2,
+            pop, logbook = algorithms.eaSimple(pop, self.toolbox, cxpb=getattr(self, 'ga_crossover_probability', 0.5), mutpb=getattr(self, 'ga_mutation_probability', 0.2),
                                                ngen=num_generations, stats=stats,
                                                halloffame=hof, verbose=True)
 
@@ -5056,6 +5085,15 @@ def main(config):
     except Exception:
         pass
 
+    # GA hyperparameters
+    ga_crossover_probability = pick(getattr(config.dtn_expansion_optimization, 'ga_crossover_probability', None), saved.get('ga_crossover_probability'), 0.5)
+    ga_mutation_probability = pick(getattr(config.dtn_expansion_optimization, 'ga_mutation_probability', None), saved.get('ga_mutation_probability'), 0.2)
+    ga_tournament_size = pick(getattr(config.dtn_expansion_optimization, 'ga_tournament_size', None), saved.get('ga_tournament_size'), 3)
+    ga_mutation_indpb = pick(getattr(config.dtn_expansion_optimization, 'ga_mutation_indpb', None), saved.get('ga_mutation_indpb'), 0.4)
+
+    # random seed: 0 or blank => random
+    ga_random_seed = pick(getattr(config.dtn_expansion_optimization, 'ga_random_seed', None), saved.get('ga_random_seed'), 0)
+
     log().info("Creating optimizer with original locator (using direct path methods)")
 
     # Resolve objective and technical parameters with precedence (config > saved > defaults)
@@ -5144,6 +5182,48 @@ def main(config):
     population_size = pick(getattr(config.dtn_expansion_optimization, 'population_size', None), saved.get('population_size'), 50)
     num_generations = pick(getattr(config.dtn_expansion_optimization, 'num_generations', None), saved.get('num_generations'), 30)
 
+    # Persist resolved run settings (including new constraint parameters) to temp scenario for Part 3 and reproducibility
+    try:
+        settings_out = {
+            "network_type": network_type,
+            "objective_function": str(objective_function),
+            "num_phases": int(num_phases),
+            "phase_durations": phase_durations,
+            "capex_budget_per_phase": capex_budget_per_phase,
+            "total_expenditure_budget_per_phase": total_expenditure_budget_per_phase,
+            "ghg_budget_per_phase": ghg_budget_per_phase,
+            # New constraint parameters (use snake_case keys Part 3 understands)
+            "capex_per_phase_relaxing_pct": float(capex_per_phase_softening_pct),
+            "total_exp_per_phase_relaxing_pct": float(total_exp_per_phase_softening_pct),
+            "enforce_final_cumulative_capex": bool(enforce_final_cumulative_capex),
+            "final_cumulative_capex_budget_total": float(final_cumulative_capex_budget_total),
+            "enforce_final_cumulative_total_exp": bool(enforce_final_cumulative_total_exp),
+            "final_cumulative_total_exp_budget_total": float(final_cumulative_total_exp_budget_total),
+            "lock_committed_early_phases": bool(lock_committed_early_phases),
+            "locked_phase_indices": locked_phase_indices,
+            "lock_reference_genome": str(lock_reference_genome),
+            "custom_locked_genome": custom_locked_genome,
+            "enforce_per_phase_soft_ceiling": bool(enforce_per_phase_soft_ceiling),
+            # GA runtime
+            "population_size": int(population_size),
+            "num_generations": int(num_generations),
+            # Misc
+            "testing_clusters": testing_clusters,
+            "compute_emissions_from_cop": bool(getattr(optimizer, 'compute_emissions_from_cop', True))
+        }
+        # Remove None values to keep file clean
+        settings_out = {k: v for k, v in settings_out.items() if v is not None}
+        # Ensure parent folder exists and write
+        try:
+            Path(saved_path).parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        with open(saved_path, 'w') as f:
+            json.dump(settings_out, f, indent=2)
+        log().info(f"Saved resolved run settings to {saved_path}")
+    except Exception as e:
+        log().warning(f"Could not write resolved run settings JSON: {e}")
+
     solution = optimizer.optimize(population_size=int(population_size), num_generations=int(num_generations))
 
     # Save the results
@@ -5173,6 +5253,19 @@ def main(config):
             "population_size": int(population_size),
             "num_generations": int(num_generations),
             "testing_clusters": testing_clusters,
+            # New constraint parameters (mirrors run_settings.json)
+            "capex_per_phase_relaxing_pct": float(capex_per_phase_softening_pct),
+            "total_exp_per_phase_relaxing_pct": float(total_exp_per_phase_softening_pct),
+            "enforce_final_cumulative_capex": bool(enforce_final_cumulative_capex),
+            "final_cumulative_capex_budget_total": float(final_cumulative_capex_budget_total),
+            "enforce_final_cumulative_total_exp": bool(enforce_final_cumulative_total_exp),
+            "final_cumulative_total_exp_budget_total": float(final_cumulative_total_exp_budget_total),
+            "lock_committed_early_phases": bool(lock_committed_early_phases),
+            "locked_phase_indices": locked_phase_indices,
+            "lock_reference_genome": str(lock_reference_genome),
+            "custom_locked_genome": custom_locked_genome,
+            "enforce_per_phase_soft_ceiling": bool(enforce_per_phase_soft_ceiling),
+            "compute_emissions_from_cop": bool(getattr(optimizer, 'compute_emissions_from_cop', True)),
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
         }
         # get genome if available

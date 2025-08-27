@@ -252,7 +252,12 @@ class DTNExpansionOptimizer:
                  pump_capex_a: float = 1230, pump_capex_b: float = 0.65,
                  cooling_cop: float = 4.0, ghg_budget_per_phase: Optional[List[float]] = None,
                  multi_objective_mode: bool = False, multi_objective_functions: Optional[List[str]] = None,
-                 testing_clusters=None):
+                 testing_clusters=None,
+                 ga_crossover_probability: float = 0.5,
+                 ga_mutation_probability: float = 0.2,
+                 ga_tournament_size: int = 3,
+                 ga_mutation_indpb: float = 0.4,
+                 ga_random_seed: int = 0):
         """
         Initialize the DTN expansion optimizer.
 
@@ -364,6 +369,29 @@ class DTNExpansionOptimizer:
 
         # Emissions computation preference: default to COP-based correction (fail-fast on errors)
         self.compute_emissions_from_cop = True
+
+        # ---------------- GA hyperparameters ----------------
+        try:
+            self.ga_crossover_probability = float(ga_crossover_probability if ga_crossover_probability is not None else 0.5)
+            self.ga_mutation_probability = float(ga_mutation_probability if ga_mutation_probability is not None else 0.2)
+            self.ga_tournament_size = int(ga_tournament_size if ga_tournament_size is not None else 3)
+            self.ga_mutation_indpb = float(ga_mutation_indpb if ga_mutation_indpb is not None else 0.4)
+            self.ga_random_seed = int(ga_random_seed if ga_random_seed is not None else 0)
+        except Exception:
+            self.ga_crossover_probability = 0.5
+            self.ga_mutation_probability = 0.2
+            self.ga_tournament_size = 3
+            self.ga_mutation_indpb = 0.4
+            self.ga_random_seed = 0
+        # Apply RNG seed if provided (>0)
+        try:
+            if int(self.ga_random_seed) > 0:
+                random.seed(int(self.ga_random_seed))
+                np.random.seed(int(self.ga_random_seed))
+                log().info(f"GA RNG seeded with {self.ga_random_seed}")
+        except Exception:
+            pass
+        # ------------------------------------------------------
 
         # Initialize DEAP toolbox
         self.toolbox = base.Toolbox()
@@ -2045,8 +2073,8 @@ class DTNExpansionOptimizer:
         # Register genetic operators
         self.toolbox.register("evaluate", self._evaluate_individual)
         self.toolbox.register("mate", tools.cxTwoPoint)
-        self.toolbox.register("mutate", tools.mutUniformInt, low=1, up=self.num_phases, indpb=0.4)  # Increased mutation rate
-        self.toolbox.register("select", tools.selTournament, tournsize=3)
+        self.toolbox.register("mutate", tools.mutUniformInt, low=1, up=self.num_phases, indpb=getattr(self, 'ga_mutation_indpb', 0.4))  # configurable mutation rate
+        self.toolbox.register("select", tools.selTournament, tournsize=getattr(self, 'ga_tournament_size', 3))
         
         # Define a repair decorator that wraps the genetic operators
         def repair_decorator(func):
@@ -2389,9 +2417,9 @@ class DTNExpansionOptimizer:
 
             # Use the custom evaluation function in the algorithm
             algorithms.eaMuPlusLambda(pop, self.toolbox, mu=population_size,
-                                  lambda_=population_size,
-                                  cxpb=0.5, mutpb=0.2,
-                                  ngen=num_generations,
+                                      lambda_=population_size,
+                                      cxpb=getattr(self, 'ga_crossover_probability', 0.5), mutpb=getattr(self, 'ga_mutation_probability', 0.2),
+                                      ngen=num_generations,
                                   stats=None, halloffame=pareto, verbose=True)
 
             # Process the Pareto front solutions

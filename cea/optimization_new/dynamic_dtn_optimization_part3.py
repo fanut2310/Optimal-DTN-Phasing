@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
 import cea.config
 import cea.inputlocator
@@ -100,7 +101,16 @@ def _detect_energy_columns(df: pd.DataFrame) -> Dict[str, str]:
             cols['dhw'] = lc[key]
             break
     # Electricity
-    for key in ['electricity_kwhyr', 'E_sys_kWhyr'.lower(), 'e_sys_kwhyr', 'electricity']:
+    for key in [
+        'electricity_kwhyr',
+        'e_sys_kwhyr',
+        'el_sys_kwhyr',
+        'electricity',
+        'e_sys_mwhyr',
+        'el_sys_mwhyr',
+        'e_sys_kwhyr',
+        'e_sys_mwhyr'
+    ]:
         if key in lc:
             cols['electricity'] = lc[key]
             break
@@ -141,13 +151,44 @@ def _compute_district_deltas(baseline_td: pd.DataFrame, modified_td: pd.DataFram
 
 
 def _load_cluster_nodes(locator: cea.inputlocator.InputLocator) -> pd.DataFrame:
-    path = Path(locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / 'cluster_nodes.csv'
-    if not path.exists():
-        raise FileNotFoundError(f"cluster_nodes.csv not found in temp scenario: {path}")
-    df = pd.read_csv(path)
-    if 'building' not in df.columns or 'cluster' not in df.columns:
-        raise ValueError("cluster_nodes.csv must contain 'building' and 'cluster' columns")
-    return df
+    """Load cluster_nodes.csv with robust fallbacks.
+    Order of attempts:
+    1) Temp scenario DTN expansion folder
+    2) Baseline locator.get_dtn_cluster_nodes_file()
+    3) Baseline DTN expansion results folder / 'cluster_nodes.csv'
+    If none found or invalid, returns an empty DataFrame (columns: building, cluster, type) and logs a warning.
+    """
+    candidates: List[Path] = []
+    try:
+        candidates.append(Path(locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / 'cluster_nodes.csv')
+    except Exception:
+        pass
+    try:
+        # Known baseline path exposed by locator
+        baseline_nodes = Path(locator.get_dtn_cluster_nodes_file())
+        candidates.append(baseline_nodes)
+    except Exception:
+        pass
+    try:
+        # Common baseline results location
+        candidates.append(Path(locator.get_dtn_expansion_optimization_results_folder()) / 'cluster_nodes.csv')
+    except Exception:
+        pass
+
+    for path in candidates:
+        try:
+            if path and path.exists():
+                df = pd.read_csv(path)
+                if 'building' in df.columns and 'cluster' in df.columns:
+                    log().info(f"Loaded cluster_nodes from: {path}")
+                    return df
+                else:
+                    log().warning(f"cluster_nodes at {path} missing required columns; trying next candidate.")
+        except Exception as e:
+            log().warning(f"Failed to load cluster_nodes from {path}: {e}")
+
+    log().warning("cluster_nodes.csv not found in temp or baseline; proceeding without cluster-level plots.")
+    return pd.DataFrame(columns=['building', 'cluster', 'type'])
 
 
 def _compute_cluster_level_deltas(baseline_td: pd.DataFrame, modified_td: pd.DataFrame, cluster_nodes: pd.DataFrame,
@@ -313,7 +354,12 @@ def _generate_figures(analysis_dir: Path,
                       cluster_deltas_df: pd.DataFrame,
                       baseline_genome: List[int],
                       rerun_genome: List[int],
-                      clusters_sorted: List[int]) -> None:
+                      clusters_sorted: List[int],
+                      genome_deltas: Optional[Dict[str, float]] = None,
+                      genome_comparison_df: Optional[pd.DataFrame] = None,
+                      lock_committed_early_phases: bool = False,
+                      locked_phase_indices: Optional[List[int]] = None,
+                      emissions_summary: Optional[Dict[str, float]] = None) -> None:
     # Ensure non-interactive backend for headless environments
     try:
         plt.switch_backend('Agg')
@@ -346,7 +392,7 @@ def _generate_figures(analysis_dir: Path,
                 mod_vals.append(float(m))
         if labels:
             x = np.arange(len(labels))
-            w = 0.4
+            w = 0.28
             plt.figure(figsize=(8, 5))
             plt.bar(x - w/2, base_vals, width=w, label='Baseline')
             plt.bar(x + w/2, mod_vals, width=w, label='Modified')
@@ -355,7 +401,9 @@ def _generate_figures(analysis_dir: Path,
             plt.title('District totals: Baseline vs Modified')
             plt.legend()
             plt.tight_layout()
-            plt.savefig(figs_dir / 'district_totals_baseline_vs_modified.png', dpi=200)
+            out_path = figs_dir / 'district_totals_baseline_vs_modified.png'
+            plt.savefig(out_path, dpi=200)
+            log().info(f"Saved figure: {out_path}")
             plt.close()
     except Exception as e:
         log().warning(f"Failed to create district totals figure: {e}")
@@ -373,29 +421,30 @@ def _generate_figures(analysis_dir: Path,
                                  .str.replace('delta_', '', regex=False)
                                  .str.replace('_pct', '', regex=False)
                                  .str.title())
-                # Order clusters
+                # Scale fractions to percent for plotting
+                dfm['pct_delta'] = dfm['pct_delta'] * 100.0
+                # Order clusters numerically ascending
                 try:
-                    heating_abs = dfm[dfm['metric'] == 'Heating'].set_index('cluster')['pct_delta'].abs()
-                    cluster_order = list(heating_abs.sort_values(ascending=False).index)
+                    cluster_order = sorted([int(c) for c in dfm['cluster'].dropna().unique()])
                 except Exception:
-                    cluster_order = list(dfm.groupby('cluster')['pct_delta'].apply(lambda s: s.abs().mean()).sort_values(ascending=False).index)
-                # Ensure deterministic casting
-                cluster_order = [int(c) if pd.notna(c) else c for c in cluster_order]
+                    cluster_order = list(pd.to_numeric(dfm['cluster'], errors='coerce').dropna().astype(int).sort_values().unique())
                 dfm['cluster'] = pd.Categorical(dfm['cluster'], cluster_order)
                 metrics = sorted(dfm['metric'].dropna().unique().tolist())
                 x = np.arange(len(cluster_order))
-                w = min(0.8/ max(1, len(metrics)), 0.2)
+                w = min(0.6/ max(1, len(metrics)), 0.12)
                 plt.figure(figsize=(max(8, len(cluster_order)*0.35), 5))
                 for i, met in enumerate(metrics):
                     yi = dfm[dfm['metric'] == met].set_index('cluster').reindex(cluster_order)['pct_delta'].values
                     plt.bar(x + (i - (len(metrics)-1)/2)*w, yi, width=w, label=met)
                 plt.axhline(0, color='k', linewidth=0.8)
                 plt.xticks(x, [str(c) for c in cluster_order], rotation=45)
-                plt.ylabel('Percent change (Δ/Baseline)')
+                plt.ylabel('Percent change (%)')
                 plt.title('Cluster-level percent changes')
                 plt.legend()
                 plt.tight_layout()
-                plt.savefig(figs_dir / 'cluster_level_percent_changes.png', dpi=200)
+                out_path = figs_dir / 'cluster_level_percent_changes.png'
+                plt.savefig(out_path, dpi=200)
+                log().info(f"Saved figure: {out_path}")
                 plt.close()
     except Exception as e:
         log().warning(f"Failed to create cluster-level figure: {e}")
@@ -416,13 +465,165 @@ def _generate_figures(analysis_dir: Path,
                         plt.plot([cl[k], cl[k]], [base[k], new[k]], color='gray', linewidth=0.8)
                 plt.xlabel('Cluster ID')
                 plt.ylabel('Phase')
+                # enforce integer-only ticks for phases
+                try:
+                    max_phase_plot = int(max(max(base), max(new))) if base and new else None
+                except Exception:
+                    max_phase_plot = None
+                ax = plt.gca()
+                ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+                if max_phase_plot and max_phase_plot > 0:
+                    ax.set_ylim(0.5, max_phase_plot + 0.5)
+                    ax.set_yticks(range(1, max_phase_plot + 1))
                 plt.title('Genome phase changes by cluster')
                 plt.legend()
                 plt.tight_layout()
-                plt.savefig(figs_dir / 'genome_phase_changes.png', dpi=200)
+                out_path = figs_dir / 'genome_phase_changes.png'
+                plt.savefig(out_path, dpi=200)
+                log().info(f"Saved figure: {out_path}")
                 plt.close()
+
+                # 3b) With locks overlay
+                try:
+                    if lock_committed_early_phases and locked_phase_indices:
+                        locked_set = set(int(x) for x in locked_phase_indices)
+                        plt.figure(figsize=(max(8, n*0.3), 4))
+                        plt.plot(cl, base, marker='o', label='Baseline phase')
+                        plt.plot(cl, new, marker='s', label='Rerun phase')
+                        # Highlight locked clusters (based on baseline phase in locked phases)
+                        locked_x = [cl[k] for k in range(n) if base[k] in locked_set]
+                        locked_y = [base[k] for k in range(n) if base[k] in locked_set]
+                        if locked_x:
+                            plt.scatter(locked_x, locked_y, s=80, facecolors='none', edgecolors='red', linewidths=1.5, label='Locked (by phase)')
+                        for k in range(n):
+                            if base[k] != new[k]:
+                                plt.plot([cl[k], cl[k]], [base[k], new[k]], color='gray', linewidth=0.8)
+                        plt.xlabel('Cluster ID')
+                        plt.ylabel('Phase')
+                        # enforce integer-only ticks for phases
+                        try:
+                            max_phase_plot = int(max(max(base), max(new))) if base and new else None
+                        except Exception:
+                            max_phase_plot = None
+                        ax = plt.gca()
+                        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+                        if max_phase_plot and max_phase_plot > 0:
+                            ax.set_ylim(0.5, max_phase_plot + 0.5)
+                            ax.set_yticks(range(1, max_phase_plot + 1))
+                        plt.title('Genome phase changes (locked phases highlighted)')
+                        plt.legend()
+                        plt.tight_layout()
+                        out_path = figs_dir / 'genome_phase_changes_with_locks.png'
+                        plt.savefig(out_path, dpi=200)
+                        log().info(f"Saved figure: {out_path}")
+                        plt.close()
+                except Exception as e2:
+                    log().warning(f"Failed to create locked overlay figure: {e2}")
     except Exception as e:
         log().warning(f"Failed to create genome phase figure: {e}")
+
+    # 4) Genome change counts (earlier/later/same)
+    try:
+        if isinstance(genome_deltas, dict):
+            earlier = genome_deltas.get('earlier')
+            later = genome_deltas.get('later')
+            same = genome_deltas.get('same')
+            if all(x is not None and not pd.isna(x) for x in [earlier, later, same]):
+                vals = [int(earlier), int(later), int(same)]
+                labels = ['Earlier', 'Later', 'Same']
+                plt.figure(figsize=(6, 4))
+                plt.bar(np.arange(3), vals, width=0.35, color=['#1b9e77','#d95f02','#7570b3'])
+                plt.xticks(np.arange(3), labels)
+                plt.ylabel('Cluster count')
+                # integer y-axis ticks
+                ax = plt.gca()
+                ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+                try:
+                    y_max = max(vals)
+                    ax.set_ylim(0, y_max + 0.5)
+                    ax.set_yticks(range(0, y_max + 1))
+                except Exception:
+                    pass
+                plt.title('Genome changes summary')
+                plt.tight_layout()
+                out_path = figs_dir / 'genome_changes_counts.png'
+                plt.savefig(out_path, dpi=200)
+                log().info(f"Saved figure: {out_path}")
+                plt.close()
+    except Exception as e:
+        log().warning(f"Failed to create genome changes counts figure: {e}")
+
+    # 5) Phase transition matrix heatmap (optional; disabled by default)
+    generate_phase_transition_matrix = False
+    try:
+        if generate_phase_transition_matrix and baseline_genome and rerun_genome and clusters_sorted:
+            n = min(len(baseline_genome), len(rerun_genome), len(clusters_sorted))
+            if n > 0:
+                base = np.array(list(map(int, baseline_genome[:n])))
+                new = np.array(list(map(int, rerun_genome[:n])))
+                max_phase = int(max(base.max(), new.max())) if len(base) and len(new) else 0
+                if max_phase > 0:
+                    mat = np.zeros((max_phase, max_phase), dtype=int)
+                    for i in range(n):
+                        bi = max(1, int(base[i]))
+                        nj = max(1, int(new[i]))
+                        if bi <= max_phase and nj <= max_phase:
+                            mat[bi-1, nj-1] += 1
+                    plt.figure(figsize=(max(6, max_phase), max(5, max_phase)))
+                    im = plt.imshow(mat, cmap='Blues', origin='upper')
+                    plt.colorbar(im, fraction=0.046, pad=0.04, label='Cluster count')
+                    plt.xticks(np.arange(max_phase), [str(j) for j in range(1, max_phase+1)])
+                    plt.yticks(np.arange(max_phase), [str(i) for i in range(1, max_phase+1)])
+                    ax = plt.gca()
+                    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+                    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+                    plt.xlabel('Rerun phase')
+                    plt.ylabel('Baseline phase')
+                    # Add summary stats to title
+                    try:
+                        earlier = int(genome_deltas.get('earlier', 0)) if isinstance(genome_deltas, dict) else 0
+                        later = int(genome_deltas.get('later', 0)) if isinstance(genome_deltas, dict) else 0
+                        same = int(genome_deltas.get('same', 0)) if isinstance(genome_deltas, dict) else 0
+                        hamming = int(genome_deltas.get('hamming', 0)) if isinstance(genome_deltas, dict) and pd.notna(genome_deltas.get('hamming')) else 0
+                        bias = int(genome_deltas.get('directional_shift', 0)) if isinstance(genome_deltas, dict) and pd.notna(genome_deltas.get('directional_shift')) else 0
+                        plt.title(f'Phase transition matrix (counts)\nEarlier: {earlier}, Later: {later}, Same: {same}; Hamming: {hamming}; Bias: {bias}')
+                    except Exception:
+                        plt.title('Phase transition matrix (counts)')
+                    # Annotations
+                    for i in range(max_phase):
+                        for j in range(max_phase):
+                            val = mat[i, j]
+                            if val > 0:
+                                plt.text(j, i, str(val), ha='center', va='center', color='black')
+                    plt.tight_layout()
+                    out_path = figs_dir / 'phase_transition_matrix.png'
+                    plt.savefig(out_path, dpi=200)
+                    log().info(f"Saved figure: {out_path}")
+                    plt.close()
+    except Exception as e:
+        log().warning(f"Failed to create phase transition matrix: {e}")
+
+    # 6) Emissions bar (optional)
+    try:
+        if isinstance(emissions_summary, dict):
+            b = emissions_summary.get('baseline_emissions_tonCO2')
+            m = emissions_summary.get('modified_emissions_tonCO2')
+            if b is not None and m is not None and not (pd.isna(b) or pd.isna(m)):
+                plt.figure(figsize=(6,4))
+                plt.bar([0,1], [float(b), float(m)], width=0.28, tick_label=['Baseline','Modified'])
+                plt.ylabel('Operational emissions (ton CO2)')
+                delta_pct = emissions_summary.get('delta_emissions_pct')
+                if delta_pct is not None and not pd.isna(delta_pct):
+                    plt.title(f'Emissions: Baseline vs Modified (Δ {delta_pct*100:.1f}%)')
+                else:
+                    plt.title('Emissions: Baseline vs Modified')
+                plt.tight_layout()
+                out_path = figs_dir / 'emissions_baseline_vs_modified.png'
+                plt.savefig(out_path, dpi=200)
+                log().info(f"Saved figure: {out_path}")
+                plt.close()
+    except Exception as e:
+        log().warning(f"Failed to create emissions figure: {e}")
 
 
 def main(config):
@@ -466,15 +667,32 @@ def main(config):
 
     # Compute cluster-level deltas
     cluster_nodes = _load_cluster_nodes(locator)
-    cluster_deltas_df = _compute_cluster_level_deltas(baseline_td, modified_td, cluster_nodes, testing_clusters)
+    try:
+        cluster_deltas_df = _compute_cluster_level_deltas(baseline_td, modified_td, cluster_nodes, testing_clusters)
+    except Exception as e:
+        logger.warning(f"Cluster-level deltas computation failed, will proceed without cluster plots: {e}")
+        cluster_deltas_df = pd.DataFrame()
 
     # Determine the clusters order used by the optimizer (exclude 0 and negatives)
-    clusters_sorted = sorted([int(c) for c in cluster_nodes['cluster'].unique() if isinstance(c, (int, np.integer)) and c > 0])
-    if testing_clusters:
+    try:
+        if isinstance(cluster_nodes, pd.DataFrame) and 'cluster' in cluster_nodes.columns and not cluster_nodes.empty:
+            clusters_sorted = sorted([int(c) for c in cluster_nodes['cluster'].unique() if pd.notna(c) and int(c) > 0])
+        else:
+            clusters_sorted = []
+    except Exception:
+        clusters_sorted = []
+    if testing_clusters and clusters_sorted:
         clusters_sorted = [c for c in clusters_sorted if c in set(testing_clusters)]
 
     # Load genomes and compute genome deltas
     baseline_genome, rerun_genome, baseline_metrics, rerun_metrics = _load_baseline_and_rerun_genomes(locator, network_type, settings)
+
+    # If we have genomes but no clusters, use position indices as surrogate cluster IDs
+    if (not clusters_sorted) and baseline_genome and rerun_genome:
+        n_sur = min(len(baseline_genome), len(rerun_genome))
+        if n_sur > 0:
+            clusters_sorted = list(range(1, n_sur + 1))
+
     genome_deltas = _compute_genome_deltas(baseline_genome, rerun_genome, clusters_sorted)
 
     # Try to load emissions totals (optional)
@@ -498,6 +716,68 @@ def main(config):
     except Exception as e:
         logger.warning(f"Failed to load emissions totals: {e}")
 
+    # Read new Part 2 constraint parameters (prefer run_settings.json, fallback to config)
+    def _get_setting(key_snake: str, key_hyphen: str, default=None):
+        if key_snake in settings:
+            return settings.get(key_snake)
+        if key_hyphen in settings:
+            return settings.get(key_hyphen)
+        try:
+            return getattr(config.dtn_expansion_optimization, key_snake)
+        except Exception:
+            return default
+
+    capex_relax_pct = _get_setting('capex_per_phase_relaxing_pct', 'capex-per-phase-relaxing-pct')
+    totalexp_relax_pct = _get_setting('total_exp_per_phase_relaxing_pct', 'total-exp-per-phase-relaxing-pct')
+    enforce_final_capex = bool(_get_setting('enforce_final_cumulative_capex', 'enforce-final-cumulative-capex', False))
+    final_capex_budget_total = _get_setting('final_cumulative_capex_budget_total', 'final-cumulative-capex-budget-total')
+    enforce_final_totalexp = bool(_get_setting('enforce_final_cumulative_total_exp', 'enforce-final-cumulative-total-exp', False))
+    final_totalexp_budget_total = _get_setting('final_cumulative_total_exp_budget_total', 'final-cumulative-total-exp-budget-total')
+    lock_committed = bool(_get_setting('lock_committed_early_phases', 'lock-committed-early-phases', False))
+
+    locked_phase_indices_val = _get_setting('locked_phase_indices', 'locked-phase-indices')
+    # Normalize locked_phase_indices to List[int]
+    locked_phase_indices: List[int] = []
+    try:
+        if isinstance(locked_phase_indices_val, str):
+            locked_phase_indices = [int(x.strip()) for x in locked_phase_indices_val.split(',') if x.strip()]
+        elif isinstance(locked_phase_indices_val, (list, tuple)):
+            locked_phase_indices = [int(x) for x in locked_phase_indices_val]
+        elif locked_phase_indices_val is not None:
+            locked_phase_indices = [int(locked_phase_indices_val)]
+    except Exception:
+        locked_phase_indices = []
+
+    lock_reference_genome = bool(_get_setting('lock_reference_genome', 'lock-reference-genome', False))
+    custom_locked_genome = _get_setting('custom_locked_genome', 'custom-locked-genome')
+
+    # Build genome comparison DataFrame
+    genome_rows = []
+    try:
+        base_map = {c: p for c, p in zip(clusters_sorted, baseline_genome)}
+        new_map = {c: p for c, p in zip(clusters_sorted, rerun_genome)}
+        for c in clusters_sorted:
+            if c in base_map and c in new_map:
+                bp = int(base_map[c])
+                rp = int(new_map[c])
+                genome_rows.append({
+                    'cluster': int(c),
+                    'baseline_phase': bp,
+                    'rerun_phase': rp,
+                    'phase_delta': rp - bp,
+                    'is_locked': bool(lock_committed and (bp in locked_phase_indices))
+                })
+    except Exception:
+        pass
+    genome_comparison_df = pd.DataFrame(genome_rows)
+    genome_comp_csv = analysis_dir / 'genome_comparison.csv'
+    try:
+        if not genome_comparison_df.empty:
+            genome_comparison_df.to_csv(genome_comp_csv, index=False)
+            logger.info(f"Saved genome comparison to {genome_comp_csv}")
+    except Exception as e:
+        logger.warning(f"Failed to save genome comparison CSV: {e}")
+
     # Aggregate master summary
     master_row = {
         'network_type': network_type,
@@ -506,9 +786,34 @@ def main(config):
         'phase_durations': settings.get('phase_durations'),
         'testing_clusters': ','.join(str(c) for c in testing_clusters) if testing_clusters else '',
         'baseline_genome': json.dumps(baseline_genome),
-        'rerun_genome': json.dumps(rerun_genome)
+        'rerun_genome': json.dumps(rerun_genome),
+        # New constraint parameters
+        'capex_per_phase_relaxing_pct': capex_relax_pct,
+        'total_exp_per_phase_relaxing_pct': totalexp_relax_pct,
+        'enforce_final_cumulative_capex': enforce_final_capex,
+        'final_cumulative_capex_budget_total': final_capex_budget_total,
+        'enforce_final_cumulative_total_exp': enforce_final_totalexp,
+        'final_cumulative_total_exp_budget_total': final_totalexp_budget_total,
+        'lock_committed_early_phases': lock_committed,
+        'locked_phase_indices': ','.join(str(x) for x in locked_phase_indices) if locked_phase_indices else '',
+        'lock_reference_genome': lock_reference_genome,
+        'custom_locked_genome': json.dumps(custom_locked_genome) if custom_locked_genome is not None else ''
     }
     master_row.update(district_deltas)
+    # Demand modification proxies (portfolio-level)
+    try:
+        def _pct100(x):
+            try:
+                return float(x) * 100.0 if pd.notna(x) else x
+            except Exception:
+                return x
+        master_row['mean_reduction_heating_pct'] = _pct100(district_deltas.get('delta_heating_pct'))
+        master_row['mean_reduction_cooling_pct'] = _pct100(district_deltas.get('delta_cooling_pct'))
+        master_row['mean_reduction_dhw_pct'] = _pct100(district_deltas.get('delta_dhw_pct'))
+        master_row['mean_reduction_electricity_pct'] = _pct100(district_deltas.get('delta_electricity_pct'))
+        master_row['densification_pct'] = _pct100(district_deltas.get('delta_gfa_pct'))
+    except Exception:
+        pass
     master_row.update(genome_deltas)
     master_row.update({f"baseline_{k}": v for k, v in baseline_metrics.items()})
     master_row.update({f"rerun_{k}": v for k, v in rerun_metrics.items()})
@@ -523,9 +828,20 @@ def main(config):
         pd.DataFrame([master_row]).to_csv(master_summary_csv, index=False)
     logger.info(f"Saved master summary to {master_summary_csv}")
 
-    # Save cluster-level deltas
+    # Save cluster-level deltas (scale *_pct as percent for user-facing CSV)
     cluster_deltas_csv = analysis_dir / 'cluster_level_deltas.csv'
-    cluster_deltas_df.to_csv(cluster_deltas_csv, index=False)
+    try:
+        cluster_save = cluster_deltas_df.copy()
+        pct_cols = [c for c in cluster_save.columns if c.endswith('_pct')]
+        for c in pct_cols:
+            try:
+                cluster_save[c] = pd.to_numeric(cluster_save[c], errors='coerce') * 100.0
+            except Exception:
+                pass
+        cluster_save.to_csv(cluster_deltas_csv, index=False)
+    except Exception:
+        # fallback to original if scaling failed for any unexpected reason
+        cluster_deltas_df.to_csv(cluster_deltas_csv, index=False)
     logger.info(f"Saved cluster-level deltas to {cluster_deltas_csv}")
 
     # Save a JSON summary for quick inspection
@@ -545,13 +861,189 @@ def main(config):
             cluster_deltas_df=cluster_deltas_df,
             baseline_genome=baseline_genome,
             rerun_genome=rerun_genome,
-            clusters_sorted=clusters_sorted
+            clusters_sorted=clusters_sorted,
+            genome_deltas=genome_deltas,
+            genome_comparison_df=genome_comparison_df,
+            lock_committed_early_phases=lock_committed,
+            locked_phase_indices=locked_phase_indices,
+            emissions_summary=emissions_summary
         )
     except Exception as e:
         logger.warning(f"Plot generation failed: {e}")
 
+    # Cross-run insight plots (non-blocking)
+    try:
+        _generate_cross_run_insight_plots(analysis_dir)
+    except Exception as e:
+        logger.warning(f"Cross-run insight plots skipped: {e}")
+
     logger.info("Sensitivity analysis (core) completed.")
     return None
+
+
+def _generate_cross_run_insight_plots(analysis_dir: Path) -> None:
+    """Create cross-run plots that relate genome changes to policy levers and demand changes.
+    Reads analysis/master_summary.csv and outputs PNGs to analysis/figures.
+    Safe no-op if file or required fields are missing.
+    """
+    try:
+        try:
+            plt.switch_backend('Agg')
+        except Exception:
+            pass
+        ms_path = analysis_dir / 'master_summary.csv'
+        if not ms_path.exists():
+            return
+        df = pd.read_csv(ms_path)
+        figs = analysis_dir / 'figures'
+        try:
+            figs.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        def col(name: str):
+            if name in df.columns:
+                return pd.to_numeric(df[name], errors='coerce') if df[name].dtype == object else df[name]
+            return None
+
+        def line_or_scatter(xs: np.ndarray, ys: np.ndarray, xlabel: str, ylabel: str, title: str, out: Path):
+            if len(xs) < 2:
+                return
+            order = np.argsort(xs)
+            xs_sorted = np.array(xs)[order]
+            ys_sorted = np.array(ys)[order]
+            plt.figure(figsize=(6, 4))
+            # If there are repeated x values, aggregate by mean for line; also plot scatter
+            try:
+                x_unique = np.unique(xs_sorted)
+                y_mean = [np.nanmean(ys_sorted[xs_sorted == xv]) for xv in x_unique]
+                plt.plot(x_unique, y_mean, marker='o', linewidth=1.5, label='mean by x')
+                plt.scatter(xs_sorted, ys_sorted, s=16, alpha=0.6, label='runs')
+            except Exception:
+                plt.plot(xs_sorted, ys_sorted, marker='o', linewidth=1.5)
+            plt.xlabel(xlabel)
+            plt.ylabel(ylabel)
+            plt.title(title)
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.legend(loc='best')
+            plt.savefig(out, dpi=200)
+            try:
+                log().info(f"Saved figure: {out}")
+            except Exception:
+                pass
+            plt.close()
+
+        def scatter_with_fit(x: np.ndarray, y: np.ndarray, xlabel: str, ylabel: str, title: str, out: Path):
+            if len(x) < 2:
+                return
+            plt.figure(figsize=(6, 4))
+            plt.scatter(x, y, s=20, alpha=0.7)
+            # simple linear fit
+            try:
+                coeffs = np.polyfit(x, y, 1)
+                x_line = np.linspace(np.nanmin(x), np.nanmax(x), 50)
+                y_line = coeffs[0] * x_line + coeffs[1]
+                plt.plot(x_line, y_line, color='orange', linewidth=1.5, label=f'fit: y={coeffs[0]:.2f}x+{coeffs[1]:.2f}')
+                plt.legend(loc='best')
+            except Exception:
+                pass
+            plt.xlabel(xlabel)
+            plt.ylabel(ylabel)
+            plt.title(title)
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(out, dpi=200)
+            try:
+                log().info(f"Saved figure: {out}")
+            except Exception:
+                pass
+            plt.close()
+
+        hamming_norm = col('hamming_norm')
+        directional_shift = col('directional_shift')
+        capex_relax = col('capex_per_phase_relaxing_pct')
+        totalexp_relax = col('total_exp_per_phase_relaxing_pct')
+        lock_flag = df['lock_committed_early_phases'] if 'lock_committed_early_phases' in df.columns else None
+
+        # Hamming vs CAPEX relaxation
+        if hamming_norm is not None and capex_relax is not None:
+            d = pd.DataFrame({'x': capex_relax, 'y': hamming_norm}).dropna()
+            if len(d) >= 2:
+                line_or_scatter(d['x'].values, d['y'].values,
+                                'CAPEX per-phase relaxing pct', 'Hamming (normalized)',
+                                f'Hamming vs CAPEX relaxation (n={len(d)})',
+                                figs / 'hamming_vs_capex_relaxation.png')
+
+        # Hamming vs Total Expenditure relaxation
+        if hamming_norm is not None and totalexp_relax is not None:
+            d = pd.DataFrame({'x': totalexp_relax, 'y': hamming_norm}).dropna()
+            if len(d) >= 2:
+                line_or_scatter(d['x'].values, d['y'].values,
+                                'Total-exp per-phase relaxing pct', 'Hamming (normalized)',
+                                f'Hamming vs Total-exp relaxation (n={len(d)})',
+                                figs / 'hamming_vs_totalexp_relaxation.png')
+
+        # Bias (directional shift) vs relaxations
+        if directional_shift is not None and capex_relax is not None:
+            d = pd.DataFrame({'x': capex_relax, 'y': directional_shift}).dropna()
+            if len(d) >= 2:
+                line_or_scatter(d['x'].values, d['y'].values,
+                                'CAPEX per-phase relaxing pct', 'Directional shift (ΣΔphase)',
+                                f'Bias vs CAPEX relaxation (n={len(d)})',
+                                figs / 'bias_vs_capex_relaxation.png')
+        if directional_shift is not None and totalexp_relax is not None:
+            d = pd.DataFrame({'x': totalexp_relax, 'y': directional_shift}).dropna()
+            if len(d) >= 2:
+                line_or_scatter(d['x'].values, d['y'].values,
+                                'Total-exp per-phase relaxing pct', 'Directional shift (ΣΔphase)',
+                                f'Bias vs Total-exp relaxation (n={len(d)})',
+                                figs / 'bias_vs_totalexp_relaxation.png')
+
+        # Hamming by lock flag (bar of means with counts)
+        if hamming_norm is not None and lock_flag is not None:
+            try:
+                d = pd.DataFrame({'lock': lock_flag.astype(int), 'h': pd.to_numeric(hamming_norm, errors='coerce')}).dropna()
+                if len(d) >= 2 and d['lock'].nunique() >= 1:
+                    stats = d.groupby('lock')['h'].agg(['mean', 'count']).reset_index()
+                    plt.figure(figsize=(5, 4))
+                    plt.bar(stats['lock'].astype(str), stats['mean'], width=0.5)
+                    for i, row in stats.iterrows():
+                        plt.text(i, row['mean'], f"n={int(row['count'])}", ha='center', va='bottom', fontsize=8)
+                    plt.xlabel('Lock committed early phases (0/1)')
+                    plt.ylabel('Hamming (normalized)')
+                    plt.title('Hamming by locking policy')
+                    plt.tight_layout()
+                    out_path = figs / 'hamming_by_lock_flag.png'
+                    plt.savefig(out_path, dpi=200)
+                    try:
+                        log().info(f"Saved figure: {out_path}")
+                    except Exception:
+                        pass
+                    plt.close()
+            except Exception:
+                pass
+
+        # Hamming vs end-use reductions and densification
+        for key, label in [
+            ('mean_reduction_heating_pct', 'Heating reduction (pct)'),
+            ('mean_reduction_cooling_pct', 'Cooling reduction (pct)'),
+            ('mean_reduction_dhw_pct', 'DHW reduction (pct)'),
+            ('mean_reduction_electricity_pct', 'Electricity reduction (pct)'),
+            ('densification_pct', 'Densification (pct)')
+        ]:
+            xcol = col(key)
+            if xcol is None or hamming_norm is None:
+                continue
+            d = pd.DataFrame({'x': xcol, 'y': hamming_norm}).dropna()
+            if len(d) >= 2:
+                scatter_with_fit(d['x'].values, d['y'].values,
+                                 label, 'Hamming (normalized)',
+                                 f'Hamming vs {label} (n={len(d)})',
+                                 figs / f"hamming_vs_{key}.png")
+    except Exception:
+        # Never fail main flow because of cross-run plots
+        return
 
 
 if __name__ == '__main__':

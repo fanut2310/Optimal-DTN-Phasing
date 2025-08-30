@@ -333,7 +333,15 @@ Energy Supply System Optimisation:
     label: District Thermal Network Expansion Optimization
     description: |
       Analyzes optimal expansion sequence for district thermal networks by clustering buildings and determining phased connections.
+      This module now computes operational emissions exclusively via LCA Operation per phase using phase-specific supply files and a per-phase Total_Demand snapshot.
+      - Demand is re-run when needed to reflect each phase's supply configuration. Results are cached by a stable phase signature to avoid repeats.
+      - New artifacts are saved under outputs/data/optimization/dtn_expansion:
+        - phase_supply_files/phase{N}_supply.csv
+        - phase_demand/phase{N}__{signature}.csv
+        - phase_LCA_operation/phase{N}__{signature}__Total_LCA_operation.csv and phase{N}_Total_LCA_operation.csv
+        - emissions_by_phase_summary.csv (phase totals and intensities)
       Note: Buildings in cluster 0 (existing DTN) should ideally use DISTRICT scale supply systems for heating, cooling, and DHW.
+      The legacy compute-emissions-from-cop option has been removed.
     interfaces: [ cli, dashboard ]
     module: cea.optimization_new.DTN_expansion_optimization
     parameters: [ 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free', 'general:debug',
@@ -364,6 +372,7 @@ Energy Supply System Optimisation:
       - [get_db4_components_conversion_folder]
       - [get_database_components_distribution_thermal_grid]
       - [get_weather_file]
+      - [get_building_supply]
 
   - name: dynamic-dtn-optimization
     label: "Dynamic DTN Optimization Part 1: Urban Metric Modifications"
@@ -428,12 +437,17 @@ Energy Supply System Optimisation:
   - name: dynamic-dtn-optimization-part2
     label: "Dynamic DTN Optimization Part 2: Rerun Optimization"
     description: |
-      Alternative implementation of Dynamic DTN Optimization Part 2 that directly uses files in the temp scenario folder
-      without relying on complex redirection mechanisms or inheritance from other modules. This implementation
-      avoids path handling issues that may occur with the standard implementation.
+      Reruns DTN Expansion Optimization using the temporary scenario created by Part 1.
+      This module computes operational emissions exclusively via LCA Operation per phase using the temp scenario’s phase-specific supply files and per-phase Total_Demand snapshots.
+      - For each phase, Demand is re-run in the temp scenario when needed to reflect the phase’s supply configuration; results are cached by a stable phase signature.
+      - Artifacts under temp scenario outputs/data/optimization/dynamic_dtn_optimization:
+        - phase_supply_files/phase{N}_supply.csv
+        - phase_demand/phase{N}__{signature}.csv
+        - phase_LCA_operation/phase{N}__{signature}__Total_LCA_operation.csv and phase{N}_Total_LCA_operation.csv
+        - emissions_by_phase_summary.csv
+      The legacy compute-emissions-from-cop option has been removed; emissions are LCA-only.
       
-      **IMPORTANT**: This module requires results from Dynamic DTN Optimization Part 1.
-      Please run Dynamic DTN Optimization Part 1 with the same network type before running this module.
+      IMPORTANT: Requires results from Dynamic DTN Optimization Part 1 (same network type).
     interfaces: [ cli, dashboard ]
     module: cea.optimization_new.dynamic_dtn_optimization_part2
     parameters: [ 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free', 'general:debug',
@@ -481,6 +495,7 @@ Energy Supply System Optimisation:
     input-files:
       - [get_optimization_results_folder]
       - [get_dtn_expansion_optimization_results_folder]
+      - [get_building_supply]
 
   - name: dynamic-dtn-rerun-optimization
     label: "(Archived) Dynamic DTN Optimization Part 2: Rerun Optimization"

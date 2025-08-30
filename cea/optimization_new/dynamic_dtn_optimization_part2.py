@@ -13,6 +13,7 @@ import random
 import json
 from pathlib import Path
 from typing import Dict, Tuple, List, Set, Optional, Union
+import hashlib
 
 import geopandas as gpd
 import pandas as pd
@@ -1506,6 +1507,56 @@ class DTNExpansionOptimizer:
 
         return total_t, kg_per_m2_yr, emis_breakdown
 
+    def _run_demand_for_scenario(self, scenario_path: str):
+        """Run CEA Demand for a given scenario path (used for temp scenario)."""
+        try:
+            import cea.config as _cfg
+            from cea.demand import demand_main as _demand_main
+            cfg = _cfg.Configuration()
+            cfg.scenario = scenario_path
+            try:
+                cfg.general.debug = True if hasattr(cfg, 'general') and hasattr(cfg.general, 'debug') and getattr(logging.getLogger(), 'level', logging.INFO) <= logging.DEBUG else cfg.general.debug
+            except Exception:
+                pass
+            _demand_main.main(cfg)
+        except Exception as e:
+            log().error(f"Demand run failed for scenario {scenario_path}: {e}")
+            raise
+
+    @staticmethod
+    def _signature_from_supply_df(df: pd.DataFrame) -> str:
+        """Create a stable SHA1 signature from the supply dataframe content relevant to energy carriers."""
+        try:
+            cols = [c for c in ['name', 'supply_type_hs', 'supply_type_cs', 'supply_type_dhw', 'supply_type_el'] if c in df.columns]
+            sub = df[cols].copy()
+            sub['__name_norm__'] = sub['name'].astype(str).str.strip().str.upper()
+            sub = sub.sort_values('__name_norm__')
+            sub = sub.fillna('')
+            s = '\n'.join(f"{r['__name_norm__']}|{r.get('supply_type_hs','')}|{r.get('supply_type_cs','')}|{r.get('supply_type_dhw','')}|{r.get('supply_type_el','')}" for _, r in sub.iterrows())
+            return hashlib.sha1(s.encode('utf-8')).hexdigest()[:12]
+        except Exception:
+            return f"x{random.randint(0, 999999):06d}"
+
+    class _TemporarySupplyFileForScenario:
+        """Context manager to swap supply.csv for a specific locator's scenario and restore afterwards."""
+        def __init__(self, locator_obj: cea.inputlocator.InputLocator, modified_supply_df: pd.DataFrame):
+            self.locator = locator_obj
+            self.modified_supply_df = modified_supply_df
+            self.supply_file = locator_obj.get_building_supply()
+            base, ext = os.path.splitext(self.supply_file)
+            self.backup_file = f"{base}.__bak_{int(time.time())}_{random.randint(0,99999)}{ext}"
+        def __enter__(self):
+            shutil.copy2(self.supply_file, self.backup_file)
+            self.modified_supply_df.to_csv(self.supply_file, index=False)
+            return self
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            try:
+                if os.path.exists(self.backup_file):
+                    shutil.copy2(self.backup_file, self.supply_file)
+                    os.remove(self.backup_file)
+            except Exception:
+                pass
+
     def calculate_district_emissions_new(self):
         """
         Calculate district operation emissions using the new methodology.
@@ -1579,6 +1630,9 @@ class DTNExpansionOptimizer:
         # Create directory for per-phase LCA outputs under temp scenario dtn_expansion
         phase_lca_dir = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "phase_LCA_operation"
         phase_lca_dir.mkdir(parents=True, exist_ok=True)
+        # Create directory for per-phase Demand snapshots under temp scenario dtn_expansion
+        phase_demand_dir = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "phase_demand"
+        phase_demand_dir.mkdir(parents=True, exist_ok=True)
 
         # Phase 0 emissions: always use LCA operation with temp demand (COP-based path removed)
         if False:
@@ -1595,21 +1649,35 @@ class DTNExpansionOptimizer:
         else:
             from cea.analysis.lca.operation import lca_operation
             temp_demand_path = self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand()
-            log().info("Running LCA operation for phase 0 with:")
+            log().info("Preparing Phase 0 demand/LCA with caching:")
             log().info(f"  - Supply path: {phase0_supply_path}")
-            log().info(f"  - Demand path: {temp_demand_path}")
-            # Run LCA using a temp scenario locator so outputs are written under temp_scenario
+            log().info(f"  - Baseline temp demand path: {temp_demand_path}")
+            # Use a temp scenario locator so outputs go under temp_scenario
             temp_locator = cea.inputlocator.InputLocator(self.locator.get_dynamic_dtn_optimization_temp_scenario_folder())
             _assert_under_temp(phase0_supply_path, temp_root, "LCA supply path (phase 0)")
             _assert_under_temp(_PathForIO(temp_demand_path), temp_root, "LCA demand path (phase 0)")
-            _log_io("CALL LCA phase0", _PathForIO(temp_locator.scenario), extra={"supply": str(phase0_supply_path), "demand": str(temp_demand_path)})
-            lca_operation(temp_locator, custom_supply_path=str(phase0_supply_path), custom_demand_path=temp_demand_path)
-
-            # Load LCA results (ALL buildings) from temp scenario
-            lca_results_path = temp_locator.get_lca_operation()
-            _assert_under_temp(_PathForIO(lca_results_path), temp_root, "LCA results (phase 0)")
-            _log_io("READ LCA results phase0", _PathForIO(lca_results_path))
-            lca_operation_results = pd.read_csv(lca_results_path)
+            # Phase 0 caching
+            sig0 = self._signature_from_supply_df(original_supply_df)
+            phase0_demand_cache = phase_demand_dir / f"phase0__{sig0}.csv"
+            phase0_lca_cache = phase_lca_dir / f"phase0__{sig0}__Total_LCA_operation.csv"
+            if phase0_demand_cache.exists():
+                log().info(f"[Demand][Cache HIT] Phase 0 demand: {phase0_demand_cache}")
+            else:
+                shutil.copy2(temp_demand_path, phase0_demand_cache)
+                log().info(f"[Demand][Cache MISS] Saved Phase 0 demand snapshot to {phase0_demand_cache}")
+            # LCA cache
+            if phase0_lca_cache.exists():
+                log().info(f"[LCA][Cache HIT] Phase 0 LCA: {phase0_lca_cache}")
+                lca_operation_results = pd.read_csv(phase0_lca_cache)
+            else:
+                _log_io("CALL LCA phase0", _PathForIO(temp_locator.scenario), extra={"supply": str(phase0_supply_path), "demand": str(phase0_demand_cache)})
+                lca_operation(temp_locator, custom_supply_path=str(phase0_supply_path), custom_demand_path=str(phase0_demand_cache))
+                lca_operation_results = pd.read_csv(temp_locator.get_lca_operation())
+                try:
+                    lca_operation_results.to_csv(phase0_lca_cache, index=False)
+                    log().info(f"[LCA][Cache MISS] Saved Phase 0 LCA to {phase0_lca_cache}")
+                except Exception:
+                    pass
             log().info(f"Loaded LCA results with {len(lca_operation_results)} buildings")
             # Determine name column and build normalized series
             name_col = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
@@ -1752,25 +1820,55 @@ class DTNExpansionOptimizer:
             phase_supply_df.to_csv(phase_supply_path, index=False)
             log().debug(f"Created phase {phase} supply file: {phase_supply_path}")
 
-            # Run LCA operation module with the phase-specific supply file on temp scenario (COP-based path removed)
+            # Demand + LCA caching per phase in temp scenario
             from cea.analysis.lca.operation import lca_operation
-            temp_demand_path = self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand()
-            log().info(f"Running LCA operation for phase {phase} with:")
-            log().info(f"  - Supply path: {phase_supply_path}")
-            log().info(f"  - Demand path: {temp_demand_path}")
             temp_locator = cea.inputlocator.InputLocator(self.locator.get_dynamic_dtn_optimization_temp_scenario_folder())
+            temp_demand_path = self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand()
             _assert_under_temp(phase_supply_path, temp_root, "LCA supply path (phase)")
             _assert_under_temp(_PathForIO(temp_demand_path), temp_root, "LCA demand path (phase)")
-            _log_io("CALL LCA phase", _PathForIO(temp_locator.scenario), extra={"phase": phase, "supply": str(phase_supply_path), "demand": str(temp_demand_path)})
-            lca_operation(temp_locator, custom_supply_path=str(phase_supply_path), custom_demand_path=temp_demand_path)
+            sig = self._signature_from_supply_df(phase_supply_df)
+            phase_demand_cache = phase_demand_dir / f"phase{phase}__{sig}.csv"
+            phase_lca_cache = phase_lca_dir / f"phase{phase}__{sig}__Total_LCA_operation.csv"
 
-            # Load LCA results from temp scenario and compute totals and connected-only emissions
-            lca_results_path = temp_locator.get_lca_operation()
-            _assert_under_temp(_PathForIO(lca_results_path), temp_root, "LCA results (phase)")
-            _log_io("READ LCA results phase", _PathForIO(lca_results_path), extra={"phase": phase})
-            lca_operation_results = pd.read_csv(lca_results_path)
-            log().info(f"Loaded LCA results with {len(lca_operation_results)} buildings")
-            # Save per-phase LCA results
+            # Demand cache: if miss, swap supply in temp scenario and run Demand
+            if phase_demand_cache.exists():
+                log().info(f"[Demand][Cache HIT] Phase {phase} demand (temp): {phase_demand_cache}")
+            else:
+                log().info(f"[Demand][Cache MISS] Phase {phase}: swapping temp supply & re-running Demand")
+                with self._TemporarySupplyFileForScenario(temp_locator, phase_supply_df):
+                    self._run_demand_for_scenario(temp_locator.scenario)
+                    try:
+                        td_tmp = pd.read_csv(temp_demand_path)
+                        diag = {
+                            'DH_hs_MWhyr': float(td_tmp.get('DH_hs_MWhyr', pd.Series([0])).sum()),
+                            'NG_hs_MWhyr': float(td_tmp.get('NG_hs_MWhyr', pd.Series([0])).sum()),
+                            'DC_cs_MWhyr': float(td_tmp.get('DC_cs_MWhyr', pd.Series([0])).sum()),
+                            'GRID_MWhyr': float(td_tmp.get('GRID_MWhyr', pd.Series([0])).sum()),
+                            'PV_MWhyr': float(td_tmp.get('PV_MWhyr', pd.Series([0])).sum()),
+                        }
+                        log().info(f"[Demand][Phase {phase} temp] Carriers summary: {diag}")
+                    except Exception:
+                        pass
+                    shutil.copy2(temp_demand_path, phase_demand_cache)
+                    log().info(f"[Demand] Saved Phase {phase} temp demand snapshot to {phase_demand_cache}")
+
+            # LCA: cache load or run against cached demand
+            if phase_lca_cache.exists():
+                log().info(f"[LCA][Cache HIT] Phase {phase} LCA (temp): {phase_lca_cache}")
+                lca_operation_results = pd.read_csv(phase_lca_cache)
+            else:
+                _log_io("CALL LCA phase", _PathForIO(temp_locator.scenario), extra={"phase": phase, "supply": str(phase_supply_path), "demand": str(phase_demand_cache)})
+                lca_operation(temp_locator, custom_supply_path=str(phase_supply_path), custom_demand_path=str(phase_demand_cache))
+                lca_results_path = temp_locator.get_lca_operation()
+                _assert_under_temp(_PathForIO(lca_results_path), temp_root, "LCA results (phase)")
+                _log_io("READ LCA results phase", _PathForIO(lca_results_path), extra={"phase": phase})
+                lca_operation_results = pd.read_csv(lca_results_path)
+                try:
+                    lca_operation_results.to_csv(phase_lca_cache, index=False)
+                    log().info(f"[LCA][Cache MISS] Saved Phase {phase} LCA to {phase_lca_cache}")
+                except Exception:
+                    pass
+            # Also save generic per-phase LCA CSV for inspection
             try:
                 (Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "phase_LCA_operation").mkdir(parents=True, exist_ok=True)
                 phase_lca_csv = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "phase_LCA_operation" / f"phase{phase}_Total_LCA_operation.csv"

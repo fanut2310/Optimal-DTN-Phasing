@@ -60,6 +60,7 @@ import random
 import json
 from pathlib import Path
 from typing import Dict, Tuple, List, Set, Optional, Union
+import hashlib
 
 import geopandas as gpd
 import pandas as pd
@@ -1167,6 +1168,66 @@ class DTNExpansionOptimizer:
                 shutil.copy(self.backup_file, self.supply_file)
                 os.remove(self.backup_file)
 
+    class TemporaryDemandBackup:
+        """Context manager to backup and restore the scenario's Total_Demand.csv while we re-run Demand."""
+        def __init__(self, locator):
+            self.locator = locator
+            self.demand_file = locator.get_total_demand()
+            self.backup_file = None
+
+        def __enter__(self):
+            try:
+                if os.path.exists(self.demand_file):
+                    # place backup in temporary folder of scenario
+                    tmp = getattr(self.locator, 'get_temporary_folder', None)
+                    tmp_dir = tmp() if callable(tmp) else os.path.dirname(self.demand_file)
+                    self.backup_file = os.path.join(tmp_dir, f'backup_total_demand_{int(time.time())}_{random.randint(0,99999)}.csv')
+                    shutil.copy2(self.demand_file, self.backup_file)
+            except Exception:
+                self.backup_file = None
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            try:
+                if self.backup_file and os.path.exists(self.backup_file):
+                    shutil.copy2(self.backup_file, self.demand_file)
+                    os.remove(self.backup_file)
+            except Exception:
+                pass
+
+    def _run_demand_for_current_scenario(self):
+        """Run CEA Demand for the optimizer's current scenario."""
+        try:
+            import cea.config as _cfg
+            from cea.demand import demand_main as _demand_main
+            cfg = _cfg.Configuration()
+            cfg.scenario = self.locator.scenario
+            try:
+                # honor debug flag if possible
+                cfg.general.debug = True if hasattr(cfg, 'general') and hasattr(cfg.general, 'debug') and getattr(logging.getLogger(), 'level', logging.INFO) <= logging.DEBUG else cfg.general.debug
+            except Exception:
+                pass
+            _demand_main.main(cfg)
+        except Exception as e:
+            log().error(f"Demand run failed for scenario {self.locator.scenario}: {e}")
+            raise
+
+    @staticmethod
+    def _signature_from_supply_df(df: pd.DataFrame) -> str:
+        """Create a stable SHA1 signature from the supply dataframe content relevant to energy carriers."""
+        try:
+            cols = [c for c in ['name', 'supply_type_hs', 'supply_type_cs', 'supply_type_dhw', 'supply_type_el'] if c in df.columns]
+            sub = df[cols].copy()
+            sub['__name_norm__'] = sub['name'].astype(str).str.strip().str.upper()
+            sub = sub.sort_values('__name_norm__')
+            sub = sub.fillna('')
+            # build a compact string
+            s = '\n'.join(f"{r['__name_norm__']}|{r.get('supply_type_hs','')}|{r.get('supply_type_cs','')}|{r.get('supply_type_dhw','')}|{r.get('supply_type_el','')}" for _, r in sub.iterrows())
+            return hashlib.sha1(s.encode('utf-8')).hexdigest()[:12]
+        except Exception:
+            # fallback random suffix
+            return f"x{random.randint(0, 999999):06d}"
+
 
     def _cache_emissions_for_individual(self, individual, emissions, has_non_district_scale):
         """Store emissions results and non-district scale flag for an individual in the cache"""
@@ -1416,11 +1477,14 @@ class DTNExpansionOptimizer:
         district_cooling_system = district_supply_systems['supply_type_cs'].iloc[0]
         district_dhw_system = district_supply_systems['supply_type_dhw'].iloc[0]
 
-        # Create directory for phase-specific supply files and per-phase LCA outputs
-        phase_files_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "phase_supply_files"
+        # Create directory for phase-specific supply files and per-phase outputs
+        root_opt = Path(self.locator.get_dtn_expansion_optimization_results_folder())
+        phase_files_dir = root_opt / "phase_supply_files"
         phase_files_dir.mkdir(parents=True, exist_ok=True)
-        phase_lca_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "phase_LCA_operation"
+        phase_lca_dir = root_opt / "phase_LCA_operation"
         phase_lca_dir.mkdir(parents=True, exist_ok=True)
+        phase_demand_dir = root_opt / "phase_demand"
+        phase_demand_dir.mkdir(parents=True, exist_ok=True)
 
         # Create phase 0 supply file (original)
         phase0_supply_path = phase_files_dir / "phase0_supply.csv"
@@ -1435,17 +1499,35 @@ class DTNExpansionOptimizer:
         _total_gfa_const = float(_demand_df['GFA_m2'].sum())
         _name_to_gfa = dict(zip(_demand_df['name'], _demand_df['GFA_m2']))
 
-        # Phase 0 emissions: always use LCA operation (COP-based path removed)
+        # Phase 0 emissions with per-phase Demand caching (no Demand re-run needed if baseline present)
         from cea.analysis.lca.operation import lca_operation
-        lca_operation(self.locator, custom_supply_path=str(phase0_supply_path))
-        lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
-        # Save a snapshot of this phase's LCA results
+        sig0 = self._signature_from_supply_df(original_supply_df)
+        phase0_demand_cache = phase_demand_dir / f"phase0__{sig0}.csv"
+        phase0_lca_cache = phase_lca_dir / f"phase0__{sig0}__Total_LCA_operation.csv"
         try:
-            phase0_lca_csv = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "phase_LCA_operation" / "phase0_Total_LCA_operation.csv"
-            lca_operation_results.to_csv(phase0_lca_csv, index=False)
-            log().debug(f"Saved phase 0 LCA results to {phase0_lca_csv}")
-        except Exception:
-            pass
+            if phase0_demand_cache.exists():
+                log().info(f"[Demand][Cache HIT] Phase 0 demand: {phase0_demand_cache}")
+            else:
+                # Snapshot current Total_Demand.csv as phase 0 demand
+                td_path = self.locator.get_total_demand()
+                if not os.path.exists(td_path):
+                    raise FileNotFoundError(f"Total_Demand not found at {td_path}")
+                shutil.copy2(td_path, phase0_demand_cache)
+                log().info(f"[Demand][Cache MISS] Saved Phase 0 demand snapshot to {phase0_demand_cache}")
+        except Exception as e:
+            log().warning(f"Phase 0 demand cache setup issue: {e}")
+        # LCA: use cache if available
+        if phase0_lca_cache.exists():
+            log().info(f"[LCA][Cache HIT] Phase 0 LCA: {phase0_lca_cache}")
+            lca_operation_results = pd.read_csv(phase0_lca_cache)
+        else:
+            lca_operation(self.locator, custom_supply_path=str(phase0_supply_path), custom_demand_path=str(phase0_demand_cache))
+            lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
+            try:
+                lca_operation_results.to_csv(phase0_lca_cache, index=False)
+                log().info(f"[LCA][Cache MISS] Saved Phase 0 LCA to {phase0_lca_cache}")
+            except Exception:
+                pass
         # District-wide total emissions
         total_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())
         # Connected-only emissions for Phase 0 (cluster 0)
@@ -1557,17 +1639,53 @@ class DTNExpansionOptimizer:
             phase_supply_df.to_csv(phase_supply_path, index=False)
             log().debug(f"Created phase {phase} supply file: {phase_supply_path}")
 
-            # Run LCA operation module with the phase-specific supply file (COP-based path removed)
+            # Demand + LCA caching per phase
             from cea.analysis.lca.operation import lca_operation
-            lca_operation(self.locator, custom_supply_path=str(phase_supply_path))
+            sig = self._signature_from_supply_df(phase_supply_df)
+            phase_demand_cache = phase_demand_dir / f"phase{phase}__{sig}.csv"
+            phase_lca_cache = phase_lca_dir / f"phase{phase}__{sig}__Total_LCA_operation.csv"
 
-            # Load LCA results, compute totals and connected-only emissions
-            lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
-            # Save per-phase LCA results
+            # Demand cache: if miss, temporarily swap supply, run Demand, snapshot Total_Demand.csv
+            if phase_demand_cache.exists():
+                log().info(f"[Demand][Cache HIT] Phase {phase} demand: {phase_demand_cache}")
+            else:
+                log().info(f"[Demand][Cache MISS] Phase {phase}: swapping supply & re-running Demand")
+                with self.TemporarySupplyFile(self.locator, phase_supply_df), self.TemporaryDemandBackup(self.locator):
+                    self._run_demand_for_current_scenario()
+                    # Diagnostics (optional)
+                    try:
+                        td_tmp = pd.read_csv(self.locator.get_total_demand())
+                        diag = {
+                            'DH_hs_MWhyr': float(td_tmp.get('DH_hs_MWhyr', pd.Series([0])).sum()),
+                            'NG_hs_MWhyr': float(td_tmp.get('NG_hs_MWhyr', pd.Series([0])).sum()),
+                            'DC_cs_MWhyr': float(td_tmp.get('DC_cs_MWhyr', pd.Series([0])).sum()),
+                            'GRID_MWhyr': float(td_tmp.get('GRID_MWhyr', pd.Series([0])).sum()),
+                            'PV_MWhyr': float(td_tmp.get('PV_MWhyr', pd.Series([0])).sum()),
+                        }
+                        log().info(f"[Demand][Phase {phase}] Carriers summary: {diag}")
+                    except Exception:
+                        pass
+                    # Snapshot demand
+                    shutil.copy2(self.locator.get_total_demand(), phase_demand_cache)
+                    log().info(f"[Demand] Saved Phase {phase} demand snapshot to {phase_demand_cache}")
+
+            # LCA: cache load or run against cached demand
+            if phase_lca_cache.exists():
+                log().info(f"[LCA][Cache HIT] Phase {phase} LCA: {phase_lca_cache}")
+                lca_operation_results = pd.read_csv(phase_lca_cache)
+            else:
+                lca_operation(self.locator, custom_supply_path=str(phase_supply_path), custom_demand_path=str(phase_demand_cache))
+                lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
+                try:
+                    lca_operation_results.to_csv(phase_lca_cache, index=False)
+                    log().info(f"[LCA][Cache MISS] Saved Phase {phase} LCA to {phase_lca_cache}")
+                except Exception:
+                    pass
+            # Also save a generic per-phase LCA CSV for ease of inspection
             try:
                 phase_lca_csv = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "phase_LCA_operation" / f"phase{phase}_Total_LCA_operation.csv"
                 lca_operation_results.to_csv(phase_lca_csv, index=False)
-                log().debug(f"Saved phase {phase} LCA results to {phase_lca_csv}")
+                log().debug(f"Saved phase {phase} LCA (generic) to {phase_lca_csv}")
             except Exception:
                 pass
             total_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())

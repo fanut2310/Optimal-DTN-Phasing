@@ -350,7 +350,6 @@ Energy Supply System Optimisation:
                   'dtn-expansion-optimization:pump-load-factor', 'dtn-expansion-optimization:pump-capex-a', 'dtn-expansion-optimization:pump-capex-b',
                   'dtn-expansion-optimization:cooling-cop', 'dtn-expansion-optimization:ghg-budget-per-phase', 
                   'dtn-expansion-optimization:multi-objective-mode', 'dtn-expansion-optimization:multi-objective-functions',
-                  'dtn-expansion-optimization:compute-emissions-from-cop',
                   'dtn-expansion-optimization:ga-crossover-probability',
                   'dtn-expansion-optimization:ga-mutation-probability',
                   'dtn-expansion-optimization:ga-tournament-size',
@@ -461,7 +460,6 @@ Energy Supply System Optimisation:
                   'dtn-expansion-optimization:multi-objective-functions',
                   'dtn-expansion-optimization:population-size',
                   'dtn-expansion-optimization:num-generations',
-                  'dtn-expansion-optimization:compute-emissions-from-cop',
                   'dtn-expansion-optimization:capex-per-phase-relaxing-pct',
                   'dtn-expansion-optimization:total-exp-per-phase-relaxing-pct',
                   'dtn-expansion-optimization:enforce-final-cumulative-capex',
@@ -476,7 +474,9 @@ Energy Supply System Optimisation:
                   'dtn-expansion-optimization:ga-mutation-probability',
                   'dtn-expansion-optimization:ga-tournament-size',
                   'dtn-expansion-optimization:ga-mutation-indpb',
-                  'dtn-expansion-optimization:ga-random-seed'
+                  'dtn-expansion-optimization:ga-random-seed',
+                  'dynamic-dtn-optimization:include-in-part3',
+                  'dynamic-dtn-optimization:run-label'
                   ]
     input-files:
       - [get_optimization_results_folder]

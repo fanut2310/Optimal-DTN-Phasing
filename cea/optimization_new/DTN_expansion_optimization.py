@@ -367,8 +367,11 @@ class DTNExpansionOptimizer:
         # Create a cache for emissions results
         self.emissions_cache = {}
 
-        # Emissions computation preference: default to COP-based correction (fail-fast on errors)
-        self.compute_emissions_from_cop = True
+        # Emissions computation uses LCA Operation only (COP-based path removed)
+        try:
+            log().info("COP-based emissions path removed; LCA Operation is the sole emissions method.")
+        except Exception:
+            pass
 
         # ---------------- GA hyperparameters ----------------
         try:
@@ -1413,54 +1416,53 @@ class DTNExpansionOptimizer:
         district_cooling_system = district_supply_systems['supply_type_cs'].iloc[0]
         district_dhw_system = district_supply_systems['supply_type_dhw'].iloc[0]
 
-        # Create directory for phase-specific supply files
+        # Create directory for phase-specific supply files and per-phase LCA outputs
         phase_files_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "phase_supply_files"
         phase_files_dir.mkdir(parents=True, exist_ok=True)
+        phase_lca_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "phase_LCA_operation"
+        phase_lca_dir.mkdir(parents=True, exist_ok=True)
 
         # Create phase 0 supply file (original)
         phase0_supply_path = phase_files_dir / "phase0_supply.csv"
         original_supply_df.to_csv(phase0_supply_path, index=False)
         log().debug(f"Created phase 0 supply file: {phase0_supply_path}")
 
-        # Prepare per-phase breakdown collection
-        breakdown_rows = []
+        # Prepare per-phase summary collection
+        summary_rows = []
 
         # Load demand once for GFA denominators
         _demand_df = pd.read_csv(self.locator.get_total_demand())
         _total_gfa_const = float(_demand_df['GFA_m2'].sum())
         _name_to_gfa = dict(zip(_demand_df['name'], _demand_df['GFA_m2']))
 
-        # Phase 0 emissions: COP-based if enabled, else use LCA operation
-        if self.compute_emissions_from_cop:
-            # District-wide scope: ALL buildings
-            total_ghg, _, breakdown = self._compute_phase_emissions_from_cop(phase0_supply_path, scope_buildings=None, pump_electricity_kwh=0.0)
-            # Collect breakdown row for phase 0
-            row0 = {'phase': 0, 'cumulative_clusters': '0'}
-            row0.update(breakdown)
-            breakdown_rows.append(row0)
-            # In COP mode, approximate connected-only emissions with total for intensity
-            connected_ghg = total_ghg
-        else:
-            from cea.analysis.lca.operation import lca_operation
-            lca_operation(self.locator, custom_supply_path=str(phase0_supply_path))
-            lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
-            # District-wide total emissions
-            total_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())
-            # Connected-only emissions for Phase 0 (cluster 0)
-            name_col = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
-            if not name_col:
-                raise ValueError("LCA file missing building name column (expected 'name' or 'Name')")
-            # Normalize names for robust matching
-            conn_set_raw = set(self._get_buildings_in_specific_cluster(0))
-            conn_set_norm = {str(b).strip().upper() for b in conn_set_raw}
-            lca_names_norm = lca_operation_results[name_col].astype(str).str.strip().str.upper()
-            mask_conn = lca_names_norm.isin(conn_set_norm)
-            connected_ghg = float(lca_operation_results.loc[mask_conn, 'GHG_sys_tonCO2'].sum())
-            # No hybrid replacement for Phase 0; preserve raw LCA totals for comparability
+        # Phase 0 emissions: always use LCA operation (COP-based path removed)
+        from cea.analysis.lca.operation import lca_operation
+        lca_operation(self.locator, custom_supply_path=str(phase0_supply_path))
+        lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
+        # Save a snapshot of this phase's LCA results
+        try:
+            phase0_lca_csv = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "phase_LCA_operation" / "phase0_Total_LCA_operation.csv"
+            lca_operation_results.to_csv(phase0_lca_csv, index=False)
+            log().debug(f"Saved phase 0 LCA results to {phase0_lca_csv}")
+        except Exception:
+            pass
+        # District-wide total emissions
+        total_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())
+        # Connected-only emissions for Phase 0 (cluster 0)
+        name_col = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
+        if not name_col:
+            raise ValueError("LCA file missing building name column (expected 'name' or 'Name')")
+        # Normalize names for robust matching
+        conn_set_raw = set(self._get_buildings_in_specific_cluster(0))
+        conn_set_norm = {str(b).strip().upper() for b in conn_set_raw}
+        lca_names_norm = lca_operation_results[name_col].astype(str).str.strip().str.upper()
+        mask_conn = lca_names_norm.isin(conn_set_norm)
+        connected_ghg = float(lca_operation_results.loc[mask_conn, 'GHG_sys_tonCO2'].sum())
+        # No hybrid replacement for Phase 0; preserve raw LCA totals for comparability
 
         # Compute GFA denominators (use LCA per-building GFA for consistency)
         _connected_buildings_p0 = set(self._get_buildings_in_specific_cluster(0))
-        if not self.compute_emissions_from_cop and 'GFA_m2' in lca_operation_results.columns:
+        if 'GFA_m2' in lca_operation_results.columns:
             try:
                 name_col_gfa = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
                 mask_conn_gfa = lca_operation_results[name_col_gfa].astype(str).isin(_connected_buildings_p0) if name_col_gfa else pd.Series(False, index=lca_operation_results.index)
@@ -1482,6 +1484,18 @@ class DTNExpansionOptimizer:
             'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': per_connected,
             'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': per_total
         }
+        # Append to summary rows
+        try:
+            summary_rows.append({
+                'phase': 0,
+                'cumulative_clusters': '0',
+                'district_operation_emission_tonCO2': total_ghg,
+                'connected_clusters_operation_emissions_tonCO2': connected_ghg,
+                'per_total_gfa_kgCO2_per_m2yr': per_total,
+                'per_connected_gfa_kgCO2_per_m2yr': per_connected
+            })
+        except Exception:
+            pass
 
         # Get cluster assignments from the final best genome if available; else fall back to current individual
         if hasattr(self, 'solution') and self.solution and 'genome' in self.solution and self.solution['genome']:
@@ -1543,41 +1557,32 @@ class DTNExpansionOptimizer:
             phase_supply_df.to_csv(phase_supply_path, index=False)
             log().debug(f"Created phase {phase} supply file: {phase_supply_path}")
 
-            if self.compute_emissions_from_cop:
-                # Pump electricity for cumulative connected clusters (convert Wh to kWh)
-                try:
-                    _, pump_electricity_wh = self.calculate_pump_costs(tuple(connected_clusters))
-                except Exception as e:
-                    log().error(f"Failed to calculate pump electricity for clusters {connected_clusters}: {e}")
-                    raise
-                pump_electricity_kwh = pump_electricity_wh / 1000.0
-                # District-wide emissions for ALL buildings
-                total_ghg, _, breakdown = self._compute_phase_emissions_from_cop(phase_supply_path, scope_buildings=None, pump_electricity_kwh=pump_electricity_kwh)
-                # Collect breakdown row for this phase
-                cum_clusters_str = '+'.join(map(str, sorted(set(connected_clusters))))
-                rowp = {'phase': phase, 'cumulative_clusters': cum_clusters_str}
-                rowp.update(breakdown)
-                breakdown_rows.append(rowp)
-            else:
-                # Run LCA operation module with the phase-specific supply file
-                from cea.analysis.lca.operation import lca_operation
-                lca_operation(self.locator, custom_supply_path=str(phase_supply_path))
+            # Run LCA operation module with the phase-specific supply file (COP-based path removed)
+            from cea.analysis.lca.operation import lca_operation
+            lca_operation(self.locator, custom_supply_path=str(phase_supply_path))
 
-                # Load LCA results, compute totals and connected-only emissions
-                lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
-                total_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())
-                name_col = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
-                if not name_col:
-                    raise ValueError("LCA file missing building name column (expected 'name' or 'Name')")
-                # Normalize names for robust matching
-                conn_set_raw = set(connected_buildings)
-                conn_set_norm = {str(b).strip().upper() for b in conn_set_raw}
-                lca_names_norm = lca_operation_results[name_col].astype(str).str.strip().str.upper()
-                mask_conn = lca_names_norm.isin(conn_set_norm)
-                connected_ghg = float(lca_operation_results.loc[mask_conn, 'GHG_sys_tonCO2'].sum())
+            # Load LCA results, compute totals and connected-only emissions
+            lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
+            # Save per-phase LCA results
+            try:
+                phase_lca_csv = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "phase_LCA_operation" / f"phase{phase}_Total_LCA_operation.csv"
+                lca_operation_results.to_csv(phase_lca_csv, index=False)
+                log().debug(f"Saved phase {phase} LCA results to {phase_lca_csv}")
+            except Exception:
+                pass
+            total_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())
+            name_col = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
+            if not name_col:
+                raise ValueError("LCA file missing building name column (expected 'name' or 'Name')")
+            # Normalize names for robust matching
+            conn_set_raw = set(connected_buildings)
+            conn_set_norm = {str(b).strip().upper() for b in conn_set_raw}
+            lca_names_norm = lca_operation_results[name_col].astype(str).str.strip().str.upper()
+            mask_conn = lca_names_norm.isin(conn_set_norm)
+            connected_ghg = float(lca_operation_results.loc[mask_conn, 'GHG_sys_tonCO2'].sum())
 
             # Compute GFA denominators for this phase (prefer LCA per-building GFA for consistency)
-            if (not self.compute_emissions_from_cop) and 'GFA_m2' in lca_operation_results.columns:
+            if 'GFA_m2' in lca_operation_results.columns:
                 try:
                     connected_gfa_lca = float(lca_operation_results.loc[mask_conn, 'GFA_m2'].sum())
                     total_gfa_lca = float(lca_operation_results['GFA_m2'].sum())
@@ -1597,16 +1602,29 @@ class DTNExpansionOptimizer:
                 'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': per_connected,
                 'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': per_total
             }
+            # Append to summary
+            try:
+                cum_clusters_str = '+'.join(map(str, sorted(set(connected_clusters))))
+                summary_rows.append({
+                    'phase': phase,
+                    'cumulative_clusters': cum_clusters_str,
+                    'district_operation_emission_tonCO2': total_ghg,
+                    'connected_clusters_operation_emissions_tonCO2': connected_ghg,
+                    'per_total_gfa_kgCO2_per_m2yr': per_total,
+                    'per_connected_gfa_kgCO2_per_m2yr': per_connected
+                })
+            except Exception:
+                pass
 
-        # Write breakdown CSV if available
+        # Write per-phase summary CSV
         try:
-            if breakdown_rows:
-                breakdown_df = pd.DataFrame(breakdown_rows)
-                breakdown_file = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "emissions_breakdown_by_phase.csv"
-                breakdown_df.to_csv(breakdown_file, index=False)
-                log().debug(f"Saved emissions breakdown by phase to {breakdown_file}")
+            if summary_rows:
+                summary_df = pd.DataFrame(summary_rows)
+                summary_file = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "emissions_by_phase_summary.csv"
+                summary_df.to_csv(summary_file, index=False)
+                log().debug(f"Saved emissions-by-phase summary to {summary_file}")
         except Exception as e:
-            log().warning(f"Could not write emissions breakdown CSV: {e}")
+            log().warning(f"Could not write emissions summary CSV: {e}")
 
         return results
 
@@ -4458,13 +4476,11 @@ def main(config):
             testing_clusters=testing_clusters
         )
 
-        # Set emissions computation mode from config (default True)
+        # Emissions are LCA-only; compute-emissions-from-cop is deprecated and ignored
         try:
-            optimizer.compute_emissions_from_cop = bool(getattr(config.dtn_expansion_optimization, 'compute_emissions_from_cop', True))
-            log().info(f"compute-emissions-from-cop set to {optimizer.compute_emissions_from_cop}")
-        except Exception as e:
-            log().warning(f"Could not read compute-emissions-from-cop from config, defaulting to True. Error: {e}")
-            optimizer.compute_emissions_from_cop = True
+            log().info("compute-emissions-from-cop parameter is deprecated and ignored. Using LCA Operation per phase.")
+        except Exception:
+            pass
 
         # Run optimization
         solution = optimizer.optimize(

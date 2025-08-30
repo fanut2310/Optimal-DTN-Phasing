@@ -6,6 +6,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import time
 
 import pandas as pd
 import numpy as np
@@ -553,7 +554,92 @@ def _generate_figures(analysis_dir: Path,
     except Exception as e:
         log().warning(f"Failed to create genome changes counts figure: {e}")
 
-    # 5) Phase transition matrix heatmap (optional; disabled by default)
+    # 5) Phase volatility and baseline→destination stacks (single-run)
+    try:
+        if isinstance(genome_comparison_df, pd.DataFrame) and not genome_comparison_df.empty:
+            gdf = genome_comparison_df.copy()
+            if {'baseline_phase','rerun_phase','phase_delta'}.issubset(gdf.columns):
+                # Phase volatility counts and avg |Δ|
+                vol = gdf.groupby('baseline_phase').agg(
+                    moved_count=('phase_delta', lambda s: int((s != 0).sum())),
+                    avg_abs_delta=('phase_delta', lambda s: float(np.nanmean(np.abs(s))))
+                ).reset_index().sort_values('baseline_phase')
+                if not vol.empty:
+                    # Bar for moved_count and line for avg_abs_delta (twin axis)
+                    plt.figure(figsize=(max(6, len(vol)*0.6), 4))
+                    x = np.arange(len(vol))
+                    b = plt.bar(x, vol['moved_count'].values, width=0.5, color='#4c78a8', label='Moved count')
+                    ax1 = plt.gca()
+                    ax1.yaxis.set_major_locator(MaxNLocator(integer=True))
+                    ax2 = ax1.twinx()
+                    ax2.plot(x, vol['avg_abs_delta'].values, color='#f58518', marker='o', label='Avg |Δphase|')
+                    ax1.set_xlabel('Baseline phase')
+                    ax1.set_ylabel('Moved count')
+                    ax2.set_ylabel('Avg |Δphase|')
+                    plt.xticks(x, vol['baseline_phase'].astype(int).astype(str))
+                    plt.title('Phase volatility by baseline phase')
+                    plt.tight_layout()
+                    out_path = figs_dir / 'phase_volatility_counts.png'
+                    plt.savefig(out_path, dpi=200)
+                    try:
+                        log().info(f"Saved figure: {out_path}")
+                    except Exception:
+                        pass
+                    plt.close()
+                else:
+                    try:
+                        log().info("[Part3] Skipping phase_volatility_counts: no movements detected (vol table empty).")
+                    except Exception:
+                        pass
+                # Baseline phase to earlier/same/later stacks (shares)
+                buckets = gdf.assign(change_bucket=np.sign(gdf['phase_delta']).map({-1:'Earlier',0:'Same',1:'Later'}))
+                stacks = (buckets
+                          .groupby(['baseline_phase','change_bucket'])
+                          .size()
+                          .unstack(fill_value=0)
+                          .sort_index())
+                if not stacks.empty:
+                    stacks = stacks[['Earlier','Same','Later']] if {'Earlier','Same','Later'}.issubset(stacks.columns) else stacks
+                    shares = stacks.div(stacks.sum(axis=1), axis=0)
+                    plt.figure(figsize=(max(6, shares.shape[0]*0.6), 4))
+                    bottom = np.zeros(shares.shape[0])
+                    colors = {'Earlier':'#1b9e77','Same':'#7570b3','Later':'#d95f02'}
+                    x = np.arange(shares.shape[0])
+                    for col in shares.columns:
+                        plt.bar(x, shares[col].values, bottom=bottom, color=colors.get(col, None), label=col, width=0.6)
+                        bottom += shares[col].values
+                    plt.xticks(x, shares.index.astype(int).astype(str))
+                    plt.xlabel('Baseline phase')
+                    plt.ylabel('Share')
+                    plt.title('Baseline phase → earlier/same/later shares')
+                    plt.legend()
+                    plt.tight_layout()
+                    out_path = figs_dir / 'baseline_phase_to_dest_stacks.png'
+                    plt.savefig(out_path, dpi=200)
+                    try:
+                        log().info(f"Saved figure: {out_path}")
+                    except Exception:
+                        pass
+                    plt.close()
+                else:
+                    try:
+                        log().info("[Part3] Skipping baseline_phase_to_dest_stacks: no data for stacks (empty table).")
+                    except Exception:
+                        pass
+            else:
+                try:
+                    log().info("[Part3] Skipping phase-volatility/stack plots: genome_comparison missing required columns.")
+                except Exception:
+                    pass
+        else:
+            try:
+                log().info("[Part3] Skipping phase-volatility/stack plots: genome_comparison is empty or not provided.")
+            except Exception:
+                pass
+    except Exception as e:
+        log().warning(f"Failed to create phase volatility/stack plots: {e}")
+
+    # 6) Phase transition matrix heatmap (optional; disabled by default)
     generate_phase_transition_matrix = False
     try:
         if generate_phase_transition_matrix and baseline_genome and rerun_genome and clusters_sorted:
@@ -778,6 +864,55 @@ def main(config):
     except Exception as e:
         logger.warning(f"Failed to save genome comparison CSV: {e}")
 
+    # Persist per-run, per-phase movement stats for cross-run phase-wise plots
+    try:
+        if not genome_comparison_df.empty and {'baseline_phase','phase_delta'}.issubset(genome_comparison_df.columns):
+            mv = genome_comparison_df.copy()
+            # Compute counts per baseline phase
+            phase_stats = mv.groupby('baseline_phase').agg(
+                moved_count=('phase_delta', lambda s: int((s != 0).sum())),
+                earlier_count=('phase_delta', lambda s: int((s < 0).sum())),
+                later_count=('phase_delta', lambda s: int((s > 0).sum())),
+                same_count=('phase_delta', lambda s: int((s == 0).sum())),
+                avg_abs_delta=('phase_delta', lambda s: float(np.nanmean(np.abs(s))))
+            ).reset_index()
+            # Build rows with run metadata
+            run_id = time.strftime('%Y-%m-%dT%H:%M:%S')
+            rows = []
+            for _, r in phase_stats.iterrows():
+                rows.append({
+                    'run_id': run_id,
+                    'network_type': network_type,
+                    'objective_function': settings.get('objective_function', 'NPV'),
+                    'capex_per_phase_relaxing_pct': capex_relax_pct,
+                    'total_exp_per_phase_relaxing_pct': totalexp_relax_pct,
+                    'lock_committed_early_phases': int(bool(lock_committed)),
+                    'locked_phases_count': len(locked_phase_indices) if locked_phase_indices else 0,
+                    'baseline_phase': int(r['baseline_phase']) if pd.notna(r['baseline_phase']) else np.nan,
+                    'moved_count': int(r['moved_count']) if pd.notna(r['moved_count']) else np.nan,
+                    'earlier_count': int(r['earlier_count']) if pd.notna(r['earlier_count']) else np.nan,
+                    'later_count': int(r['later_count']) if pd.notna(r['later_count']) else np.nan,
+                    'same_count': int(r['same_count']) if pd.notna(r['same_count']) else np.nan,
+                    'avg_abs_delta': float(r['avg_abs_delta']) if pd.notna(r['avg_abs_delta']) else np.nan,
+                })
+            mv_df = pd.DataFrame(rows)
+            mv_csv = analysis_dir / 'genome_phase_movements.csv'
+            if mv_csv.exists():
+                # aligned append
+                try:
+                    old = pd.read_csv(mv_csv)
+                except Exception:
+                    old = pd.DataFrame()
+                all_cols = sorted(set(old.columns.tolist()) | set(mv_df.columns.tolist()))
+                old = old.reindex(columns=all_cols)
+                mv_df = mv_df.reindex(columns=all_cols)
+                pd.concat([old, mv_df], ignore_index=True).to_csv(mv_csv, index=False)
+            else:
+                mv_df.to_csv(mv_csv, index=False)
+            logger.info(f"Saved per-phase movement stats to {mv_csv}")
+    except Exception as e:
+        logger.warning(f"Failed to persist per-phase movement stats: {e}")
+
     # Aggregate master summary
     master_row = {
         'network_type': network_type,
@@ -815,18 +950,55 @@ def main(config):
     except Exception:
         pass
     master_row.update(genome_deltas)
+    # Derived shares from genome deltas
+    try:
+        _total = float(master_row.get('clusters_compared')) if master_row.get('clusters_compared') not in (None, np.nan) else np.nan
+        _earlier = float(master_row.get('earlier')) if master_row.get('earlier') not in (None, np.nan) else np.nan
+        _later = float(master_row.get('later')) if master_row.get('later') not in (None, np.nan) else np.nan
+        _same = float(master_row.get('same')) if master_row.get('same') not in (None, np.nan) else np.nan
+        if pd.notna(_total) and _total > 0 and all(pd.notna(x) for x in [_earlier, _later, _same]):
+            master_row['earlier_share'] = _earlier / _total
+            master_row['later_share'] = _later / _total
+            master_row['same_share'] = _same / _total
+    except Exception:
+        pass
+    # Locking KPIs
+    try:
+        master_row['locked_phases_count'] = len(locked_phase_indices) if locked_phase_indices else 0
+        if isinstance(genome_comparison_df, pd.DataFrame) and not genome_comparison_df.empty and 'is_locked' in genome_comparison_df.columns:
+            locked_df = genome_comparison_df[genome_comparison_df['is_locked'] == True]
+            if not locked_df.empty and 'phase_delta' in locked_df.columns:
+                prot = float((locked_df['phase_delta'] == 0).sum()) / float(len(locked_df)) if len(locked_df) > 0 else np.nan
+                master_row['protected_share'] = prot
+    except Exception:
+        pass
     master_row.update({f"baseline_{k}": v for k, v in baseline_metrics.items()})
     master_row.update({f"rerun_{k}": v for k, v in rerun_metrics.items()})
     master_row.update(emissions_summary)
 
-    # Save outputs
+    # Save outputs (robust aligned writer to avoid schema drift)
     master_summary_csv = analysis_dir / 'master_summary.csv'
-    if master_summary_csv.exists():
-        # append
-        pd.DataFrame([master_row]).to_csv(master_summary_csv, mode='a', header=False, index=False)
-    else:
-        pd.DataFrame([master_row]).to_csv(master_summary_csv, index=False)
-    logger.info(f"Saved master summary to {master_summary_csv}")
+    try:
+        new_df = pd.DataFrame([master_row])
+        if master_summary_csv.exists():
+            try:
+                old_df = pd.read_csv(master_summary_csv)
+            except Exception:
+                old_df = pd.DataFrame()
+            all_cols = sorted(set(old_df.columns.tolist()) | set(new_df.columns.tolist()))
+            old_df = old_df.reindex(columns=all_cols)
+            new_df = new_df.reindex(columns=all_cols)
+            combined = pd.concat([old_df, new_df], ignore_index=True)
+            combined.to_csv(master_summary_csv, index=False)
+        else:
+            new_df.to_csv(master_summary_csv, index=False)
+        logger.info(f"Saved master summary to {master_summary_csv}")
+    except Exception as e:
+        logger.warning(f"Failed aligned write of master_summary.csv: {e}. Falling back to append mode.")
+        if master_summary_csv.exists():
+            pd.DataFrame([master_row]).to_csv(master_summary_csv, mode='a', header=False, index=False)
+        else:
+            pd.DataFrame([master_row]).to_csv(master_summary_csv, index=False)
 
     # Save cluster-level deltas (scale *_pct as percent for user-facing CSV)
     cluster_deltas_csv = analysis_dir / 'cluster_level_deltas.csv'
@@ -1041,6 +1213,162 @@ def _generate_cross_run_insight_plots(analysis_dir: Path) -> None:
                                  label, 'Hamming (normalized)',
                                  f'Hamming vs {label} (n={len(d)})',
                                  figs / f"hamming_vs_{key}.png")
+
+        # Earlier / Later shares vs relaxations
+        earlier_share = col('earlier_share')
+        later_share = col('later_share')
+        if earlier_share is not None and capex_relax is not None:
+            d = pd.DataFrame({'x': capex_relax, 'y': earlier_share}).dropna()
+            if len(d) >= 2:
+                line_or_scatter(d['x'].values, d['y'].values,
+                                'CAPEX per-phase relaxing pct', 'Earlier share',
+                                f'Earlier share vs CAPEX relaxation (n={len(d)})',
+                                figs / 'earlier_share_vs_capex_relaxation.png')
+        if later_share is not None and capex_relax is not None:
+            d = pd.DataFrame({'x': capex_relax, 'y': later_share}).dropna()
+            if len(d) >= 2:
+                line_or_scatter(d['x'].values, d['y'].values,
+                                'CAPEX per-phase relaxing pct', 'Later share',
+                                f'Later share vs CAPEX relaxation (n={len(d)})',
+                                figs / 'later_share_vs_capex_relaxation.png')
+        if earlier_share is not None and totalexp_relax is not None:
+            d = pd.DataFrame({'x': totalexp_relax, 'y': earlier_share}).dropna()
+            if len(d) >= 2:
+                line_or_scatter(d['x'].values, d['y'].values,
+                                'Total-exp per-phase relaxing pct', 'Earlier share',
+                                f'Earlier share vs Total-exp relaxation (n={len(d)})',
+                                figs / 'earlier_share_vs_totalexp_relaxation.png')
+        if later_share is not None and totalexp_relax is not None:
+            d = pd.DataFrame({'x': totalexp_relax, 'y': later_share}).dropna()
+            if len(d) >= 2:
+                line_or_scatter(d['x'].values, d['y'].values,
+                                'Total-exp per-phase relaxing pct', 'Later share',
+                                f'Later share vs Total-exp relaxation (n={len(d)})',
+                                figs / 'later_share_vs_totalexp_relaxation.png')
+
+        # Earlier / Later shares vs demand-change proxies
+        for key, label in [
+            ('mean_reduction_heating_pct', 'Heating reduction (pct)'),
+            ('mean_reduction_cooling_pct', 'Cooling reduction (pct)'),
+            ('mean_reduction_dhw_pct', 'DHW reduction (pct)'),
+            ('mean_reduction_electricity_pct', 'Electricity reduction (pct)'),
+            ('densification_pct', 'Densification (pct)')
+        ]:
+            xcol = col(key)
+            if xcol is None:
+                continue
+            if earlier_share is not None:
+                d = pd.DataFrame({'x': xcol, 'y': earlier_share}).dropna()
+                if len(d) >= 2:
+                    scatter_with_fit(d['x'].values, d['y'].values,
+                                     label, 'Earlier share',
+                                     f'Earlier share vs {label} (n={len(d)})',
+                                     figs / f"earlier_share_vs_{key}.png")
+            if later_share is not None:
+                d = pd.DataFrame({'x': xcol, 'y': later_share}).dropna()
+                if len(d) >= 2:
+                    scatter_with_fit(d['x'].values, d['y'].values,
+                                     label, 'Later share',
+                                     f'Later share vs {label} (n={len(d)})',
+                                     figs / f"later_share_vs_{key}.png")
+
+        # Protected share by number of locked phases (bars)
+        if 'protected_share' in df.columns and 'locked_phases_count' in df.columns:
+            d = df[['protected_share','locked_phases_count']].copy()
+            d['protected_share'] = pd.to_numeric(d['protected_share'], errors='coerce')
+            d['locked_phases_count'] = pd.to_numeric(d['locked_phases_count'], errors='coerce')
+            d = d.dropna()
+            if len(d) >= 2 and d['locked_phases_count'].nunique() >= 1:
+                stats = d.groupby('locked_phases_count')['protected_share'].agg(['mean','count']).reset_index()
+                plt.figure(figsize=(6,4))
+                plt.bar(stats['locked_phases_count'].astype(int).astype(str), stats['mean'], width=0.5)
+                for i, row in stats.iterrows():
+                    plt.text(i, row['mean'], f"n={int(row['count'])}", ha='center', va='bottom', fontsize=8)
+                plt.xlabel('Locked phases count')
+                plt.ylabel('Protected share (locked unchanged)')
+                plt.title('Protected share by locked phases count')
+                plt.tight_layout()
+                plt.savefig(figs / 'protected_share_by_locked_phases_count.png', dpi=200)
+                plt.close()
+
+        # Phase-wise relaxation plots from genome_phase_movements.csv
+        mv_csv = analysis_dir / 'genome_phase_movements.csv'
+        if mv_csv.exists():
+            try:
+                mv = pd.read_csv(mv_csv)
+                # Ensure numeric types
+                for c in ['capex_per_phase_relaxing_pct', 'total_exp_per_phase_relaxing_pct',
+                          'baseline_phase', 'moved_count', 'avg_abs_delta', 'lock_committed_early_phases']:
+                    if c in mv.columns:
+                        mv[c] = pd.to_numeric(mv[c], errors='coerce')
+                # Helper to draw lines per baseline phase for a given x and y and lock flag subset
+                def plot_phase_lines(df_in: pd.DataFrame, xcol: str, ycol: str, lock_flag_val: int, out_name: str, xlabel: str, ylabel: str, title_prefix: str):
+                    d = df_in.copy()
+                    d = d[(~d[xcol].isna()) & (~d[ycol].isna())]
+                    if 'lock_committed_early_phases' in d.columns:
+                        d = d[d['lock_committed_early_phases'] == lock_flag_val]
+                    if d.empty:
+                        return
+                    # Need at least two distinct x values
+                    if d[xcol].nunique() < 2:
+                        return
+                    plt.figure(figsize=(7, 4.5))
+                    phases = sorted([int(p) for p in d['baseline_phase'].dropna().unique()]) if 'baseline_phase' in d.columns else []
+                    for ph in phases:
+                        dp = d[d['baseline_phase'] == ph]
+                        if dp.empty:
+                            continue
+                        # aggregate by x (mean y)
+                        grp = dp.groupby(xcol)[ycol].mean().reset_index().sort_values(xcol)
+                        plt.plot(grp[xcol].values, grp[ycol].values, marker='o', linewidth=1.5, label=f'Phase {ph}')
+                    # tipping point: first x with any movement (>0) across phases when y is moved_count
+                    try:
+                        if ycol == 'moved_count':
+                            agg = d.groupby(xcol)['moved_count'].sum().reset_index().sort_values(xcol)
+                            tip = agg.loc[agg['moved_count'] > 0, xcol].min()
+                            if pd.notna(tip):
+                                plt.axvline(tip, color='red', linestyle='--', linewidth=1.0, alpha=0.7)
+                                plt.text(tip, plt.gca().get_ylim()[1]*0.95, f'first change @ {tip:g}%', color='red', ha='right', va='top', fontsize=8)
+                    except Exception:
+                        pass
+                    plt.xlabel(xlabel)
+                    plt.ylabel(ylabel)
+                    plt.title(f"{title_prefix} (lock={'ON' if lock_flag_val==1 else 'OFF'})")
+                    plt.legend(ncol=2, fontsize=8)
+                    plt.grid(True, alpha=0.3)
+                    plt.tight_layout()
+                    out_path = figs / out_name
+                    plt.savefig(out_path, dpi=200)
+                    try:
+                        log().info(f"Saved figure: {out_path}")
+                    except Exception:
+                        pass
+                    plt.close()
+
+                # Create the four requested families of plots
+                if {'baseline_phase','moved_count','avg_abs_delta'}.issubset(mv.columns):
+                    for lock_val in (0, 1):
+                        # CAPEX relaxation based
+                        if 'capex_per_phase_relaxing_pct' in mv.columns:
+                            plot_phase_lines(mv, 'capex_per_phase_relaxing_pct', 'moved_count', lock_val,
+                                             f"phase_moved_vs_capex_relaxation_lock{lock_val}.png",
+                                             'CAPEX per-phase relaxing pct', 'Moved count', 'Phase movement vs CAPEX relaxation')
+                            plot_phase_lines(mv, 'capex_per_phase_relaxing_pct', 'avg_abs_delta', lock_val,
+                                             f"phase_avg_abs_delta_vs_capex_relaxation_lock{lock_val}.png",
+                                             'CAPEX per-phase relaxing pct', 'Avg |Δphase|', 'Avg |Δ| vs CAPEX relaxation')
+                        # Total expenditure relaxation based
+                        if 'total_exp_per_phase_relaxing_pct' in mv.columns:
+                            plot_phase_lines(mv, 'total_exp_per_phase_relaxing_pct', 'moved_count', lock_val,
+                                             f"phase_moved_vs_totalexp_relaxation_lock{lock_val}.png",
+                                             'Total-exp per-phase relaxing pct', 'Moved count', 'Phase movement vs Total-exp relaxation')
+                            plot_phase_lines(mv, 'total_exp_per_phase_relaxing_pct', 'avg_abs_delta', lock_val,
+                                             f"phase_avg_abs_delta_vs_totalexp_relaxation_lock{lock_val}.png",
+                                             'Total-exp per-phase relaxing pct', 'Avg |Δphase|', 'Avg |Δ| vs Total-exp relaxation')
+            except Exception as e:
+                try:
+                    log().warning(f"Phase-wise relaxation plots skipped: {e}")
+                except Exception:
+                    pass
     except Exception:
         # Never fail main flow because of cross-run plots
         return

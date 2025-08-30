@@ -362,7 +362,10 @@ Energy Supply System Optimisation:
                   'dtn-expansion-optimization:ga-mutation-probability',
                   'dtn-expansion-optimization:ga-tournament-size',
                   'dtn-expansion-optimization:ga-mutation-indpb',
-                  'dtn-expansion-optimization:ga-random-seed' ]
+                  'dtn-expansion-optimization:ga-random-seed',
+                  'dtn-expansion-optimization:emissions-evaluation-mode',
+                  'dtn-expansion-optimization:hybrid-validate-top-k',
+                  'dtn-expansion-optimization:hybrid-final-validate' ]
     input-files:
       - [get_street_network]
       - [get_total_demand]
@@ -489,6 +492,9 @@ Energy Supply System Optimisation:
                   'dtn-expansion-optimization:ga-tournament-size',
                   'dtn-expansion-optimization:ga-mutation-indpb',
                   'dtn-expansion-optimization:ga-random-seed',
+                  'dtn-expansion-optimization:emissions-evaluation-mode',
+                  'dtn-expansion-optimization:hybrid-validate-top-k',
+                  'dtn-expansion-optimization:hybrid-final-validate',
                   'dynamic-dtn-optimization:include-in-part3',
                   'dynamic-dtn-optimization:run-label'
                   ]

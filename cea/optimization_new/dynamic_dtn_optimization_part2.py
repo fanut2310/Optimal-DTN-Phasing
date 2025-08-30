@@ -450,6 +450,15 @@ class DTNExpansionOptimizer:
             pass
 
         # Initialize DEAP toolbox
+        # Emissions evaluation mode defaults (can be overridden in main() from config)
+        try:
+            self.emissions_mode = 'fast'
+            self.hybrid_validate_top_k = 5
+            self.hybrid_final_validate = True
+        except Exception:
+            self.emissions_mode = 'fast'
+            self.hybrid_validate_top_k = 5
+            self.hybrid_final_validate = True
         self.toolbox = base.Toolbox()
         self._setup_genetic_algorithm()
 
@@ -1634,6 +1643,130 @@ class DTNExpansionOptimizer:
         phase_demand_dir = Path(self.locator.get_dynamic_dtn_optimization_temp_scenario_dtn_expansion_folder()) / "phase_demand"
         phase_demand_dir.mkdir(parents=True, exist_ok=True)
 
+        # Load baseline temp demand for possible synthetic generation (fast/hybrid)
+        try:
+            _baseline_temp_demand_df = pd.read_csv(self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand())
+        except Exception:
+            _baseline_temp_demand_df = pd.DataFrame()
+
+        # Helper: Synthetic per-phase Total_Demand builder (FAST mode)
+        def _build_synthetic_phase_demand(phase_supply_df: pd.DataFrame,
+                                          base_total_demand_df: pd.DataFrame,
+                                          base_supply_df: pd.DataFrame) -> pd.DataFrame:
+            df_base = base_total_demand_df.copy()
+            # Required columns
+            for col in ['name', 'GFA_m2', 'GRID_MWhyr', 'PV_MWhyr', 'Qhs_sys_MWhyr', 'Qww_sys_MWhyr']:
+                if col not in df_base.columns:
+                    df_base[col] = 0.0
+            has_qcs = 'Qcs_sys_MWhyr' in df_base.columns
+            has_qcre = 'Qcre_sys_MWhyr' in df_base.columns
+            has_qcdata = 'Qcdata_sys_MWhyr' in df_base.columns
+            if not (has_qcs or has_qcre or has_qcdata):
+                df_base['Qcs_sys_MWhyr'] = df_base.get('QC_sys_MWhyr', pd.Series(0.0, index=df_base.index))
+                has_qcs = True
+            out = df_base[['name', 'GFA_m2']].copy()
+            out['GRID_MWhyr'] = df_base['GRID_MWhyr'].astype(float)
+            out['PV_MWhyr'] = df_base['PV_MWhyr'].astype(float)
+            heating_cols = ['DH_hs_MWhyr', 'SOLAR_hs_MWhyr', 'NG_hs_MWhyr', 'COAL_hs_MWhyr', 'OIL_hs_MWhyr', 'WOOD_hs_MWhyr']
+            dhw_cols = ['DH_ww_MWhyr', 'SOLAR_ww_MWhyr', 'NG_ww_MWhyr', 'COAL_ww_MWhyr', 'OIL_ww_MWhyr', 'WOOD_ww_MWhyr']
+            for c in heating_cols + dhw_cols:
+                out[c] = 0.0
+            for c in ['DC_cs_MWhyr', 'DC_cdata_MWhyr', 'DC_cre_MWhyr']:
+                out[c] = 0.0
+            cooling_db = pd.read_csv(self.locator.get_database_assemblies_supply_cooling())
+            heating_db = pd.read_csv(self.locator.get_database_assemblies_supply_heating())
+            dhw_db = pd.read_csv(self.locator.get_database_assemblies_supply_hot_water())
+            sup = phase_supply_df[['name', 'supply_type_cs', 'supply_type_hs', 'supply_type_dhw']].copy()
+            sup = sup.merge(cooling_db[['code', 'feedstock', 'scale', 'efficiency']].rename(
+                columns={'code': 'supply_type_cs', 'feedstock': 'feedstock_cs', 'scale': 'scale_cs', 'efficiency': 'eff_cs'}),
+                on='supply_type_cs', how='left')
+            sup = sup.merge(heating_db[['code', 'feedstock', 'scale', 'efficiency']].rename(
+                columns={'code': 'supply_type_hs', 'feedstock': 'feedstock_hs', 'scale': 'scale_hs', 'efficiency': 'eff_hs'}),
+                on='supply_type_hs', how='left')
+            sup = sup.merge(dhw_db[['code', 'feedstock', 'scale', 'efficiency']].rename(
+                columns={'code': 'supply_type_dhw', 'feedstock': 'feedstock_dhw', 'scale': 'scale_dhw', 'efficiency': 'eff_dhw'}),
+                on='supply_type_dhw', how='left')
+            base_sup = base_supply_df[['name', 'supply_type_cs']].merge(
+                cooling_db[['code', 'feedstock', 'scale', 'efficiency']].rename(
+                    columns={'code': 'supply_type_cs', 'feedstock': 'b_feedstock_cs', 'scale': 'b_scale_cs', 'efficiency': 'b_eff_cs'}),
+                on='supply_type_cs', how='left')
+            out = out.merge(df_base[['name', 'Qhs_sys_MWhyr', 'Qww_sys_MWhyr'] + ([
+                'Qcs_sys_MWhyr'] if has_qcs else []) + ([
+                'Qcre_sys_MWhyr'] if has_qcre else []) + ([
+                'Qcdata_sys_MWhyr'] if has_qcdata else [])], on='name', how='left')
+            out = out.merge(sup, on='name', how='left')
+            out = out.merge(base_sup[['name', 'b_scale_cs', 'b_eff_cs']], on='name', how='left')
+            def set_heat_row(row):
+                q = float(max(row.get('Qhs_sys_MWhyr', 0.0), 0.0))
+                if q <= 0:
+                    return row
+                eff = row.get('eff_hs', None)
+                scale = str(row.get('scale_hs', '')).upper()
+                fs = str(row.get('feedstock_hs', '')).upper()
+                val = (q / eff) if (eff and eff > 0) else 0.0
+                if scale == 'DISTRICT':
+                    row['DH_hs_MWhyr'] += val
+                else:
+                    mapping = {
+                        'NATURALGAS': 'NG_hs_MWhyr', 'NG': 'NG_hs_MWhyr',
+                        'OIL': 'OIL_hs_MWhyr', 'WOOD': 'WOOD_hs_MWhyr', 'COAL': 'COAL_hs_MWhyr', 'SOLAR': 'SOLAR_hs_MWhyr'
+                    }
+                    col = mapping.get(fs, None)
+                    if col:
+                        row[col] += val
+                return row
+            def set_dhw_row(row):
+                q = float(max(row.get('Qww_sys_MWhyr', 0.0), 0.0))
+                if q <= 0:
+                    return row
+                eff = row.get('eff_dhw', None)
+                scale = str(row.get('scale_dhw', '')).upper()
+                fs = str(row.get('feedstock_dhw', '')).upper()
+                val = (q / eff) if (eff and eff > 0) else 0.0
+                if scale == 'DISTRICT':
+                    row['DH_ww_MWhyr'] += val
+                else:
+                    mapping = {
+                        'NATURALGAS': 'NG_ww_MWhyr', 'NG': 'NG_ww_MWhyr',
+                        'OIL': 'OIL_ww_MWhyr', 'WOOD': 'WOOD_ww_MWhyr', 'COAL': 'COAL_ww_MWhyr', 'SOLAR': 'SOLAR_ww_MWhyr'
+                    }
+                    col = mapping.get(fs, None)
+                    if col:
+                        row[col] += val
+                return row
+            def set_cool_row(row):
+                qcs = float(max(row.get('Qcs_sys_MWhyr', 0.0), 0.0))
+                qcre = float(max(row.get('Qcre_sys_MWhyr', 0.0), 0.0))
+                qcdata = float(max(row.get('Qcdata_sys_MWhyr', 0.0), 0.0))
+                eff_cs = row.get('eff_cs', None)
+                scale_cs = str(row.get('scale_cs', '')).upper()
+                b_scale = str(row.get('b_scale_cs', '')).upper()
+                b_eff = row.get('b_eff_cs', None)
+                total_q = qcs + qcre + qcdata
+                if scale_cs == 'DISTRICT':
+                    val_cs = (qcs / eff_cs) if (eff_cs and eff_cs > 0) else 0.0
+                    val_cre = (qcre / eff_cs) if (eff_cs and eff_cs > 0) else 0.0
+                    val_cdata = (qcdata / eff_cs) if (eff_cs and eff_cs > 0) else 0.0
+                    row['DC_cs_MWhyr'] += val_cs
+                    row['DC_cre_MWhyr'] += val_cre
+                    row['DC_cdata_MWhyr'] += val_cdata
+                    if b_scale == 'BUILDING' and (b_eff and b_eff > 0) and total_q > 0:
+                        e_ch_base = total_q / b_eff
+                        row['GRID_MWhyr'] = max(float(row['GRID_MWhyr']) - e_ch_base, 0.0)
+                else:
+                    if b_scale == 'DISTRICT' and (eff_cs and eff_cs > 0) and total_q > 0:
+                        e_new = total_q / eff_cs
+                        row['GRID_MWhyr'] = float(row['GRID_MWhyr']) + e_new
+                return row
+            out = out.apply(set_heat_row, axis=1)
+            out = out.apply(set_dhw_row, axis=1)
+            out = out.apply(set_cool_row, axis=1)
+            cols_keep = ['name', 'GFA_m2', 'GRID_MWhyr', 'PV_MWhyr'] + heating_cols + dhw_cols + ['DC_cs_MWhyr', 'DC_cdata_MWhyr', 'DC_cre_MWhyr']
+            for c in cols_keep:
+                if c not in out.columns:
+                    out[c] = 0.0
+            return out[cols_keep]
+
         # Phase 0 emissions: always use LCA operation with temp demand (COP-based path removed)
         if False:
             # District-wide scope: ALL buildings
@@ -1658,16 +1791,18 @@ class DTNExpansionOptimizer:
             _assert_under_temp(_PathForIO(temp_demand_path), temp_root, "LCA demand path (phase 0)")
             # Phase 0 caching
             sig0 = self._signature_from_supply_df(original_supply_df)
-            phase0_demand_cache = phase_demand_dir / f"phase0__{sig0}.csv"
-            phase0_lca_cache = phase_lca_dir / f"phase0__{sig0}__Total_LCA_operation.csv"
+            _mode = str(getattr(self, 'emissions_mode', 'fast')).lower()
+            suffix = 'accurate' if _mode == 'accurate' else 'synthetic'
+            phase0_demand_cache = phase_demand_dir / f"phase0__{sig0}__{suffix}.csv"
+            phase0_lca_cache = phase_lca_dir / f"phase0__{sig0}__{suffix}__Total_LCA_operation.csv"
             if phase0_demand_cache.exists():
-                log().info(f"[Demand][Cache HIT] Phase 0 demand: {phase0_demand_cache}")
+                log().info(f"[Demand][Cache HIT] Phase 0 demand ({_mode}): {phase0_demand_cache}")
             else:
                 shutil.copy2(temp_demand_path, phase0_demand_cache)
-                log().info(f"[Demand][Cache MISS] Saved Phase 0 demand snapshot to {phase0_demand_cache}")
+                log().info(f"[Demand][Cache MISS] Saved Phase 0 demand snapshot ({_mode}) to {phase0_demand_cache}")
             # LCA cache
             if phase0_lca_cache.exists():
-                log().info(f"[LCA][Cache HIT] Phase 0 LCA: {phase0_lca_cache}")
+                log().info(f"[LCA][Cache HIT] Phase 0 LCA ({_mode}): {phase0_lca_cache}")
                 lca_operation_results = pd.read_csv(phase0_lca_cache)
             else:
                 _log_io("CALL LCA phase0", _PathForIO(temp_locator.scenario), extra={"supply": str(phase0_supply_path), "demand": str(phase0_demand_cache)})
@@ -1675,7 +1810,7 @@ class DTNExpansionOptimizer:
                 lca_operation_results = pd.read_csv(temp_locator.get_lca_operation())
                 try:
                     lca_operation_results.to_csv(phase0_lca_cache, index=False)
-                    log().info(f"[LCA][Cache MISS] Saved Phase 0 LCA to {phase0_lca_cache}")
+                    log().info(f"[LCA][Cache MISS] Saved Phase 0 LCA ({_mode}) to {phase0_lca_cache}")
                 except Exception:
                     pass
             log().info(f"Loaded LCA results with {len(lca_operation_results)} buildings")
@@ -1755,7 +1890,9 @@ class DTNExpansionOptimizer:
                 'district_operation_emission_tonCO2': total_ghg,
                 'connected_clusters_operation_emissions_tonCO2': connected_ghg,
                 'per_total_gfa_kgCO2_per_m2yr': per_total,
-                'per_connected_gfa_kgCO2_per_m2yr': per_connected
+                'per_connected_gfa_kgCO2_per_m2yr': per_connected,
+                'mode': str(getattr(self, 'emissions_mode', 'fast')).lower(),
+                'supply_signature': sig0
             })
         except Exception:
             pass
@@ -1827,34 +1964,44 @@ class DTNExpansionOptimizer:
             _assert_under_temp(phase_supply_path, temp_root, "LCA supply path (phase)")
             _assert_under_temp(_PathForIO(temp_demand_path), temp_root, "LCA demand path (phase)")
             sig = self._signature_from_supply_df(phase_supply_df)
-            phase_demand_cache = phase_demand_dir / f"phase{phase}__{sig}.csv"
-            phase_lca_cache = phase_lca_dir / f"phase{phase}__{sig}__Total_LCA_operation.csv"
+            _mode = str(getattr(self, 'emissions_mode', 'fast')).lower()
+            suffix = 'accurate' if _mode == 'accurate' else 'synthetic'
+            phase_demand_cache = phase_demand_dir / f"phase{phase}__{sig}__{suffix}.csv"
+            phase_lca_cache = phase_lca_dir / f"phase{phase}__{sig}__{suffix}__Total_LCA_operation.csv"
 
-            # Demand cache: if miss, swap supply in temp scenario and run Demand
-            if phase_demand_cache.exists():
-                log().info(f"[Demand][Cache HIT] Phase {phase} demand (temp): {phase_demand_cache}")
+            # Demand cache with mode branching
+            if _mode in ('fast', 'hybrid'):
+                if phase_demand_cache.exists():
+                    log().info(f"[Demand][Synthetic][Cache HIT] Phase {phase} demand (temp): {phase_demand_cache}")
+                else:
+                    syn = _build_synthetic_phase_demand(phase_supply_df, _baseline_temp_demand_df, original_supply_df)
+                    syn.to_csv(phase_demand_cache, index=False)
+                    log().info(f"[Demand][Synthetic][Cache MISS] Saved Phase {phase} synthetic demand (temp) to {phase_demand_cache}")
             else:
-                log().info(f"[Demand][Cache MISS] Phase {phase}: swapping temp supply & re-running Demand")
-                with self._TemporarySupplyFileForScenario(temp_locator, phase_supply_df):
-                    self._run_demand_for_scenario(temp_locator.scenario)
-                    try:
-                        td_tmp = pd.read_csv(temp_demand_path)
-                        diag = {
-                            'DH_hs_MWhyr': float(td_tmp.get('DH_hs_MWhyr', pd.Series([0])).sum()),
-                            'NG_hs_MWhyr': float(td_tmp.get('NG_hs_MWhyr', pd.Series([0])).sum()),
-                            'DC_cs_MWhyr': float(td_tmp.get('DC_cs_MWhyr', pd.Series([0])).sum()),
-                            'GRID_MWhyr': float(td_tmp.get('GRID_MWhyr', pd.Series([0])).sum()),
-                            'PV_MWhyr': float(td_tmp.get('PV_MWhyr', pd.Series([0])).sum()),
-                        }
-                        log().info(f"[Demand][Phase {phase} temp] Carriers summary: {diag}")
-                    except Exception:
-                        pass
-                    shutil.copy2(temp_demand_path, phase_demand_cache)
-                    log().info(f"[Demand] Saved Phase {phase} temp demand snapshot to {phase_demand_cache}")
+                if phase_demand_cache.exists():
+                    log().info(f"[Demand][Accurate][Cache HIT] Phase {phase} demand (temp): {phase_demand_cache}")
+                else:
+                    log().info(f"[Demand][Accurate][Cache MISS] Phase {phase}: swapping temp supply & re-running Demand")
+                    with self._TemporarySupplyFileForScenario(temp_locator, phase_supply_df):
+                        self._run_demand_for_scenario(temp_locator.scenario)
+                        try:
+                            td_tmp = pd.read_csv(temp_demand_path)
+                            diag = {
+                                'DH_hs_MWhyr': float(td_tmp.get('DH_hs_MWhyr', pd.Series([0])).sum()),
+                                'NG_hs_MWhyr': float(td_tmp.get('NG_hs_MWhyr', pd.Series([0])).sum()),
+                                'DC_cs_MWhyr': float(td_tmp.get('DC_cs_MWhyr', pd.Series([0])).sum()),
+                                'GRID_MWhyr': float(td_tmp.get('GRID_MWhyr', pd.Series([0])).sum()),
+                                'PV_MWhyr': float(td_tmp.get('PV_MWhyr', pd.Series([0])).sum()),
+                            }
+                            log().info(f"[Demand][Phase {phase} temp] Carriers summary: {diag}")
+                        except Exception:
+                            pass
+                        shutil.copy2(temp_demand_path, phase_demand_cache)
+                        log().info(f"[Demand] Saved Phase {phase} temp demand snapshot to {phase_demand_cache}")
 
             # LCA: cache load or run against cached demand
             if phase_lca_cache.exists():
-                log().info(f"[LCA][Cache HIT] Phase {phase} LCA (temp): {phase_lca_cache}")
+                log().info(f"[LCA][Cache HIT] Phase {phase} LCA ({_mode}): {phase_lca_cache}")
                 lca_operation_results = pd.read_csv(phase_lca_cache)
             else:
                 _log_io("CALL LCA phase", _PathForIO(temp_locator.scenario), extra={"phase": phase, "supply": str(phase_supply_path), "demand": str(phase_demand_cache)})
@@ -1865,7 +2012,7 @@ class DTNExpansionOptimizer:
                 lca_operation_results = pd.read_csv(lca_results_path)
                 try:
                     lca_operation_results.to_csv(phase_lca_cache, index=False)
-                    log().info(f"[LCA][Cache MISS] Saved Phase {phase} LCA to {phase_lca_cache}")
+                    log().info(f"[LCA][Cache MISS] Saved Phase {phase} LCA ({_mode}) to {phase_lca_cache}")
                 except Exception:
                     pass
             # Also save generic per-phase LCA CSV for inspection
@@ -1913,6 +2060,21 @@ class DTNExpansionOptimizer:
                 'district_operation_emission_per_connected_gfa [kg CO2eq/yr/m2]': per_connected,
                 'district_operation_emission_per_total_gfa [kg CO2eq/yr/m2]': per_total
             }
+            # Append to summary rows
+            try:
+                cum_clusters_str = '+'.join(map(str, sorted(set(connected_clusters))))
+                summary_rows.append({
+                    'phase': phase,
+                    'cumulative_clusters': cum_clusters_str,
+                    'district_operation_emission_tonCO2': total_ghg,
+                    'connected_clusters_operation_emissions_tonCO2': connected_ghg,
+                    'per_total_gfa_kgCO2_per_m2yr': per_total,
+                    'per_connected_gfa_kgCO2_per_m2yr': per_connected,
+                    'mode': str(getattr(self, 'emissions_mode', 'fast')).lower(),
+                    'supply_signature': sig
+                })
+            except Exception:
+                pass
 
         # Write per-phase summary CSV
         try:
@@ -5343,6 +5505,27 @@ def main(config):
     # Emissions are LCA-only; compute-emissions-from-cop is deprecated and ignored
     try:
         log().info("compute-emissions-from-cop parameter is deprecated and ignored. Using LCA Operation per phase.")
+    except Exception:
+        pass
+
+    # Apply emissions evaluation mode & hybrid flags from config (fallbacks provided)
+    try:
+        em_mode = str(getattr(config.dtn_expansion_optimization, 'emissions_evaluation_mode', 'fast')).lower()
+    except Exception:
+        em_mode = 'fast'
+    try:
+        hybrid_topk = int(getattr(config.dtn_expansion_optimization, 'hybrid_validate_top_k', 5))
+    except Exception:
+        hybrid_topk = 5
+    try:
+        hybrid_final = bool(getattr(config.dtn_expansion_optimization, 'hybrid_final_validate', True))
+    except Exception:
+        hybrid_final = True
+    try:
+        optimizer.emissions_mode = em_mode
+        optimizer.hybrid_validate_top_k = hybrid_topk
+        optimizer.hybrid_final_validate = hybrid_final
+        log().info(f"[EmissionsMode] Using mode={optimizer.emissions_mode}, hybrid_top_k={optimizer.hybrid_validate_top_k}, hybrid_final_validate={optimizer.hybrid_final_validate}")
     except Exception:
         pass
 

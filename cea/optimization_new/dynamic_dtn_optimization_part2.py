@@ -2429,9 +2429,68 @@ class DTNExpansionOptimizer:
         total_roi = 0
         total_npv = 0
 
-        # Check if budget constraints are satisfied
+        # Check if budget constraints are satisfied (EARLY FEASIBILITY CHECK before Demand/LCA)
         phase_capex = [0] * self.num_phases
         phase_total_expenditure = [0] * self.num_phases
+        # Early feasibility short-circuit: if any phase violates budgets, skip emissions calculation
+        try:
+            # Group clusters by phase
+            _clusters_by_phase_early = {}
+            for c, p in cluster_phase_map.items():
+                if int(p) > 0:
+                    _clusters_by_phase_early.setdefault(int(p), []).append(c)
+            violated = False
+            violated_phase = None
+            violated_msg = None
+            for ph in range(1, self.num_phases + 1):
+                clusters = _clusters_by_phase_early.get(ph, [])
+                if clusters:
+                    capex_val, _ = self._calculate_phase_capex(clusters, ph)
+                    if self.capex_budget_per_phase and ph-1 < len(self.capex_budget_per_phase) and capex_val > self.capex_budget_per_phase[ph-1]:
+                        violated = True
+                        violated_phase = ph
+                        violated_msg = f"CAPEX {capex_val} > {self.capex_budget_per_phase[ph-1]}"
+                        break
+                    total_exp_val = self._calculate_phase_total_expenditure(clusters, ph)
+                    if self.total_expenditure_budget_per_phase and ph-1 < len(self.total_expenditure_budget_per_phase) and total_exp_val > self.total_expenditure_budget_per_phase[ph-1]:
+                        violated = True
+                        violated_phase = ph
+                        violated_msg = f"TotalExp {total_exp_val} > {self.total_expenditure_budget_per_phase[ph-1]}"
+                        break
+            if violated:
+                ind_tuple = tuple(individual)
+                try:
+                    log().info(f"[Skip Emissions] Infeasible individual {ind_tuple} at phase {violated_phase}: {violated_msg}")
+                except Exception:
+                    pass
+                if self.multi_objective_mode:
+                    objectives = self.multi_objective_functions or ['NPV', 'emissions']
+                    objectives = objectives[:3]
+                    pen = []
+                    for obj in objectives:
+                        o = obj.lower() if isinstance(obj, str) else obj
+                        if o == 'npv':
+                            pen.append(-1e12)
+                        elif o == 'roi':
+                            pen.append(-1e6)
+                        elif o == 'emissions':
+                            pen.append(1e12)
+                        elif o == 'total_capex':
+                            pen.append(1e15)
+                    return tuple(pen)
+                else:
+                    obj_lower = self.objective_function.lower() if isinstance(self.objective_function, str) else self.objective_function
+                    if obj_lower == 'roi':
+                        return (-1e6,)
+                    elif obj_lower == 'emissions':
+                        return (-1e12,)
+                    elif obj_lower == 'total_capex':
+                        return (1e15,)
+                    else:
+                        return (-1e12,)
+        except Exception:
+            # If early check fails for any reason, fall back to full evaluation
+            pass
 
         # Calculate emissions using calculate_district_emissions_new
         ind_tuple = tuple(individual)

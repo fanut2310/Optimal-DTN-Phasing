@@ -565,7 +565,7 @@ Energy Supply System Optimisation:
     description: This Feature optimises energy supply systems for centralised operation.
     interfaces: [cli, dashboard]
     module: cea.optimization_new.domain
-    parameters: ['general:debug', 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free',
+    parameters: ['general:scenario', 'general:debug', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free',
                  optimization-new]
     input-files:
       - [get_street_network]
@@ -741,7 +741,7 @@ Utilities:
     description: Run all the plots for test purposes
     interfaces: [test, cli]
     module: cea.tests.run_all_plots
-    parameters: ["general:project", "general:scenario", "plots", "plots-comparisons", "plots-optimization",
+    parameters: ["general:scenario", "general:project", "plots", "plots-comparisons", "plots-optimization",
                  "plots-supply-system"]
 
 default:
@@ -823,7 +823,7 @@ default:
     description: Run a workflow.yml file from start to end
     interfaces: [cli]
     module: cea.workflows.workflow
-    parameters: [workflow, 'general:scenario']
+    parameters: ['general:scenario', workflow]
 
 Documentation:
   - name: html

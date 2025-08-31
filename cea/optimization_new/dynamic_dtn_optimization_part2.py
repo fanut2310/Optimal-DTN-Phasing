@@ -1627,13 +1627,10 @@ class DTNExpansionOptimizer:
         # Prepare per-phase summary collection
         summary_rows = []
 
-        # Load demand once for GFA denominators (temp scenario); restrict denominators to the authoritative universe U
+        # Load demand once for GFA denominators (temp scenario); always use full modified total GFA for per_total intensities
         _demand_df = pd.read_csv(self.locator.get_dynamic_dtn_optimization_temp_scenario_total_demand())
-        _universe = list(getattr(self, '_universe_U_names', []) or [])
-        if _universe:
-            _total_gfa_const = float(_demand_df.loc[_demand_df['name'].isin(_universe), 'GFA_m2'].sum())
-        else:
-            _total_gfa_const = float(_demand_df['GFA_m2'].sum())
+        # Use the total GFA across all buildings in the temp scenario (no universe filtering) to ensure consistent per_total intensities
+        _total_gfa_const = float(_demand_df['GFA_m2'].sum())
         _name_to_gfa = dict(zip(_demand_df['name'], _demand_df['GFA_m2']))
 
         # Create directory for per-phase LCA outputs under temp scenario dtn_expansion
@@ -1865,7 +1862,8 @@ class DTNExpansionOptimizer:
                 name_col_gfa = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
                 mask_conn_gfa = lca_operation_results[name_col_gfa].astype(str).isin(_connected_buildings_p0) if name_col_gfa else pd.Series(False, index=lca_operation_results.index)
                 connected_gfa_lca = float(lca_operation_results.loc[mask_conn_gfa, 'GFA_m2'].sum())
-                total_gfa_lca = float(lca_operation_results['GFA_m2'].sum())
+                # Use the modified total GFA from the temp scenario for per_total intensities
+                total_gfa_lca = _total_gfa_const
             except Exception:
                 connected_gfa_lca = float(sum(_name_to_gfa.get(b, 0.0) for b in _connected_buildings_p0))
                 total_gfa_lca = _total_gfa_const
@@ -2043,7 +2041,8 @@ class DTNExpansionOptimizer:
             if 'GFA_m2' in lca_operation_results.columns:
                 try:
                     connected_gfa_lca = float(lca_operation_results.loc[mask_conn, 'GFA_m2'].sum())
-                    total_gfa_lca = float(lca_operation_results.loc[mask_total, 'GFA_m2'].sum())
+                    # Use the modified total GFA from the temp scenario for per_total intensities
+                    total_gfa_lca = _total_gfa_const
                 except Exception:
                     connected_gfa_lca = float(sum(_name_to_gfa.get(b, 0.0) for b in set(connected_buildings)))
                     total_gfa_lca = _total_gfa_const

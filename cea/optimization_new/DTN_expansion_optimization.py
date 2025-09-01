@@ -1205,6 +1205,31 @@ class DTNExpansionOptimizer:
             except Exception:
                 pass
 
+    class TemporaryEmissionsBackup:
+        """Backup & restore outputs/data/emissions/Total_LCA_operation.csv around LCA calls to avoid overwriting baseline."""
+        def __init__(self, locator):
+            self.locator = locator
+            self.lca_file = locator.get_lca_operation()
+            self.backup_file = None
+        def __enter__(self):
+            try:
+                lca_dir = os.path.dirname(self.lca_file)
+                if os.path.exists(self.lca_file):
+                    tmp = getattr(self.locator, 'get_temporary_folder', None)
+                    tmp_dir = tmp() if callable(tmp) else lca_dir
+                    self.backup_file = os.path.join(tmp_dir, f'backup_lca_operation_{int(time.time())}_{random.randint(0,99999)}.csv')
+                    shutil.copy2(self.lca_file, self.backup_file)
+            except Exception:
+                self.backup_file = None
+            return self
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            try:
+                if self.backup_file and os.path.exists(self.backup_file):
+                    shutil.copy2(self.backup_file, self.lca_file)
+                    os.remove(self.backup_file)
+            except Exception:
+                pass
+
     def _run_demand_for_current_scenario(self):
         """Run CEA Demand for the optimizer's current scenario."""
         try:
@@ -1503,6 +1528,8 @@ class DTNExpansionOptimizer:
 
         # Prepare per-phase summary collection
         summary_rows = []
+        # Prepare per-phase LCA totals ledger (unfiltered vs U-filtered)
+        ledger_rows = []
 
         # Load baseline demand for possible synthetic generation (fast/hybrid)
         try:
@@ -1568,6 +1595,17 @@ class DTNExpansionOptimizer:
                 'Qcdata_sys_MWhyr'] if has_qcdata else [])], on='name', how='left')
             out = out.merge(sup, on='name', how='left')
             out = out.merge(base_sup[['name', 'b_scale_cs', 'b_eff_cs']], on='name', how='left')
+            # Also prepare baseline heating & DHW supply info for GRID adjustments
+            base_sup_hs = base_supply_df[['name', 'supply_type_hs']].merge(
+                heating_db[['code', 'feedstock', 'scale', 'efficiency']].rename(
+                    columns={'code': 'supply_type_hs', 'feedstock': 'b_feedstock_hs', 'scale': 'b_scale_hs', 'efficiency': 'b_eff_hs'}),
+                on='supply_type_hs', how='left')
+            base_sup_dhw = base_supply_df[['name', 'supply_type_dhw']].merge(
+                dhw_db[['code', 'feedstock', 'scale', 'efficiency']].rename(
+                    columns={'code': 'supply_type_dhw', 'feedstock': 'b_feedstock_dhw', 'scale': 'b_scale_dhw', 'efficiency': 'b_eff_dhw'}),
+                on='supply_type_dhw', how='left')
+            out = out.merge(base_sup_hs[['name', 'b_feedstock_hs', 'b_scale_hs', 'b_eff_hs']], on='name', how='left')
+            out = out.merge(base_sup_dhw[['name', 'b_feedstock_dhw', 'b_scale_dhw', 'b_eff_dhw']], on='name', how='left')
             # Heating allocation
             def set_heat_row(row):
                 q = float(max(row.get('Qhs_sys_MWhyr', 0.0), 0.0))
@@ -1642,6 +1680,39 @@ class DTNExpansionOptimizer:
             out = out.apply(set_heat_row, axis=1)
             out = out.apply(set_dhw_row, axis=1)
             out = out.apply(set_cool_row, axis=1)
+            # Heating/DHW electric ↔ district adjustments on GRID electricity
+            def adjust_grid_for_hs_dhw(row):
+                grid = float(row.get('GRID_MWhyr', 0.0))
+                qhs = float(max(row.get('Qhs_sys_MWhyr', 0.0), 0.0))
+                qww = float(max(row.get('Qww_sys_MWhyr', 0.0), 0.0))
+                # Phase supplies
+                eff_hs = row.get('eff_hs', None)
+                eff_dhw = row.get('eff_dhw', None)
+                scale_hs = str(row.get('scale_hs', '')).upper()
+                scale_dhw = str(row.get('scale_dhw', '')).upper()
+                fs_hs = str(row.get('feedstock_hs', '')).upper()
+                fs_dhw = str(row.get('feedstock_dhw', '')).upper()
+                # Baseline supplies
+                b_eff_hs = row.get('b_eff_hs', None)
+                b_eff_dhw = row.get('b_eff_dhw', None)
+                b_scale_hs = str(row.get('b_scale_hs', '')).upper()
+                b_scale_dhw = str(row.get('b_scale_dhw', '')).upper()
+                b_fs_hs = str(row.get('b_feedstock_hs', '')).upper()
+                b_fs_dhw = str(row.get('b_feedstock_dhw', '')).upper()
+                # Add new electric heating electricity if phase is building-scale electric
+                if scale_hs == 'BUILDING' and fs_hs == 'GRID' and (eff_hs and eff_hs > 0) and qhs > 0:
+                    grid += qhs / eff_hs
+                # Subtract baseline electric heating if moving away from building electric
+                if b_scale_hs == 'BUILDING' and b_fs_hs == 'GRID' and (b_eff_hs and b_eff_hs > 0) and qhs > 0:
+                    grid = max(grid - (qhs / b_eff_hs), 0.0)
+                # DHW
+                if scale_dhw == 'BUILDING' and fs_dhw == 'GRID' and (eff_dhw and eff_dhw > 0) and qww > 0:
+                    grid += qww / eff_dhw
+                if b_scale_dhw == 'BUILDING' and b_fs_dhw == 'GRID' and (b_eff_dhw and b_eff_dhw > 0) and qww > 0:
+                    grid = max(grid - (qww / b_eff_dhw), 0.0)
+                row['GRID_MWhyr'] = grid
+                return row
+            out = out.apply(adjust_grid_for_hs_dhw, axis=1)
             # Keep only required columns for LCA operation
             cols_keep = ['name', 'GFA_m2', 'GRID_MWhyr', 'PV_MWhyr'] + heating_cols + dhw_cols + ['DC_cs_MWhyr', 'DC_cdata_MWhyr', 'DC_cre_MWhyr']
             for c in cols_keep:
@@ -1678,35 +1749,65 @@ class DTNExpansionOptimizer:
             log().info(f"[LCA][Cache HIT] Phase 0 LCA ({_mode}): {phase0_lca_cache}")
             lca_operation_results = pd.read_csv(phase0_lca_cache)
         else:
-            lca_operation(self.locator, custom_supply_path=str(phase0_supply_path), custom_demand_path=str(phase0_demand_cache))
-            lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
+            with self.TemporaryEmissionsBackup(self.locator):
+                lca_operation(self.locator, custom_supply_path=str(phase0_supply_path), custom_demand_path=str(phase0_demand_cache))
+                lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
             try:
                 lca_operation_results.to_csv(phase0_lca_cache, index=False)
                 log().info(f"[LCA][Cache MISS] Saved Phase 0 LCA ({_mode}) to {phase0_lca_cache}")
             except Exception:
                 pass
-        # District-wide total emissions
-        total_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())
-        # Connected-only emissions for Phase 0 (cluster 0)
+        # Build universe U from cluster_nodes (CONSUMER) and compute totals on U only
         name_col = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
         if not name_col:
             raise ValueError("LCA file missing building name column (expected 'name' or 'Name')")
-        # Normalize names for robust matching
+        lca_names_norm = lca_operation_results[name_col].astype(str).str.strip().str.upper()
+        try:
+            if 'type' in self.cluster_nodes.columns:
+                universe_raw = self.cluster_nodes[self.cluster_nodes['type'] == 'CONSUMER']['building'].astype(str).tolist()
+            else:
+                universe_raw = self.cluster_nodes['building'].astype(str).tolist()
+        except Exception:
+            universe_raw = []
+        universe_norm = {str(b).strip().upper() for b in universe_raw} if universe_raw else set(lca_names_norm.tolist())
+        mask_total = lca_names_norm.isin(universe_norm) if universe_norm else pd.Series(True, index=lca_operation_results.index)
+        # District-wide total emissions on universe U
+        total_ghg = float(lca_operation_results.loc[mask_total, 'GHG_sys_tonCO2'].sum())
+        # Connected-only emissions for Phase 0 (cluster 0)
         conn_set_raw = set(self._get_buildings_in_specific_cluster(0))
         conn_set_norm = {str(b).strip().upper() for b in conn_set_raw}
-        lca_names_norm = lca_operation_results[name_col].astype(str).str.strip().str.upper()
         mask_conn = lca_names_norm.isin(conn_set_norm)
         connected_ghg = float(lca_operation_results.loc[mask_conn, 'GHG_sys_tonCO2'].sum())
+        # Also write U-filtered LCA snapshot
+        try:
+            phase0_lca_u_csv = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "phase_LCA_operation" / "phase0_Total_LCA_operation_U.csv"
+            lca_operation_results.loc[mask_total].to_csv(phase0_lca_u_csv, index=False)
+        except Exception:
+            pass
+        # Ledger row for Phase 0
+        try:
+            unfil_ghg0 = float(lca_operation_results['GHG_sys_tonCO2'].sum())
+            unfil_gfa0 = float(lca_operation_results['GFA_m2'].sum()) if 'GFA_m2' in lca_operation_results.columns else float(_total_gfa_const)
+            u_gfa0 = float(lca_operation_results.loc[mask_total, 'GFA_m2'].sum()) if 'GFA_m2' in lca_operation_results.columns else float(_total_gfa_const)
+            ledger_rows.append({
+                'phase': 0,
+                'total_unfiltered_ghg_t': unfil_ghg0,
+                'total_unfiltered_gfa_m2': unfil_gfa0,
+                'total_U_ghg_t': total_ghg,
+                'total_U_gfa_m2': u_gfa0
+            })
+        except Exception:
+            pass
         # No hybrid replacement for Phase 0; preserve raw LCA totals for comparability
 
-        # Compute GFA denominators (use LCA per-building GFA for consistency)
+        # Compute GFA denominators: connected from LCA, total = constant baseline total GFA
         _connected_buildings_p0 = set(self._get_buildings_in_specific_cluster(0))
         if 'GFA_m2' in lca_operation_results.columns:
             try:
                 name_col_gfa = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
-                mask_conn_gfa = lca_operation_results[name_col_gfa].astype(str).isin(_connected_buildings_p0) if name_col_gfa else pd.Series(False, index=lca_operation_results.index)
+                mask_conn_gfa = lca_operation_results[name_col_gfa].astype(str).str.strip().str.upper().isin(conn_set_norm) if name_col_gfa else pd.Series(False, index=lca_operation_results.index)
                 connected_gfa_lca = float(lca_operation_results.loc[mask_conn_gfa, 'GFA_m2'].sum())
-                total_gfa_lca = float(lca_operation_results['GFA_m2'].sum())
+                total_gfa_lca = _total_gfa_const
             except Exception:
                 connected_gfa_lca = float(sum(_name_to_gfa.get(b, 0.0) for b in _connected_buildings_p0))
                 total_gfa_lca = _total_gfa_const
@@ -1842,8 +1943,9 @@ class DTNExpansionOptimizer:
                 log().info(f"[LCA][Cache HIT] Phase {phase} LCA ({_mode}): {phase_lca_cache}")
                 lca_operation_results = pd.read_csv(phase_lca_cache)
             else:
-                lca_operation(self.locator, custom_supply_path=str(phase_supply_path), custom_demand_path=str(phase_demand_cache))
-                lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
+                with self.TemporaryEmissionsBackup(self.locator):
+                    lca_operation(self.locator, custom_supply_path=str(phase_supply_path), custom_demand_path=str(phase_demand_cache))
+                    lca_operation_results = pd.read_csv(self.locator.get_lca_operation())
                 try:
                     lca_operation_results.to_csv(phase_lca_cache, index=False)
                     log().info(f"[LCA][Cache MISS] Saved Phase {phase} LCA ({_mode}) to {phase_lca_cache}")
@@ -1856,22 +1958,39 @@ class DTNExpansionOptimizer:
                 log().debug(f"Saved phase {phase} LCA (generic) to {phase_lca_csv}")
             except Exception:
                 pass
-            total_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())
             name_col = 'name' if 'name' in lca_operation_results.columns else ('Name' if 'Name' in lca_operation_results.columns else None)
             if not name_col:
                 raise ValueError("LCA file missing building name column (expected 'name' or 'Name')")
-            # Normalize names for robust matching
+            # Normalize names for robust matching and build U-mask
+            try:
+                if 'type' in self.cluster_nodes.columns:
+                    universe_raw = self.cluster_nodes[self.cluster_nodes['type'] == 'CONSUMER']['building'].astype(str).tolist()
+                else:
+                    universe_raw = self.cluster_nodes['building'].astype(str).tolist()
+            except Exception:
+                universe_raw = []
+            lca_names_norm = lca_operation_results[name_col].astype(str).str.strip().str.upper()
+            universe_norm = {str(b).strip().upper() for b in universe_raw} if universe_raw else set(lca_names_norm.tolist())
+            mask_total = lca_names_norm.isin(universe_norm) if universe_norm else pd.Series(True, index=lca_operation_results.index)
+            # Total emissions on U only
+            total_ghg = float(lca_operation_results.loc[mask_total, 'GHG_sys_tonCO2'].sum())
+            # Connected-only emissions for this phase
             conn_set_raw = set(connected_buildings)
             conn_set_norm = {str(b).strip().upper() for b in conn_set_raw}
-            lca_names_norm = lca_operation_results[name_col].astype(str).str.strip().str.upper()
             mask_conn = lca_names_norm.isin(conn_set_norm)
             connected_ghg = float(lca_operation_results.loc[mask_conn, 'GHG_sys_tonCO2'].sum())
+            # Save U-filtered per-phase LCA CSV
+            try:
+                phase_lca_u_csv = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "phase_LCA_operation" / f"phase{phase}_Total_LCA_operation_U.csv"
+                lca_operation_results.loc[mask_total].to_csv(phase_lca_u_csv, index=False)
+            except Exception:
+                pass
 
-            # Compute GFA denominators for this phase (prefer LCA per-building GFA for consistency)
+            # Compute GFA denominators: connected from LCA, total = constant baseline total GFA
             if 'GFA_m2' in lca_operation_results.columns:
                 try:
                     connected_gfa_lca = float(lca_operation_results.loc[mask_conn, 'GFA_m2'].sum())
-                    total_gfa_lca = float(lca_operation_results['GFA_m2'].sum())
+                    total_gfa_lca = _total_gfa_const
                 except Exception:
                     connected_gfa_lca = float(sum(_name_to_gfa.get(b, 0.0) for b in set(connected_buildings)))
                     total_gfa_lca = _total_gfa_const
@@ -1880,6 +1999,21 @@ class DTNExpansionOptimizer:
                 total_gfa_lca = _total_gfa_const
             per_connected = (connected_ghg * 1000.0 / connected_gfa_lca) if connected_gfa_lca > 0 else 0.0
             per_total = (total_ghg * 1000.0 / total_gfa_lca) if total_gfa_lca > 0 else 0.0
+
+            # Ledger: unfiltered and U-filtered totals
+            try:
+                unfil_ghg = float(lca_operation_results['GHG_sys_tonCO2'].sum())
+                unfil_gfa = float(lca_operation_results['GFA_m2'].sum()) if 'GFA_m2' in lca_operation_results.columns else float(_total_gfa_const)
+                u_gfa = float(lca_operation_results.loc[mask_total, 'GFA_m2'].sum()) if 'GFA_m2' in lca_operation_results.columns else float(_total_gfa_const)
+                ledger_rows.append({
+                    'phase': phase,
+                    'total_unfiltered_ghg_t': unfil_ghg,
+                    'total_unfiltered_gfa_m2': unfil_gfa,
+                    'total_U_ghg_t': total_ghg,
+                    'total_U_gfa_m2': u_gfa
+                })
+            except Exception:
+                pass
 
             # Store results for this phase
             results[phase] = {
@@ -1904,15 +2038,21 @@ class DTNExpansionOptimizer:
             except Exception:
                 pass
 
-        # Write per-phase summary CSV
+        # Write per-phase summary CSV and LCA totals ledger
         try:
+            base_dir = Path(self.locator.get_dtn_expansion_optimization_results_folder())
             if summary_rows:
                 summary_df = pd.DataFrame(summary_rows)
-                summary_file = Path(self.locator.get_dtn_expansion_optimization_results_folder()) / "emissions_by_phase_summary.csv"
+                summary_file = base_dir / "emissions_by_phase_summary.csv"
                 summary_df.to_csv(summary_file, index=False)
                 log().debug(f"Saved emissions-by-phase summary to {summary_file}")
+            if ledger_rows:
+                ledger_df = pd.DataFrame(ledger_rows)
+                ledger_file = base_dir / "phase_LCA_operation" / "phase_lca_totals.csv"
+                ledger_df.to_csv(ledger_file, index=False)
+                log().debug(f"Saved phase LCA totals ledger to {ledger_file}")
         except Exception as e:
-            log().warning(f"Could not write emissions summary CSV: {e}")
+            log().warning(f"Could not write emissions summary / ledger CSV: {e}")
 
         return results
 

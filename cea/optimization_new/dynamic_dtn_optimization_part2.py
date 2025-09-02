@@ -1566,6 +1566,43 @@ class DTNExpansionOptimizer:
             except Exception:
                 pass
 
+    class _TemporaryDemandFolderBackupForScenario:
+        """Backup & restore the temp scenario's outputs/data/demand folder around accurate Demand reruns.
+        Ensures Dynamic Part 2 doesn't persistently overwrite Part 1 outputs in temp_scenario.
+        """
+        def __init__(self, locator_obj: cea.inputlocator.InputLocator):
+            self.locator = locator_obj
+            self.demand_dir = os.path.join(self.locator.scenario, 'outputs', 'data', 'demand')
+            base = self.demand_dir.rstrip('\\/')
+            self.backup_dir = f"{base}.__bak_{int(time.time())}_{random.randint(0,99999)}"
+            self.existed_before = False
+        def __enter__(self):
+            try:
+                if os.path.exists(self.demand_dir):
+                    self.existed_before = True
+                    shutil.copytree(self.demand_dir, self.backup_dir)
+            except Exception:
+                # If backup fails, continue without raising; better to not crash optimization
+                self.existed_before = os.path.exists(self.demand_dir)
+            return self
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            try:
+                if self.existed_before and os.path.exists(self.backup_dir):
+                    # Remove current (possibly modified) demand folder then restore
+                    if os.path.exists(self.demand_dir):
+                        shutil.rmtree(self.demand_dir, ignore_errors=True)
+                    shutil.copytree(self.backup_dir, self.demand_dir)
+                    shutil.rmtree(self.backup_dir, ignore_errors=True)
+                elif not self.existed_before:
+                    # Folder did not exist before; remove if created by the rerun
+                    if os.path.exists(self.demand_dir):
+                        shutil.rmtree(self.demand_dir, ignore_errors=True)
+                    if os.path.exists(self.backup_dir):
+                        shutil.rmtree(self.backup_dir, ignore_errors=True)
+            except Exception:
+                # Swallow any restoration errors to avoid crashing at cleanup
+                pass
+
     def calculate_district_emissions_new(self):
         """
         Calculate district operation emissions using the new methodology.
@@ -2045,7 +2082,8 @@ class DTNExpansionOptimizer:
                     log().info(f"[Demand][Accurate][Cache HIT] Phase {phase} demand (temp): {phase_demand_cache}")
                 else:
                     log().info(f"[Demand][Accurate][Cache MISS] Phase {phase}: swapping temp supply & re-running Demand")
-                    with self._TemporarySupplyFileForScenario(temp_locator, phase_supply_df):
+                    with self._TemporarySupplyFileForScenario(temp_locator, phase_supply_df), \
+                         self._TemporaryDemandFolderBackupForScenario(temp_locator):
                         self._run_demand_for_scenario(temp_locator.scenario)
                         try:
                             td_tmp = pd.read_csv(temp_demand_path)

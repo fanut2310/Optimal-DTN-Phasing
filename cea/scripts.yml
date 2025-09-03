@@ -473,8 +473,6 @@ Energy Supply System Optimisation:
                   'dtn-expansion-optimization:pump-capex-b',
                   'dtn-expansion-optimization:cooling-cop',
                   'dtn-expansion-optimization:ghg-budget-per-phase',
-                  'dtn-expansion-optimization:multi-objective-mode',
-                  'dtn-expansion-optimization:multi-objective-functions',
                   'dtn-expansion-optimization:population-size',
                   'dtn-expansion-optimization:num-generations',
                   'dtn-expansion-optimization:capex-per-phase-relaxing-pct',
@@ -551,7 +549,8 @@ Energy Supply System Optimisation:
     interfaces: [ cli, dashboard ]
     module: cea.optimization_new.dynamic_dtn_optimization_part3
     parameters: [ 'general:scenario', 'general:multiprocessing', 'general:number-of-cpus-to-keep-free',
-                  'dynamic-dtn-optimization:network-type', 'dtn-expansion-optimization:testing-clusters' ]
+                  'dynamic-dtn-optimization:network-type', 'dtn-expansion-optimization:testing-clusters',
+                  'dynamic-dtn-optimization:reset-analysis' ]
     input-files:
       - [get_optimization_results_folder]
       - [get_dtn_expansion_optimization_results_folder]

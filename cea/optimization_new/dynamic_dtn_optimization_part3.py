@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import time
@@ -731,10 +732,33 @@ def main(config):
         else:
             testing_clusters = list(config.dtn_expansion_optimization.testing_clusters)
 
+    # Optionally reset analysis folder (clear cross-run records)
+    try:
+        reset_analysis_flag = bool(getattr(config.dynamic_dtn_optimization, 'reset_analysis', False))
+    except Exception:
+        reset_analysis_flag = False
+    analysis_root = Path(locator.get_dynamic_dtn_optimization_folder()) / 'analysis'
+    if reset_analysis_flag:
+        try:
+            shutil.rmtree(analysis_root, ignore_errors=True)
+            logger.info(f"Reset-analysis: cleared {analysis_root}")
+        except Exception as e:
+            logger.warning(f"Reset-analysis: failed to clear {analysis_root}: {e}")
+
     analysis_dir = _ensure_analysis_folder(locator)
 
     # Load settings (objective function, etc.)
     settings = _load_run_settings(locator)
+
+    # Run selection flags
+    try:
+        include_in_part3 = bool(settings.get('include_in_part3', settings.get('include-in-part3', True)))
+    except Exception:
+        include_in_part3 = True
+    try:
+        run_label = settings.get('run_label', settings.get('run-label', ''))
+    except Exception:
+        run_label = ''
 
     # Load total demand (baseline vs modified temp scenario)
     baseline_total_path = Path(locator.get_total_demand())
@@ -882,6 +906,7 @@ def main(config):
             for _, r in phase_stats.iterrows():
                 rows.append({
                     'run_id': run_id,
+                    'run_label': run_label,
                     'network_type': network_type,
                     'objective_function': settings.get('objective_function', 'NPV'),
                     'capex_per_phase_relaxing_pct': capex_relax_pct,
@@ -897,19 +922,22 @@ def main(config):
                 })
             mv_df = pd.DataFrame(rows)
             mv_csv = analysis_dir / 'genome_phase_movements.csv'
-            if mv_csv.exists():
-                # aligned append
-                try:
-                    old = pd.read_csv(mv_csv)
-                except Exception:
-                    old = pd.DataFrame()
-                all_cols = sorted(set(old.columns.tolist()) | set(mv_df.columns.tolist()))
-                old = old.reindex(columns=all_cols)
-                mv_df = mv_df.reindex(columns=all_cols)
-                pd.concat([old, mv_df], ignore_index=True).to_csv(mv_csv, index=False)
+            if include_in_part3:
+                if mv_csv.exists():
+                    # aligned append
+                    try:
+                        old = pd.read_csv(mv_csv)
+                    except Exception:
+                        old = pd.DataFrame()
+                    all_cols = sorted(set(old.columns.tolist()) | set(mv_df.columns.tolist()))
+                    old = old.reindex(columns=all_cols)
+                    mv_df = mv_df.reindex(columns=all_cols)
+                    pd.concat([old, mv_df], ignore_index=True).to_csv(mv_csv, index=False)
+                else:
+                    mv_df.to_csv(mv_csv, index=False)
+                logger.info(f"Saved per-phase movement stats to {mv_csv}")
             else:
-                mv_df.to_csv(mv_csv, index=False)
-            logger.info(f"Saved per-phase movement stats to {mv_csv}")
+                logger.info("include_in_part3 is False; skipping cross-run movement stats append.")
     except Exception as e:
         logger.warning(f"Failed to persist per-phase movement stats: {e}")
 
@@ -920,6 +948,8 @@ def main(config):
         'num_phases': settings.get('num_phases'),
         'phase_durations': settings.get('phase_durations'),
         'testing_clusters': ','.join(str(c) for c in testing_clusters) if testing_clusters else '',
+        'run_label': run_label,
+        'include_in_part3': bool(include_in_part3),
         'baseline_genome': json.dumps(baseline_genome),
         'rerun_genome': json.dumps(rerun_genome),
         # New constraint parameters
@@ -978,27 +1008,30 @@ def main(config):
 
     # Save outputs (robust aligned writer to avoid schema drift)
     master_summary_csv = analysis_dir / 'master_summary.csv'
-    try:
-        new_df = pd.DataFrame([master_row])
-        if master_summary_csv.exists():
-            try:
-                old_df = pd.read_csv(master_summary_csv)
-            except Exception:
-                old_df = pd.DataFrame()
-            all_cols = sorted(set(old_df.columns.tolist()) | set(new_df.columns.tolist()))
-            old_df = old_df.reindex(columns=all_cols)
-            new_df = new_df.reindex(columns=all_cols)
-            combined = pd.concat([old_df, new_df], ignore_index=True)
-            combined.to_csv(master_summary_csv, index=False)
-        else:
-            new_df.to_csv(master_summary_csv, index=False)
-        logger.info(f"Saved master summary to {master_summary_csv}")
-    except Exception as e:
-        logger.warning(f"Failed aligned write of master_summary.csv: {e}. Falling back to append mode.")
-        if master_summary_csv.exists():
-            pd.DataFrame([master_row]).to_csv(master_summary_csv, mode='a', header=False, index=False)
-        else:
-            pd.DataFrame([master_row]).to_csv(master_summary_csv, index=False)
+    if include_in_part3:
+        try:
+            new_df = pd.DataFrame([master_row])
+            if master_summary_csv.exists():
+                try:
+                    old_df = pd.read_csv(master_summary_csv)
+                except Exception:
+                    old_df = pd.DataFrame()
+                all_cols = sorted(set(old_df.columns.tolist()) | set(new_df.columns.tolist()))
+                old_df = old_df.reindex(columns=all_cols)
+                new_df = new_df.reindex(columns=all_cols)
+                combined = pd.concat([old_df, new_df], ignore_index=True)
+                combined.to_csv(master_summary_csv, index=False)
+            else:
+                new_df.to_csv(master_summary_csv, index=False)
+            logger.info(f"Saved master summary to {master_summary_csv}")
+        except Exception as e:
+            logger.warning(f"Failed aligned write of master_summary.csv: {e}. Falling back to append mode.")
+            if master_summary_csv.exists():
+                pd.DataFrame([master_row]).to_csv(master_summary_csv, mode='a', header=False, index=False)
+            else:
+                pd.DataFrame([master_row]).to_csv(master_summary_csv, index=False)
+    else:
+        logger.info("include_in_part3 is False; skipping append to master_summary.csv.")
 
     # Save cluster-level deltas (scale *_pct as percent for user-facing CSV)
     cluster_deltas_csv = analysis_dir / 'cluster_level_deltas.csv'

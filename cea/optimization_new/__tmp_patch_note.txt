@@ -1,0 +1,1 @@
+This file documents the patch applied on 2025-09-03: Part 3 no longer reruns GA for relax plots; added plot-only helper.

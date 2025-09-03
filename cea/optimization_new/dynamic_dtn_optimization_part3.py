@@ -16,6 +16,7 @@ from matplotlib.ticker import MaxNLocator
 
 import cea.config
 import cea.inputlocator
+from cea.optimization_new import dynamic_dtn_optimization_part2 as part2
 
 __author__ = "Fan Ut Chang"
 __copyright__ = "Copyright 2025, City Energy Analyst"
@@ -1082,6 +1083,21 @@ def main(config):
     except Exception as e:
         logger.warning(f"Cross-run insight plots skipped: {e}")
 
+    # Relax plots: plot-only from existing sweep CSV; no GA reruns or Part 2 calls
+    try:
+        num_phases = int(getattr(config.dtn_expansion_optimization, 'num_phases', 3) or 3)
+        locked_phase_indices_raw = getattr(config.dtn_expansion_optimization, 'locked_phase_indices', '1')
+        if isinstance(locked_phase_indices_raw, str):
+            lock_indices_cfg = [int(x.strip()) for x in locked_phase_indices_raw.split(',') if x.strip()]
+        elif isinstance(locked_phase_indices_raw, list):
+            lock_indices_cfg = [int(x) for x in locked_phase_indices_raw]
+        else:
+            lock_indices_cfg = [1]
+        lock_on_default = bool(getattr(config.dtn_expansion_optimization, 'lock_committed_early_phases', True))
+        plot_relax_curves_from_existing(locator, num_phases, lock_indices_cfg, lock_on_default)
+    except Exception as e:
+        logger.warning(f"Relax plots skipped: {e}")
+
     logger.info("Sensitivity analysis (core) completed.")
     return None
 
@@ -1407,8 +1423,355 @@ def _generate_cross_run_insight_plots(analysis_dir: Path) -> None:
         return
 
 
-if __name__ == '__main__':
-    args = parse_args()
-    config = cea.config.Configuration(args.config)
-    config.scenario = args.scenario
-    main(config)
+
+# Plot-only helper: render relax curves from existing CSV without running Part 2
+
+def plot_relax_curves_from_existing(locator: cea.inputlocator.InputLocator,
+                                    num_phases: int,
+                                    lock_indices_cfg: list[int],
+                                    lock_on_default: bool) -> None:
+    """Plot the relax curves from an existing CSV at <dtn_results>/plots/cluster_count_vs_relax_data.csv.
+    Creates/overwrites:
+      - cluster_count_vs_relax_no_lock.png
+      - cluster_count_vs_relax_with_early_lock.png
+    If the CSV is missing, log a warning and return without error.
+    """
+    try:
+        try:
+            plt.switch_backend('Agg')
+        except Exception:
+            pass
+        res_dir = Path(locator.get_dtn_expansion_optimization_results_folder())
+        out_dir = res_dir / 'plots'
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        src_csv = out_dir / 'cluster_count_vs_relax_data.csv'
+        if not src_csv.exists():
+            log().warning(f"plot-only: sweep data not found: {src_csv}. Skipping relax plots.")
+            return
+        df = pd.read_csv(src_csv)
+        if df.empty or 'relax_percent' not in df.columns or 'mode' not in df.columns:
+            log().warning("plot-only: relax CSV has unexpected schema; skipping relax plots.")
+            return
+        # Generate plots for both modes
+        for lock_on in (False, True):
+            mode = 'with_early_lock' if lock_on else 'no_lock'
+            sub = df[df['mode'] == mode].copy()
+            if sub.empty:
+                log().warning(f"plot-only: no rows for mode={mode} in relax CSV; skipping this plot.")
+                continue
+            x = sub['relax_percent'].values.tolist()
+            p_counts = []
+            for i in range(num_phases):
+                col = f'phase{i+1}_count'
+                if col in sub.columns:
+                    p_counts.append(sub[col].values.tolist())
+                else:
+                    p_counts.append([0] * len(sub))
+            try:
+                plt.figure(figsize=(9, 4.8), dpi=160)
+            except Exception:
+                pass
+            colors = ['#d62728', '#1f77b4', '#ffbf00', '#2ca02c', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+            for i in range(num_phases):
+                plt.plot(x, p_counts[i], '-o', label=f'phase {i+1}', color=colors[i % len(colors)])
+            plt.xlabel('% relaxation of per‑phase budgets')
+            plt.ylabel('clusters connected in phase')
+            title = _compose_title(lock_indices_cfg, num_phases, locked_on=(lock_on and lock_on_default))
+            plt.title(title)
+            plt.grid(True, alpha=0.25)
+            ymax = max([0] + [max(lst) if len(lst) else 0 for lst in p_counts])
+            plt.ylim(0, max(3, ymax))
+            plt.legend(title='Phase')
+            out_png = out_dir / ("cluster_count_vs_relax_with_early_lock.png" if lock_on else "cluster_count_vs_relax_no_lock.png")
+            plt.savefig(out_png, bbox_inches='tight')
+            plt.close()
+            try:
+                log().info(f"plot-only: wrote {out_png}")
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            log().warning(f"plot-only: unexpected error while plotting relax curves: {e}")
+        except Exception:
+            pass
+
+# --------------------------- RELAX SWEEP (no fallback) ----------------------------
+
+def _read_relax_values_from_master_summary(locator: cea.inputlocator.InputLocator) -> list[float]:
+    """Read relaxation values (percent) strictly from Part 3 master_summary.csv under analysis/.
+    Accept both fraction (0.12) and percent (12). Raise RuntimeError if none found.
+    """
+    analysis_dir = Path(locator.get_dynamic_dtn_optimization_folder()) / 'analysis'
+    ms_path = analysis_dir / 'master_summary.csv'
+    if not ms_path.exists():
+        raise RuntimeError(f"Master summary not found at {ms_path}. Run Part 3 once to create it or provide it.")
+    df = pd.read_csv(ms_path)
+    cols = [c for c in df.columns]
+    candidates = [
+        'relax_percent', 'relaxation_percent', 'relaxation_pct', 'relax_value', 'relax',
+        'capex_per_phase_relaxing_pct', 'total_exp_per_phase_relaxing_pct'
+    ]
+    vals = []
+    for c in candidates:
+        if c in df.columns:
+            s = pd.to_numeric(df[c], errors='coerce').dropna()
+            for v in s.tolist():
+                v = float(v)
+                vals.append(v * 100.0 if v <= 1.0 else v)
+    vals = sorted(set(round(v, 6) for v in vals))
+    if not vals:
+        raise RuntimeError("No relaxation values found in master_summary.csv (expected a relaxation column like 'capex_per_phase_relaxing_pct').")
+    return vals
+
+
+def _infer_relax_grid_from_values(relax_percent_values: list[float]) -> list[float]:
+    """Infer an arithmetic sweep grid from discovered percent values. Do not invent defaults."""
+    uniq = sorted(set(round(float(v), 6) for v in relax_percent_values))
+    if len(uniq) <= 2:
+        return uniq
+    diffs = [round(uniq[i+1] - uniq[i], 6) for i in range(len(uniq) - 1)]
+    from collections import Counter
+    step, _ = Counter(diffs).most_common(1)[0]
+    tol = max(0.01, 0.02 * abs(step))
+    aligned = sum(1 for d in diffs if abs(d - step) <= tol)
+    if aligned >= int(0.7 * len(diffs)):
+        seq = [uniq[0]]
+        cur = uniq[0]
+        while cur + step <= uniq[-1] + tol:
+            cur = round(cur + step, 6)
+            seq.append(cur)
+        seq = [x for x in seq if uniq[0] - tol <= x <= uniq[-1] + tol]
+        return sorted(set(round(x, 6) for x in seq))
+    return uniq
+
+
+def _get_best_genome_and_npv(locator: cea.inputlocator.InputLocator, network_type: str):
+    res_dir = Path(locator.get_dtn_expansion_optimization_results_folder())
+    all_eval = res_dir / f"all_evaluated_individuals_{network_type}.csv"
+    if all_eval.exists():
+        df = pd.read_csv(all_eval)
+        if 'fitness_NPV' in df.columns and 'genome' in df.columns and not df.empty:
+            best = df.loc[df['fitness_NPV'].idxmax()]
+            g = best['genome']
+            if isinstance(g, list):
+                genome = [int(x) for x in g]
+            else:
+                genome = [int(x.strip()) for x in str(g).strip('[]').split(',') if str(x).strip() != '']
+            return genome, float(best['fitness_NPV'])
+    # fallback to results table for NPV if needed
+    res_csv = res_dir / 'optimization_results' / f"dtn_expansion_opt_results_{network_type}.csv"
+    if res_csv.exists():
+        dfr = pd.read_csv(res_csv)
+        if 'overall_npv [USD]' in dfr.columns:
+            total_row = dfr.loc[dfr['phase'].astype(str).str.lower().eq('total')]
+            if not total_row.empty:
+                return None, float(total_row['overall_npv [USD]'].iloc[0])
+    return None, float('nan')
+
+
+def _genome_to_phase_counts(genome: list[int], num_phases: int) -> list[int]:
+    counts = [0] * num_phases
+    for g in (genome or []):
+        p = int(g)
+        if 1 <= p <= num_phases:
+            counts[p - 1] += 1
+    return counts
+
+
+def _format_connection_order(genome: list[int], all_clusters: list[int]) -> str:
+    if not genome or not all_clusters:
+        return "(unknown)"
+    by_phase: dict[int, list[int]] = {}
+    for c, p in zip(all_clusters, genome):
+        by_phase.setdefault(int(p), []).append(int(c))
+    parts = ["0"]
+    for p in sorted(by_phase.keys()):
+        parts.append('+'.join(str(x) for x in sorted(by_phase[p])))
+    return ' -> '.join(parts)
+
+
+def _compose_title(lock_indices: list[int], num_phases: int, locked_on: bool) -> str:
+    if not locked_on or not lock_indices:
+        return "Clusters connected per phase vs budget relaxation (no early‑phase lock)"
+    locks = sorted(set(int(p) for p in lock_indices if 1 <= int(p) <= num_phases))
+    if not locks:
+        return "Clusters connected per phase vs budget relaxation (no early‑phase lock)"
+    # contiguous 1..k form
+    k = 1
+    while k in locks:
+        k += 1
+    k -= 1
+    if all(p in locks for p in range(1, k + 1)) and len(locks) == k:
+        return f"Clusters connected per phase vs budget relaxation (early‑phase lock: phases 1..{k})"
+    return "Clusters connected per phase vs budget relaxation (early‑phase lock: phases " + ", ".join(str(p) for p in locks) + ")"
+
+
+def _detect_change_points(relax_vals_pct: list[float], per_phase_counts: np.ndarray) -> list[int]:
+    cps: list[int] = []
+    prev = None
+    for i in range(len(relax_vals_pct)):
+        cur = tuple(int(x) for x in per_phase_counts[:, i])
+        if prev is None:
+            prev = cur
+            continue
+        if cur != prev:
+            cps.append(i)
+            prev = cur
+    return cps
+
+
+def sweep_relax_and_plot_in_part3(config: cea.config.Configuration, master_summary_path: Optional[str] = None) -> None:
+    """Run Part 2 across a relaxation grid derived only from master summary; create cluster-count plots.
+    No fallback relaxation grid is used.
+    """
+    locator = cea.inputlocator.InputLocator(scenario=config.scenario)
+    network_type = getattr(config.dynamic_dtn_optimization, 'network_type', 'DH')
+    num_phases = int(getattr(config.dtn_expansion_optimization, 'num_phases', 3) or 3)
+
+    # Locking inputs from config/run_settings
+    try:
+        locked_phase_indices_raw = getattr(config.dtn_expansion_optimization, 'locked_phase_indices', '1')
+    except Exception:
+        locked_phase_indices_raw = '1'
+    if isinstance(locked_phase_indices_raw, str):
+        lock_indices_cfg = [int(x.strip()) for x in locked_phase_indices_raw.split(',') if x.strip()]
+    elif isinstance(locked_phase_indices_raw, list):
+        lock_indices_cfg = [int(x) for x in locked_phase_indices_raw]
+    else:
+        lock_indices_cfg = [1]
+    lock_on_default = bool(getattr(config.dtn_expansion_optimization, 'lock_committed_early_phases', True))
+
+    # Read relax% only from master summary
+    if master_summary_path:
+        ms_path = Path(master_summary_path)
+        if not ms_path.exists():
+            raise RuntimeError(f"Master summary not found: {ms_path}")
+        df_ms = pd.read_csv(ms_path)
+        # prefer CAPEX relax column
+        if 'capex_per_phase_relaxing_pct' in df_ms.columns:
+            raw_vals = pd.to_numeric(df_ms['capex_per_phase_relaxing_pct'], errors='coerce').dropna().tolist()
+        elif 'total_exp_per_phase_relaxing_pct' in df_ms.columns:
+            raw_vals = pd.to_numeric(df_ms['total_exp_per_phase_relaxing_pct'], errors='coerce').dropna().tolist()
+        else:
+            raise RuntimeError("No relaxation column found in provided master summary.")
+        relax_pct_values = [float(v) * 100.0 if float(v) <= 1.0 else float(v) for v in raw_vals]
+        relax_pct_values = sorted(set(round(v, 6) for v in relax_pct_values))
+        if not relax_pct_values:
+            raise RuntimeError("No relaxation values in provided master summary.")
+    else:
+        relax_pct_values = _read_relax_values_from_master_summary(locator)
+
+    relax_grid_pct = _infer_relax_grid_from_values(relax_pct_values)
+    if not relax_grid_pct:
+        raise RuntimeError("No relaxation grid could be inferred from master summary.")
+
+    # Output paths
+    res_dir = Path(locator.get_dtn_expansion_optimization_results_folder())
+    out_dir = res_dir / 'plots'
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Cluster labels for order formatting
+    try:
+        cn = pd.read_csv(locator.get_dtn_cluster_nodes_file())
+        base_clusters = sorted([int(c) for c in cn['cluster'].unique() if int(c) > 0])
+    except Exception:
+        base_clusters = []
+
+    rows = []
+
+    for lock_on in (False, True):
+        mode_label = 'with_early_lock' if lock_on else 'no_lock'
+        p_counts = [[] for _ in range(num_phases)]
+        npvs, orders = [], []
+
+        for rpct in relax_grid_pct:
+            rfrac = float(rpct) / 100.0
+            # Build a fresh config for Part 2
+            cfg = cea.config.Configuration()
+            cfg.scenario = config.scenario
+            # pass network type
+            cfg.dynamic_dtn_optimization.network_type = network_type
+            # relaxation (fractions; Part 2 also normalizes)
+            cfg.dtn_expansion_optimization.capex_per_phase_relaxing_pct = rfrac
+            cfg.dtn_expansion_optimization.total_exp_per_phase_relaxing_pct = rfrac
+            # phases
+            cfg.dtn_expansion_optimization.num_phases = num_phases
+            try:
+                pdurs = getattr(config.dtn_expansion_optimization, 'phase_durations', None)
+                cfg.dtn_expansion_optimization.phase_durations = pdurs if pdurs else ','.join(['2'] * num_phases)
+            except Exception:
+                cfg.dtn_expansion_optimization.phase_durations = ','.join(['2'] * num_phases)
+            # lock
+            cfg.dtn_expansion_optimization.lock_committed_early_phases = bool(lock_on and lock_on_default)
+            cfg.dtn_expansion_optimization.locked_phase_indices = ','.join(str(i) for i in lock_indices_cfg) if (lock_on and lock_indices_cfg) else ''
+            # GA randomness fresh each run
+            cfg.dtn_expansion_optimization.ga_random_seed = 0
+
+            # Run Part 2
+            part2.main(cfg)
+
+            # Parse results
+            genome, best_npv = _get_best_genome_and_npv(locator, network_type)
+            if genome is None:
+                counts = [0] * num_phases
+                order_str = '(unknown)'
+            else:
+                counts = _genome_to_phase_counts(genome, num_phases)
+                order_str = _format_connection_order(genome, base_clusters)
+
+            rows.append({
+                'mode': mode_label,
+                'relax_percent': float(rpct),
+                **{f'phase{i+1}_count': counts[i] for i in range(num_phases)},
+                'best_npv': best_npv,
+                'connection_order': order_str
+            })
+
+            for i in range(num_phases):
+                p_counts[i].append(counts[i])
+            npvs.append(best_npv)
+            orders.append(order_str)
+
+        # Plot
+        x = list(relax_grid_pct)
+        try:
+            plt.figure(figsize=(9, 4.8), dpi=160)
+        except Exception:
+            pass
+        for i in range(num_phases):
+            color = ['#d62728', '#1f77b4', '#ffbf00', '#2ca02c', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'][i % 10]
+            plt.plot(x, p_counts[i], '-o', label=f'phase {i+1}', color=color)
+        plt.xlabel('% relaxation of per‑phase budgets')
+        plt.ylabel('clusters connected in phase')
+        title = _compose_title(lock_indices_cfg, num_phases, locked_on=lock_on and lock_on_default)
+        plt.title(title)
+        plt.grid(True, alpha=0.25)
+        ymax = max([0] + [max(lst) if lst else 0 for lst in p_counts])
+        plt.ylim(0, max(3, ymax))
+        plt.legend(title='Phase')
+        out_png = out_dir / ("cluster_count_vs_relax_with_early_lock.png" if lock_on else "cluster_count_vs_relax_no_lock.png")
+        plt.savefig(out_png, bbox_inches='tight')
+        plt.close()
+
+        # Switch points summary
+        counts_arr = np.array(p_counts)
+        cps = _detect_change_points(x, counts_arr)
+        lines = [title]
+        for i in cps:
+            try:
+                lines.append(f"  • Switch to {orders[i]} (NPV={npvs[i]:,.0f} USD) starting at {x[i]:.0f}% relax")
+            except Exception:
+                lines.append(f"  • Switch at {x[i]:.0f}% relax")
+        (out_dir / ("switch_points_with_early_lock.txt" if lock_on else "switch_points_no_lock.txt")).write_text('\n'.join(lines), encoding='utf-8')
+
+    # Save combined CSV
+    df_out = pd.DataFrame(rows).sort_values(['mode', 'relax_percent'])
+    df_out.to_csv(out_dir / 'cluster_count_vs_relax_data.csv', index=False)
+
+    try:
+        log().info(f"Relax sweep complete. Plots and data -> {out_dir}")
+    except Exception:
+        pass

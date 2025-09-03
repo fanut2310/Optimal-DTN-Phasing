@@ -361,6 +361,21 @@ class DTNExpansionOptimizer:
         # ---------------- New Q2/Q3 parameters ----------------
         self.capex_per_phase_softening_pct = float(capex_per_phase_softening_pct if capex_per_phase_softening_pct is not None else 0.20)
         self.total_exp_per_phase_softening_pct = float(total_exp_per_phase_softening_pct if total_exp_per_phase_softening_pct is not None else 0.20)
+        # Normalize percent-style inputs: accept 5 and 0.05 as 5%
+        try:
+            _orig_capex_pct = self.capex_per_phase_softening_pct
+            if self.capex_per_phase_softening_pct > 1.0:
+                self.capex_per_phase_softening_pct /= 100.0
+                log().info(f"Normalized capex_per_phase_softening_pct from {_orig_capex_pct} to {self.capex_per_phase_softening_pct} (fraction).")
+        except Exception:
+            pass
+        try:
+            _orig_te_pct = self.total_exp_per_phase_softening_pct
+            if self.total_exp_per_phase_softening_pct > 1.0:
+                self.total_exp_per_phase_softening_pct /= 100.0
+                log().info(f"Normalized total_exp_per_phase_softening_pct from {_orig_te_pct} to {self.total_exp_per_phase_softening_pct} (fraction).")
+        except Exception:
+            pass
         self.enforce_final_cumulative_capex = bool(enforce_final_cumulative_capex)
         self.enforce_final_cumulative_total_exp = bool(enforce_final_cumulative_total_exp)
         # Derive final cumulative totals if not provided (0 or None => auto-sum of original budgets)
@@ -392,6 +407,15 @@ class DTNExpansionOptimizer:
             self.total_exp_soft_per_phase = [ (1.0 + self.total_exp_per_phase_softening_pct) * b if (b is not None and np.isfinite(b)) else b for b in (self.total_expenditure_budget_per_phase or []) ]
         except Exception:
             self.total_exp_soft_per_phase = self.total_expenditure_budget_per_phase
+        # Early feasibility gate behavior: use relaxed budgets by default
+        self.use_relaxed_budgets_in_early_gate = True
+        try:
+            log().info(
+                f"Relaxed per-phase budgets prepared (CAPEX +{self.capex_per_phase_softening_pct*100:.1f}%, "
+                f"Total-Exp +{self.total_exp_per_phase_softening_pct*100:.1f}%). "
+                f"Early feasibility gate uses relaxed budgets: {self.use_relaxed_budgets_in_early_gate}.")
+        except Exception:
+            pass
         # Locking parameters (build map later after clusters are loaded)
         self.lock_committed_early_phases = bool(lock_committed_early_phases)
         self.lock_reference_genome = str(lock_reference_genome) if lock_reference_genome is not None else 'baseline-dtn-opt'
@@ -2737,16 +2761,37 @@ class DTNExpansionOptimizer:
                 clusters = _clusters_by_phase_early.get(ph, [])
                 if clusters:
                     capex_val, _ = self._calculate_phase_capex(clusters, ph)
-                    if self.capex_budget_per_phase and ph-1 < len(self.capex_budget_per_phase) and capex_val > self.capex_budget_per_phase[ph-1]:
+
+                    # Choose which limits to use at the early gate (prefer relaxed if available)
+                    use_relaxed = bool(getattr(self, 'use_relaxed_budgets_in_early_gate', True))
+                    cap_limits_rel = getattr(self, 'capex_soft_per_phase', []) or []
+                    te_limits_rel = getattr(self, 'total_exp_soft_per_phase', []) or []
+                    cap_limits_orig = getattr(self, 'capex_budget_per_phase', []) or []
+                    te_limits_orig = getattr(self, 'total_expenditure_budget_per_phase', []) or []
+
+                    def _pick_limit(l_rel, l_orig, idx):
+                        lim = None
+                        if use_relaxed and idx < len(l_rel):
+                            lim = l_rel[idx]
+                        if lim in (None, "") and idx < len(l_orig):
+                            lim = l_orig[idx]
+                        return lim
+
+                    cap_limit = _pick_limit(cap_limits_rel, cap_limits_orig, ph - 1)
+                    if cap_limit not in (None, "") and np.isfinite(float(cap_limit)) and capex_val > float(cap_limit):
                         violated = True
                         violated_phase = ph
-                        violated_msg = f"CAPEX {capex_val} > {self.capex_budget_per_phase[ph-1]}"
+                        src = "relaxed" if (use_relaxed and (ph-1) < len(cap_limits_rel) and cap_limits_rel[ph-1] not in (None, "")) else "original"
+                        violated_msg = f"CAPEX {capex_val} > {cap_limit} ({src} per-phase limit)"
                         break
+
                     total_exp_val = self._calculate_phase_total_expenditure(clusters, ph)
-                    if self.total_expenditure_budget_per_phase and ph-1 < len(self.total_expenditure_budget_per_phase) and total_exp_val > self.total_expenditure_budget_per_phase[ph-1]:
+                    te_limit = _pick_limit(te_limits_rel, te_limits_orig, ph - 1)
+                    if te_limit not in (None, "") and np.isfinite(float(te_limit)) and total_exp_val > float(te_limit):
                         violated = True
                         violated_phase = ph
-                        violated_msg = f"TotalExp {total_exp_val} > {self.total_expenditure_budget_per_phase[ph-1]}"
+                        src = "relaxed" if (use_relaxed and (ph-1) < len(te_limits_rel) and te_limits_rel[ph-1] not in (None, "")) else "original"
+                        violated_msg = f"TotalExp {total_exp_val} > {te_limit} ({src} per-phase limit)"
                         break
             if violated:
                 ind_tuple = tuple(individual)

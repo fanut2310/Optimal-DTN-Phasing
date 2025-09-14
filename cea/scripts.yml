@@ -323,7 +323,7 @@ Energy Supply System Optimisation:
                   'building-clustering:noise-reassign-distance',
                   'building-clustering:ensure-min-use-types',
                   'building-clustering:min-use-types-per-cluster',
-                  'building-clustering:pin-existing-to-cluster0' ]
+                  'building-clustering:export-settings-manifest' ]
     input-files:
       - [ get_zone_geometry ]
       - [ get_total_demand ]
@@ -334,7 +334,7 @@ Energy Supply System Optimisation:
     description: |
       Analyzes optimal expansion sequence for district thermal networks by clustering buildings and determining phased connections.
       This module now computes operational emissions exclusively via LCA Operation per phase using phase-specific supply files and a per-phase Total_Demand snapshot.
-      - Demand is re-run when needed to reflect each phase's supply configuration. Results are cached by a stable phase signature to avoid repeats.
+      - Demand is not re-run; per-phase Total_Demand is synthesized (fast mode).
       - New artifacts are saved under outputs/data/optimization/dtn_expansion:
         - phase_supply_files/phase{N}_supply.csv
         - phase_demand/phase{N}__{signature}.csv
@@ -363,9 +363,7 @@ Energy Supply System Optimisation:
                   'dtn-expansion-optimization:ga-tournament-size',
                   'dtn-expansion-optimization:ga-mutation-indpb',
                   'dtn-expansion-optimization:ga-random-seed',
-                  'dtn-expansion-optimization:emissions-evaluation-mode',
-                  'dtn-expansion-optimization:hybrid-validate-top-k',
-                  'dtn-expansion-optimization:hybrid-final-validate' ]
+                  ]
     input-files:
       - [get_street_network]
       - [get_total_demand]
@@ -442,7 +440,7 @@ Energy Supply System Optimisation:
     description: |
       Reruns DTN Expansion Optimization using the temporary scenario created by Part 1.
       This module computes operational emissions exclusively via LCA Operation per phase using the temp scenario’s phase-specific supply files and per-phase Total_Demand snapshots.
-      - For each phase, Demand is re-run in the temp scenario when needed to reflect the phase’s supply configuration; results are cached by a stable phase signature.
+      - Demand is not re-run; per-phase Total_Demand is synthesized (fast mode).
       - Artifacts under temp scenario outputs/data/optimization/dynamic_dtn_optimization:
         - phase_supply_files/phase{N}_supply.csv
         - phase_demand/phase{N}__{signature}.csv
@@ -490,9 +488,6 @@ Energy Supply System Optimisation:
                   'dtn-expansion-optimization:ga-tournament-size',
                   'dtn-expansion-optimization:ga-mutation-indpb',
                   'dtn-expansion-optimization:ga-random-seed',
-                  'dtn-expansion-optimization:emissions-evaluation-mode',
-                  'dtn-expansion-optimization:hybrid-validate-top-k',
-                  'dtn-expansion-optimization:hybrid-final-validate',
                   'dynamic-dtn-optimization:include-in-part3',
                   'dynamic-dtn-optimization:run-label'
                   ]

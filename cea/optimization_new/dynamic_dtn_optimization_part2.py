@@ -5682,24 +5682,15 @@ def main(config):
     except Exception:
         pass
 
-    # Apply emissions evaluation mode & hybrid flags from config (fallbacks provided)
-    try:
-        em_mode = str(getattr(config.dtn_expansion_optimization, 'emissions_evaluation_mode', 'fast')).lower()
-    except Exception:
-        em_mode = 'fast'
-    try:
-        hybrid_topk = int(getattr(config.dtn_expansion_optimization, 'hybrid_validate_top_k', 5))
-    except Exception:
-        hybrid_topk = 5
-    try:
-        hybrid_final = bool(getattr(config.dtn_expansion_optimization, 'hybrid_final_validate', True))
-    except Exception:
-        hybrid_final = True
+    # Emissions evaluation mode is fixed to 'fast'; hybrid flags disabled
+    em_mode = 'fast'
+    hybrid_topk = 0
+    hybrid_final = False
     try:
         optimizer.emissions_mode = em_mode
         optimizer.hybrid_validate_top_k = hybrid_topk
         optimizer.hybrid_final_validate = hybrid_final
-        log().info(f"[EmissionsMode] Using mode={optimizer.emissions_mode}, hybrid_top_k={optimizer.hybrid_validate_top_k}, hybrid_final_validate={optimizer.hybrid_final_validate}")
+        log().info(f"[EmissionsMode] Using mode={optimizer.emissions_mode} (fast-only); hybrid validation disabled.")
     except Exception:
         pass
 

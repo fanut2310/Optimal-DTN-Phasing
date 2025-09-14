@@ -486,18 +486,22 @@ def _generate_figures(analysis_dir: Path,
                 log().info(f"Saved figure: {out_path}")
                 plt.close()
 
-                # 3b) With locks overlay
+                # 3b) With committed overlay (rename lock->committed in user-facing text)
                 try:
                     if lock_committed_early_phases and locked_phase_indices:
                         locked_set = set(int(x) for x in locked_phase_indices)
                         plt.figure(figsize=(max(8, n*0.3), 4))
                         plt.plot(cl, base, marker='o', label='Baseline phase')
                         plt.plot(cl, new, marker='s', label='Rerun phase')
-                        # Highlight locked clusters (based on baseline phase in locked phases)
-                        locked_x = [cl[k] for k in range(n) if base[k] in locked_set]
-                        locked_y = [base[k] for k in range(n) if base[k] in locked_set]
-                        if locked_x:
-                            plt.scatter(locked_x, locked_y, s=80, facecolors='none', edgecolors='red', linewidths=1.5, label='Locked (by phase)')
+                        # Highlight committed clusters (based on baseline phase in committed phases)
+                        is_comm = [bk in locked_set for bk in base]
+                        x_comm = [cl[k] for k in range(n) if is_comm[k]]
+                        y_comm = [new[k] for k in range(n) if is_comm[k]]
+                        if x_comm:
+                            # Halo
+                            plt.scatter(x_comm, y_comm, s=160, color='#FF7F0E', alpha=0.25, linewidths=0)
+                            # Star marker
+                            plt.scatter(x_comm, y_comm, s=60, marker='*', color='#D62728', edgecolors='k', linewidths=0.7, label='Committed clusters')
                         for k in range(n):
                             if base[k] != new[k]:
                                 plt.plot([cl[k], cl[k]], [base[k], new[k]], color='gray', linewidth=0.8)
@@ -513,10 +517,10 @@ def _generate_figures(analysis_dir: Path,
                         if max_phase_plot and max_phase_plot > 0:
                             ax.set_ylim(0.5, max_phase_plot + 0.5)
                             ax.set_yticks(range(1, max_phase_plot + 1))
-                        plt.title('Genome phase changes (locked phases highlighted)')
+                        plt.title('Genome phase changes (committed phases highlighted)')
                         plt.legend()
                         plt.tight_layout()
-                        out_path = figs_dir / 'genome_phase_changes_with_locks.png'
+                        out_path = figs_dir / 'genome_phase_changes_with_committed.png'
                         plt.savefig(out_path, dpi=200)
                         log().info(f"Saved figure: {out_path}")
                         plt.close()
@@ -570,18 +574,34 @@ def _generate_figures(analysis_dir: Path,
                     # Bar for moved_count and line for avg_abs_delta (twin axis)
                     plt.figure(figsize=(max(6, len(vol)*0.6), 4))
                     x = np.arange(len(vol))
-                    b = plt.bar(x, vol['moved_count'].values, width=0.5, color='#4c78a8', label='Moved count')
+                    # Left axis: bars (counts)
                     ax1 = plt.gca()
-                    ax1.yaxis.set_major_locator(MaxNLocator(integer=True))
-                    ax2 = ax1.twinx()
-                    ax2.plot(x, vol['avg_abs_delta'].values, color='#f58518', marker='o', label='Avg |Δphase|')
+                    bars = ax1.bar(x, vol['moved_count'].values, width=0.5, color='#4C78A8', alpha=0.85, label='Moved count (left)')
                     ax1.set_xlabel('Baseline phase')
-                    ax1.set_ylabel('Moved count')
-                    ax2.set_ylabel('Avg |Δphase|')
-                    plt.xticks(x, vol['baseline_phase'].astype(int).astype(str))
-                    plt.title('Phase volatility by baseline phase')
+                    ax1.set_ylabel('Clusters moved (count)')
+                    ax1.yaxis.set_major_locator(MaxNLocator(integer=True))
+                    # X ticks as integer phase labels
+                    ax1.set_xticks(x)
+                    ax1.set_xticklabels(vol['baseline_phase'].astype(int).astype(str))
+                    # Right axis: line (avg |Δ|)
+                    ax2 = ax1.twinx()
+                    line, = ax2.plot(x, vol['avg_abs_delta'].values, color='#F58518', marker='o', linewidth=1.8, label='Avg |Δphase| (right)')
+                    # Set sensible right-axis limits between 0 and (num_phases-1) approx
+                    try:
+                        max_phase = int(vol['baseline_phase'].max())
+                        y2_top = max(1.0, min(float(np.nanmax(vol['avg_abs_delta'].values)) * 1.2, max_phase - 1 if max_phase > 1 else 1.0))
+                        ax2.set_ylim(0, y2_top)
+                    except Exception:
+                        pass
+                    ax2.set_ylabel('Average |Δphase| (right)')
+                    # Legend with explicit axis mapping
+                    handles = [bars, line]
+                    labels = ['Moved count (left)', 'Avg |Δphase| (right)']
+                    ax1.legend(handles, labels, loc='upper right')
+                    ax1.grid(True, axis='y', alpha=0.25)
+                    plt.title('Movement by baseline phase (moved count & avg |Δphase|)')
                     plt.tight_layout()
-                    out_path = figs_dir / 'phase_volatility_counts.png'
+                    out_path = figs_dir / 'phase_movement_by_baseline_phase.png'
                     plt.savefig(out_path, dpi=200)
                     try:
                         log().info(f"Saved figure: {out_path}")
@@ -590,7 +610,7 @@ def _generate_figures(analysis_dir: Path,
                     plt.close()
                 else:
                     try:
-                        log().info("[Part3] Skipping phase_volatility_counts: no movements detected (vol table empty).")
+                        log().info("[Part3] Skipping phase_movement_by_baseline_phase: no movements detected (vol table empty).")
                     except Exception:
                         pass
                 # Baseline phase to earlier/same/later stacks (shares)
@@ -1128,7 +1148,16 @@ def _generate_cross_run_insight_plots(analysis_dir: Path) -> None:
             return None
 
         def line_or_scatter(xs: np.ndarray, ys: np.ndarray, xlabel: str, ylabel: str, title: str, out: Path):
-            if len(xs) < 2:
+            # Require at least 2 distinct x values to render a meaningful line; else write placeholder
+            if len(xs) < 2 or len(np.unique(xs)) < 2:
+                try:
+                    plt.figure(figsize=(5.5, 2.8))
+                    plt.text(0.5, 0.5, 'Need ≥2 distinct relaxation values to plot', ha='center', va='center')
+                    plt.axis('off')
+                    plt.savefig(out, dpi=200, bbox_inches='tight')
+                    plt.close()
+                except Exception:
+                    pass
                 return
             order = np.argsort(xs)
             xs_sorted = np.array(xs)[order]
@@ -1225,43 +1254,37 @@ def _generate_cross_run_insight_plots(analysis_dir: Path) -> None:
         if hamming_norm is not None and lock_flag is not None:
             try:
                 d = pd.DataFrame({'lock': lock_flag.astype(int), 'h': pd.to_numeric(hamming_norm, errors='coerce')}).dropna()
-                if len(d) >= 2 and d['lock'].nunique() >= 1:
-                    stats = d.groupby('lock')['h'].agg(['mean', 'count']).reset_index()
-                    plt.figure(figsize=(5, 4))
-                    plt.bar(stats['lock'].astype(str), stats['mean'], width=0.5)
-                    for i, row in stats.iterrows():
-                        plt.text(i, row['mean'], f"n={int(row['count'])}", ha='center', va='bottom', fontsize=8)
-                    plt.xlabel('Lock committed early phases (0/1)')
-                    plt.ylabel('Hamming (normalized)')
-                    plt.title('Hamming by locking policy')
-                    plt.tight_layout()
-                    out_path = figs / 'hamming_by_lock_flag.png'
-                    plt.savefig(out_path, dpi=200)
-                    try:
-                        log().info(f"Saved figure: {out_path}")
-                    except Exception:
-                        pass
-                    plt.close()
+                if len(d) >= 2:
+                    if d['lock'].nunique() >= 2:
+                        stats = d.groupby('lock')['h'].agg(['mean', 'count']).reset_index()
+                        plt.figure(figsize=(5, 4))
+                        plt.bar(stats['lock'].astype(str), stats['mean'], width=0.5)
+                        for i, row in stats.iterrows():
+                            plt.text(i, row['mean'], f"n={int(row['count'])}", ha='center', va='bottom', fontsize=8)
+                        plt.xlabel('Commit early phases (0/1)')
+                        plt.ylabel('Hamming (normalized)')
+                        plt.title('Hamming by commitment policy')
+                        plt.tight_layout()
+                        out_path = figs / 'hamming_by_lock_flag.png'
+                        plt.savefig(out_path, dpi=200)
+                        try:
+                            log().info(f"Saved figure: {out_path}")
+                        except Exception:
+                            pass
+                        plt.close()
+                    else:
+                        # Placeholder: single lock state only
+                        plt.figure(figsize=(5, 2.8))
+                        mean_val = float(d['h'].mean()) if not d['h'].empty else float('nan')
+                        txt = f"Only one lock state present. Mean Hamming = {mean_val:.3f}"
+                        plt.text(0.5, 0.5, txt, ha='center', va='center')
+                        plt.axis('off')
+                        out_path = figs / 'hamming_by_lock_flag.png'
+                        plt.savefig(out_path, dpi=200, bbox_inches='tight')
+                        plt.close()
             except Exception:
                 pass
 
-        # Hamming vs end-use reductions and densification
-        for key, label in [
-            ('mean_reduction_heating_pct', 'Heating reduction (pct)'),
-            ('mean_reduction_cooling_pct', 'Cooling reduction (pct)'),
-            ('mean_reduction_dhw_pct', 'DHW reduction (pct)'),
-            ('mean_reduction_electricity_pct', 'Electricity reduction (pct)'),
-            ('densification_pct', 'Densification (pct)')
-        ]:
-            xcol = col(key)
-            if xcol is None or hamming_norm is None:
-                continue
-            d = pd.DataFrame({'x': xcol, 'y': hamming_norm}).dropna()
-            if len(d) >= 2:
-                scatter_with_fit(d['x'].values, d['y'].values,
-                                 label, 'Hamming (normalized)',
-                                 f'Hamming vs {label} (n={len(d)})',
-                                 figs / f"hamming_vs_{key}.png")
 
         # Earlier / Later shares vs relaxations
         earlier_share = col('earlier_share')
@@ -1295,31 +1318,6 @@ def _generate_cross_run_insight_plots(analysis_dir: Path) -> None:
                                 f'Later share vs Total-exp relaxation (n={len(d)})',
                                 figs / 'later_share_vs_totalexp_relaxation.png')
 
-        # Earlier / Later shares vs demand-change proxies
-        for key, label in [
-            ('mean_reduction_heating_pct', 'Heating reduction (pct)'),
-            ('mean_reduction_cooling_pct', 'Cooling reduction (pct)'),
-            ('mean_reduction_dhw_pct', 'DHW reduction (pct)'),
-            ('mean_reduction_electricity_pct', 'Electricity reduction (pct)'),
-            ('densification_pct', 'Densification (pct)')
-        ]:
-            xcol = col(key)
-            if xcol is None:
-                continue
-            if earlier_share is not None:
-                d = pd.DataFrame({'x': xcol, 'y': earlier_share}).dropna()
-                if len(d) >= 2:
-                    scatter_with_fit(d['x'].values, d['y'].values,
-                                     label, 'Earlier share',
-                                     f'Earlier share vs {label} (n={len(d)})',
-                                     figs / f"earlier_share_vs_{key}.png")
-            if later_share is not None:
-                d = pd.DataFrame({'x': xcol, 'y': later_share}).dropna()
-                if len(d) >= 2:
-                    scatter_with_fit(d['x'].values, d['y'].values,
-                                     label, 'Later share',
-                                     f'Later share vs {label} (n={len(d)})',
-                                     figs / f"later_share_vs_{key}.png")
 
         # Protected share by number of locked phases (bars)
         if 'protected_share' in df.columns and 'locked_phases_count' in df.columns:
@@ -1327,18 +1325,29 @@ def _generate_cross_run_insight_plots(analysis_dir: Path) -> None:
             d['protected_share'] = pd.to_numeric(d['protected_share'], errors='coerce')
             d['locked_phases_count'] = pd.to_numeric(d['locked_phases_count'], errors='coerce')
             d = d.dropna()
-            if len(d) >= 2 and d['locked_phases_count'].nunique() >= 1:
-                stats = d.groupby('locked_phases_count')['protected_share'].agg(['mean','count']).reset_index()
-                plt.figure(figsize=(6,4))
-                plt.bar(stats['locked_phases_count'].astype(int).astype(str), stats['mean'], width=0.5)
-                for i, row in stats.iterrows():
-                    plt.text(i, row['mean'], f"n={int(row['count'])}", ha='center', va='bottom', fontsize=8)
-                plt.xlabel('Locked phases count')
-                plt.ylabel('Protected share (locked unchanged)')
-                plt.title('Protected share by locked phases count')
-                plt.tight_layout()
-                plt.savefig(figs / 'protected_share_by_locked_phases_count.png', dpi=200)
-                plt.close()
+            if len(d) >= 2:
+                if d['locked_phases_count'].nunique() >= 2:
+                    stats = d.groupby('locked_phases_count')['protected_share'].agg(['mean','count']).reset_index()
+                    plt.figure(figsize=(6,4))
+                    plt.bar(stats['locked_phases_count'].astype(int).astype(str), stats['mean'], width=0.5)
+                    for i, row in stats.iterrows():
+                        plt.text(i, row['mean'], f"n={int(row['count'])}", ha='center', va='bottom', fontsize=8)
+                    plt.xlabel('Committed phases count')
+                    plt.ylabel('Protected share (committed unchanged)')
+                    plt.title('Protected share by committed phases count')
+                    plt.tight_layout()
+                    plt.savefig(figs / 'protected_share_by_locked_phases_count.png', dpi=200)
+                    plt.close()
+                else:
+                    # Placeholder when only one unique locked_phases_count exists
+                    plt.figure(figsize=(5.5, 2.8))
+                    cnt = int(d['locked_phases_count'].iloc[0]) if not d['locked_phases_count'].empty else -1
+                    mean_val = float(d['protected_share'].mean()) if not d['protected_share'].empty else float('nan')
+                    txt = f"Only one committed phases count present ({cnt}). Protected share = {mean_val:.1f}%"
+                    plt.text(0.5, 0.5, txt, ha='center', va='center')
+                    plt.axis('off')
+                    plt.savefig(figs / 'protected_share_by_locked_phases_count.png', dpi=200, bbox_inches='tight')
+                    plt.close()
 
         # Phase-wise relaxation plots from genome_phase_movements.csv
         mv_csv = analysis_dir / 'genome_phase_movements.csv'

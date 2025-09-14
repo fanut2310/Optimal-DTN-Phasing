@@ -3,8 +3,9 @@
 """
 Building Clustering Script for DTN Phased Optimization
 
-This script clusters buildings based on annual heat demand (column "QH_sys_MWhyr" in Total_demand.csv)
-and building proximity. *Cooling demand not yet considered and should be integrated later.
+This script clusters buildings based on annual thermal demand and building proximity.
+- For District Heating (DH): uses QH_sys_MWhyr (annual space-heating demand) when demand is included.
+- For District Cooling (DC): uses QC_sys_MWhyr (annual space-cooling demand) when demand is included.
 
 Outputs include:
 1. A CSV file with building cluster assignments
@@ -49,6 +50,12 @@ from scipy.spatial import cKDTree
 # Visualization library
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
+
+# Stdlib for manifest export
+import json
+import time as _time
+import sys as _sys
+import platform as _platform
 
 # CEA configuration and file locator
 import cea.config
@@ -250,7 +257,8 @@ def ensure_use_type_diversity(df, min_use_types):
             dists, nbrs = tree.query(coords[idx], k=10)
             for dist, nbr in zip(dists[1:], nbrs[1:]):
                 if clusters[nbr] != cluster_id:
-                    nbr_use = df.at[nbr, 'use_type']
+                    # Use positional indexing to avoid KeyError from label/index mismatch
+                    nbr_use = df.iloc[nbr]['use_type']
                     if nbr_use not in use_types:
                         # Swap this neighbor into current cluster
                         clusters[nbr] = cluster_id
@@ -664,12 +672,9 @@ def prepare_features(merged_df, heat_col='QH_sys_MWhyr', spatial_weight=25.0,
 
     # For K-means: use all specified features
     else:
-        # Keep as MWh instead of converting to kWh
-        merged_df['heat_MWhyr'] = merged_df[heat_col]
-
-        # Create initial numeric features array (with or without heat demand)
-        if include_heat_demand:
-            numeric_features = merged_df[['heat_MWhyr', 'x', 'y']].copy()
+        # Create initial numeric features array (with or without demand axis)
+        if include_heat_demand and (heat_col in merged_df.columns):
+            numeric_features = pd.concat([merged_df[[heat_col]], merged_df[['x', 'y']]], axis=1)
         else:
             numeric_features = merged_df[['x', 'y']].copy()
 
@@ -694,10 +699,10 @@ def prepare_features(merged_df, heat_col='QH_sys_MWhyr', spatial_weight=25.0,
                 scaled_year_features = year_scaler.fit_transform(year_features)
                 scaled_features = np.hstack((scaled_features, scaled_year_features))
 
-        # Add use_type features
+        # Add use_type features (exclude demand columns and bookkeeping)
         use_cols = [col for col in merged_df.columns if col not in
-                    ['name', 'geometry', 'x', 'y', 'heat_MWhyr', 'use_type', 'is_mixed_use',
-                     'use_type1', 'use_type2', 'use_type3', 'use_type1r', 'use_type2r', 'use_type3r',
+                    ['name', 'geometry', 'x', 'y', 'heat_MWhyr', 'thermal_MWhyr', 'QH_sys_MWhyr', 'QC_sys_MWhyr',
+                     'use_type', 'is_mixed_use', 'use_type1', 'use_type2', 'use_type3', 'use_type1r', 'use_type2r', 'use_type3r',
                      'constr_period'] + year_cols
                     and col not in merged_df.columns[:20]]
 
@@ -1062,9 +1067,9 @@ def save_results(cluster_data, locator):
     csv_path = locator.get_dtn_cluster_assignment_file()
     shp_path = os.path.join(output_dir, 'building_clusters.shp')
 
-    # Define core columns to keep with new order and renamed columns
-    # Put 'use_type' right after 'heat_MWhyr' as requested
-    core_columns = ['name', 'x', 'y', 'in_existing_DTN', 'cluster', 'heat_MWhyr', 'use_type']
+    # Define core columns to keep with new order
+    # Include unified thermal_MWhyr and keep heat_MWhyr for backward compatibility
+    core_columns = ['name', 'x', 'y', 'in_existing_DTN', 'cluster', 'thermal_MWhyr', 'heat_MWhyr', 'use_type']
 
     # Create a copy to avoid modifying the original dataframe
     save_data = cluster_data.copy()
@@ -1073,6 +1078,18 @@ def save_results(cluster_data, locator):
     for col in core_columns:
         if col not in save_data.columns and col == 'use_type' and 'dominant_use' in save_data.columns:
             save_data[col] = save_data['dominant_use']
+        elif col not in save_data.columns and col == 'thermal_MWhyr':
+            # Populate unified thermal demand from available sources if possible
+            if 'thermal_MWhyr' in save_data.columns:
+                pass  # already present
+            elif 'cool_MWhyr' in save_data.columns:
+                save_data[col] = save_data['cool_MWhyr']
+            elif 'heat_MWhyr' in save_data.columns:
+                save_data[col] = save_data['heat_MWhyr']
+            elif 'heat_kWhyr' in save_data.columns:
+                save_data[col] = save_data['heat_kWhyr'] / 1000.0
+            else:
+                save_data[col] = np.nan
         elif col not in save_data.columns and col == 'heat_MWhyr' and 'heat_kWhyr' in save_data.columns:
             save_data[col] = save_data['heat_kWhyr'] / 1000  # Convert kWh to MWh if needed
         elif col not in save_data.columns:
@@ -1201,8 +1218,20 @@ def cluster_buildings(buildings_shp, demand_df, locator,
     # Merge spatial data and demand data
     merged_df = merge_building_data(buildings_shp, demand_df)
 
-    # Store heat demand in MWh
-    merged_df['heat_MWhyr'] = merged_df['QH_sys_MWhyr']
+    # Select demand column based on network type and create unified thermal demand
+    network_type_upper = (network_type or 'DH').upper()
+    demand_col = 'QH_sys_MWhyr' if network_type_upper == 'DH' else 'QC_sys_MWhyr'
+    if demand_col in merged_df.columns:
+        merged_df['thermal_MWhyr'] = merged_df[demand_col]
+    else:
+        print(f"Warning: Expected demand column '{demand_col}' not found in Total_demand.csv. Proceeding without demand feature.")
+        merged_df['thermal_MWhyr'] = np.nan
+
+    # Preserve heat_MWhyr when available for backward compatibility
+    if 'QH_sys_MWhyr' in merged_df.columns:
+        merged_df['heat_MWhyr'] = merged_df['QH_sys_MWhyr']
+    else:
+        merged_df['heat_MWhyr'] = np.nan
 
     # Identify buildings in existing DTN from config
     dtn_buildings = existing_dtn_buildings or []
@@ -1212,11 +1241,12 @@ def cluster_buildings(buildings_shp, demand_df, locator,
     merged_df['in_existing_DTN'] = merged_df['name'].isin(dtn_buildings)
 
     # Separate DTN and non-DTN buildings
-    dtn_df = merged_df[merged_df['in_existing_DTN']].copy()
-    non_dtn_df = merged_df[~merged_df['in_existing_DTN']].copy()
+    dtn_df = merged_df[merged_df['in_existing_DTN']].copy().reset_index(drop=True)
+    non_dtn_df = merged_df[~merged_df['in_existing_DTN']].copy().reset_index(drop=True)
 
-    # Extract heat demand for potential post-processing
-    demand_values = non_dtn_df['heat_MWhyr'].values
+    # Extract thermal demand for potential post-processing / balancing (only if enabled)
+    demand_values = (non_dtn_df['thermal_MWhyr'].values
+                     if (include_heat_demand and ('thermal_MWhyr' in non_dtn_df.columns)) else None)
 
     # For non-DTN buildings, prepare features and perform clustering
     # Perform clustering based on selected algorithm
@@ -1224,7 +1254,7 @@ def cluster_buildings(buildings_shp, demand_df, locator,
         # Prepare features with clustering_algorithm parameter
         scaled_features, scaler = prepare_features(
             non_dtn_df,
-            heat_col='QH_sys_MWhyr',
+            heat_col=demand_col,
             spatial_weight=spatial_weight,
             use_type_weight=use_type_weight,
             year_weight=year_weight,
@@ -1238,7 +1268,9 @@ def cluster_buildings(buildings_shp, demand_df, locator,
             min_cluster_size=min_cluster_size,
             min_samples=min_samples,
             cluster_selection_epsilon=cluster_selection_epsilon,
-            cluster_selection_method=cluster_selection_method
+            cluster_selection_method=cluster_selection_method,
+            demand_values=demand_values,
+            max_demand_ratio=max_demand_ratio
         )
 
         # Assign initial labels
@@ -1265,7 +1297,7 @@ def cluster_buildings(buildings_shp, demand_df, locator,
         # For K-means, use the standard approach with all features
         scaled_features, scaler = prepare_features(
             non_dtn_df,
-            heat_col='QH_sys_MWhyr',
+            heat_col=demand_col,
             spatial_weight=spatial_weight,
             use_type_weight=use_type_weight,
             year_weight=year_weight,
@@ -1373,6 +1405,113 @@ def cluster_buildings(buildings_shp, demand_df, locator,
         save_path=plot_path
     )
 
+    # Write settings manifest (sidecar JSON) next to outputs
+    try:
+        export_manifest_flag = True
+        # Respect config flag if present elsewhere in the call stack
+        try:
+            # Attempt to get from a passed-through config attribute (optional)
+            export_manifest_flag = getattr(cea.config.Configuration().building_clustering, 'export_settings_manifest', True)
+        except Exception:
+            # If not resolvable via Configuration(), fall back to True
+            export_manifest_flag = True
+
+        if export_manifest_flag:
+            from pathlib import Path as _Path
+            manifest_path = _Path(out_csv).with_name('building_clustering_settings.json')
+
+            # Diagnostics
+            n_buildings = int(len(final_df))
+            unique_clusters = sorted([int(c) for c in set(final_df['cluster'])])
+            n_noise = int((final_df['cluster'] == -1).sum()) if 'cluster' in final_df.columns else 0
+            n_clusters_out = int(len([c for c in unique_clusters if c >= 0]))
+
+            # Environment and versions
+            _packages = {}
+            try:
+                import numpy as _np
+                import pandas as _pd
+                import sklearn as _sk
+                import hdbscan as _hdb
+                _packages = {
+                    'numpy': getattr(_np, '__version__', 'unknown'),
+                    'pandas': getattr(_pd, '__version__', 'unknown'),
+                    'sklearn': getattr(_sk, '__version__', 'unknown'),
+                    'hdbscan': getattr(_hdb, '__version__', 'unknown'),
+                }
+            except Exception:
+                pass
+
+            manifest = {
+                'algorithm': str(clustering_algorithm),
+                'kmeans': {
+                    'K': int(extra_clusters) if clustering_algorithm.lower() == 'kmeans' else None,
+                    'init': 'k-means++' if clustering_algorithm.lower() == 'kmeans' else None,
+                    'n_init': 10 if clustering_algorithm.lower() == 'kmeans' else None,
+                    'random_state': 42 if clustering_algorithm.lower() == 'kmeans' else None,
+                },
+                'hdbscan': {
+                    'min_cluster_size': int(min_cluster_size) if clustering_algorithm.lower() == 'hdbscan' else None,
+                    'min_samples': int(min_samples) if (clustering_algorithm.lower() == 'hdbscan' and min_samples is not None) else None,
+                    'cluster_selection_method': str(cluster_selection_method) if clustering_algorithm.lower() == 'hdbscan' else None,
+                    'cluster_selection_epsilon': float(cluster_selection_epsilon) if clustering_algorithm.lower() == 'hdbscan' else None,
+                    'metric': 'euclidean' if clustering_algorithm.lower() == 'hdbscan' else None,
+                },
+                'features': {
+                    'use_routing_distance': False,  # not used in current implementation
+                    'use_euclidean_distance': True,
+                    'use_demand': bool(include_heat_demand),
+                    'weights': {
+                        'alpha_spatial_weight': float(spatial_weight),
+                        'use_type_weight': float(use_type_weight),
+                        'year_weight': float(year_weight),
+                    },
+                    'normalization': {
+                        'scaler': 'StandardScaler',
+                    },
+                    'demand_feature': (demand_col if (include_heat_demand and (demand_col in merged_df.columns)) else 'none'),
+                    'use_construction_year': bool(use_construction_year),
+                },
+                'context': {
+                    'network_type': network_type_upper,
+                },
+                'post_processing': {
+                    'noise_reassign_distance': float(noise_reassign_distance),
+                    'ensure_min_use_types': bool(ensure_min_use_types),
+                    'min_use_types_per_cluster': int(min_use_types_per_cluster),
+                    'min_buildings_per_cluster': int(min_buildings_per_cluster),
+                    'max_demand_ratio': float(max_demand_ratio),
+                    'max_distance_threshold': float(max_distance_threshold),
+                    'pin_existing_to_cluster0': bool(pin_existing_to_cluster0),
+                },
+                'io': {
+                    'scenario': str(locator.scenario),
+                    'zone_geometry': locator.get_zone_geometry(),
+                    'demand_summary': locator.get_total_demand(),
+                    'output_assignment_csv': str(out_csv),
+                    'output_shapefile': str(out_shp),
+                    'output_plot': str(plot_path),
+                },
+                'diagnostics': {
+                    'n_buildings': n_buildings,
+                    'n_clusters_output': n_clusters_out,
+                    'n_noise': n_noise,
+                    'clusters_list': unique_clusters,
+                },
+                'env': {
+                    'python': _sys.version.split()[0],
+                    'platform': _platform.platform(),
+                    'packages': _packages,
+                    'timestamp_utc': _time.strftime('%Y-%m-%dT%H:%M:%SZ', _time.gmtime()),
+                },
+            }
+
+            with open(manifest_path, 'w', encoding='utf-8') as _f:
+                json.dump(manifest, _f, indent=2)
+            print(f"Saved clustering settings to: {manifest_path}")
+    except Exception as _e:
+        print(f"Warning: failed to write clustering settings manifest: {_e}")
+
     return final_df
 
 
@@ -1420,8 +1559,9 @@ def main(config):
     ensure_min_use_types = config.building_clustering.ensure_min_use_types
     min_use_types_per_cluster = config.building_clustering.min_use_types_per_cluster
 
-    # Pinning option (default True if not defined in schema)
-    pin_existing_to_cluster0 = getattr(config.building_clustering, 'pin_existing_to_cluster0', True)
+    # Pinning option is enforced to True (hidden from GUI)
+    pin_existing_to_cluster0 = True
+    log().info("Pin existing DTN buildings to cluster 0 is enforced (always True).")
 
     # Determine if we're running from GUI or command line
     # In GUI mode, don't show interactive plots to avoid blocking

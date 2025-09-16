@@ -1,3 +1,23 @@
+"""
+Dynamic DTN Optimization Part 3: Results Analysis
+
+This script produces single-run plots from Dynamic DTN opt part 2 vs baseline DTN opt,
+and cross-run plots for multiple scenarios from Dynamic DTN opt part 2 (e.g., different relaxation % on phased budgets),
+comparing to the baseline results.
+"""
+
+
+__author__ = "Fan Ut Chang"
+__copyright__ = "Copyright 2025, Architecture and Building Systems - ETH Zurich"
+__credits__ = ["Fan Ut Chang"]
+__license__ = "MIT"
+__version__ = "0.1"
+__maintainer__ = "Architecture and Building Systems - ETH Zurich"
+__email__ = "cea@arch.ethz.ch"
+__status__ = "Production"
+
+
+
 from __future__ import annotations
 
 import argparse
@@ -17,10 +37,6 @@ from matplotlib.ticker import MaxNLocator
 import cea.config
 import cea.inputlocator
 from cea.optimization_new import dynamic_dtn_optimization_part2 as part2
-
-__author__ = "Fan Ut Chang"
-__copyright__ = "Copyright 2025, City Energy Analyst"
-__license__ = "MIT"
 
 
 def log() -> logging.Logger:

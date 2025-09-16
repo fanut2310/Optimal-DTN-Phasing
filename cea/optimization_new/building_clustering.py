@@ -1,17 +1,8 @@
-#!/usr/bin/env python
-
 """
 Building Clustering Script for DTN Phased Optimization
 
-This script clusters buildings based on annual thermal demand and building proximity.
-- For District Heating (DH): uses QH_sys_MWhyr (annual space-heating demand) when demand is included.
-- For District Cooling (DC): uses QC_sys_MWhyr (annual space-cooling demand) when demand is included.
-
-Outputs include:
-1. A CSV file with building cluster assignments
-2. A shapefile with individual building geometries and cluster assignments
-
-The script handles mixed-use buildings and supports multi-stage district thermal network planning.
+This script assigns buildings and pipes based into clusters, which are later optimized in DTN optimization for their connection sequences.
+Existing buildings are assigned to Cluster 0, intermediary pipes on main streets (not directly connecting to buildings) are assigned to Cluster -1
 """
 
 __author__ = "Fan Ut Chang"
@@ -19,8 +10,8 @@ __copyright__ = "Copyright 2025, Architecture and Building Systems - ETH Zurich"
 __credits__ = ["Fan Ut Chang"]
 __license__ = "MIT"
 __version__ = "0.1"
-__maintainer__ = "Fan Ut Chang"
-__email__ = "changf@ethz.ch"
+__maintainer__ = "Architecture and Building Systems - ETH Zurich"
+__email__ = "cea@arch.ethz.ch"
 __status__ = "Production"
 
 # Standard libraries

@@ -550,7 +550,7 @@ Energy Supply System Optimisation:
       - [get_dtn_expansion_optimization_results_folder]
 
   - name: dynamic-dtn-optimization-part3
-    label: "Dynamic DTN Optimization Part 3: Sensitivity Analysis"
+    label: "Dynamic DTN Optimization Part 3: Results Analysis"
     description: |
       Computes and summarizes sensitivity metrics for dynamic DTN reruns by comparing baseline and temp-scenario
       demands, genomes, and KPIs. Produces master_summary.csv, cluster_level_deltas.csv, and rerun_analysis_summary.json

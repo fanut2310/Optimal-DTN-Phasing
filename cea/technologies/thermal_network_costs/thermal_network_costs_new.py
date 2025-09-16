@@ -1,8 +1,21 @@
 """
 Thermal network costs calculation for the "Thermal Network Part 3: costs" module.
 This module calculates the costs of a thermal network based on the results of the thermal_network.py simulation.
-It is adapted from the thermal_network_costs_ver2.py module to work as a standalone script.
+It is adapted from the archived thermal_network/thermal_network_costs.py module to work as a standalone script and continue on TN part 2.
 """
+
+
+
+__author__ = "Fan Ut Chang"
+__copyright__ = "Copyright 2025, Architecture and Building Systems - ETH Zurich"
+__credits__ = ["Fan Ut Chang"]
+__license__ = "MIT"
+__version__ = "0.1"
+__maintainer__ = "Daren Thomas"
+__email__ = "cea@arch.ethz.ch"
+__status__ = "Production"
+
+
 
 import numpy as np
 import pandas as pd
@@ -19,14 +32,7 @@ import cea.technologies.chiller_vapor_compression as VCCModel
 import cea.technologies.cooling_tower as CTModel
 from cea.utilities import epwreader
 
-__author__ = "Fan Ut Chang"
-__copyright__ = "Copyright 2025, Architecture and Building Systems - ETH Zurich"
-__credits__ = ["Fan Ut Chang"]
-__license__ = "MIT"
-__version__ = "0.1"
-__maintainer__ = "Daren Thomas"
-__email__ = "cea@arch.ethz.ch"
-__status__ = "Production"
+
 
 
 class NetworkCostFeatures(object):

@@ -1,3 +1,21 @@
+"""
+Dynamic DTN Optimization Part 1: Urban Metric Modification
+
+Based on the baseline DTN expansion optimization results, it allows users to select specific clusters to retrofit or vertically densify.
+It modifies the demands (and GFA) accordingly, and reruns the detailed model of Thermal Network Part 2 and Part 3.
+"""
+
+
+__author__ = "Fan Ut Chang"
+__copyright__ = "Copyright 2025, Architecture and Building Systems - ETH Zurich"
+__credits__ = ["Fan Ut Chang"]
+__license__ = "MIT"
+__version__ = "0.1"
+__maintainer__ = "Architecture and Building Systems - ETH Zurich"
+__email__ = "cea@arch.ethz.ch"
+__status__ = "Production"
+
+
 from __future__ import annotations
 
 ###############################################################################
@@ -20,10 +38,6 @@ import cea.inputlocator
 from cea.technologies.thermal_network.thermal_network import main as thermal_network_simulation_main
 from cea.technologies.thermal_network_costs.thermal_network_costs_new import main as thermal_network_costs_main
 
-
-__author__ = "Fan Ut Chang"
-__copyright__ = "Copyright 2025, City Energy Analyst"
-__license__ = "MIT"
 
 ###############################################################################
 # 3) LOGGING                                                                 #

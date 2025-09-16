@@ -1,3 +1,24 @@
+"""
+Dynamic DTN Optimization Part 2: Re-run Optimization
+
+It allows user to rerun the DTN expansion optimization with the part 1 modified-demand scenario.
+It also allows users to set relaxation on phased budgets and early-phase connection commitment (locking first n phases' clusters)
+to study the sensitivity of the rerun results to the relaxation on the phased budgets and early-phase connection commitment
+(in addition to the modified demands).
+"""
+
+
+__author__ = "Fan Ut Chang"
+__copyright__ = "Copyright 2025, Architecture and Building Systems - ETH Zurich"
+__credits__ = ["Fan Ut Chang"]
+__license__ = "MIT"
+__version__ = "0.1"
+__maintainer__ = "Architecture and Building Systems - ETH Zurich"
+__email__ = "cea@arch.ethz.ch"
+__status__ = "Production"
+
+
+
 from __future__ import annotations
 
 ###############################################################################
@@ -28,12 +49,6 @@ from cea.analysis.lca.operation import lca_operation
 from cea.analysis.costs.equations import calc_capex_annualized, calc_opex_annualized
 from cea.optimization.prices import Prices
 from cea.technologies.supply_systems_database import SupplySystemsDatabase
-
-
-# Note: The TempScenarioLocator class has been removed and replaced with direct path methods.
-# Instead of using a separate locator class to redirect file requests to the temporary scenario,
-# we now use direct path methods from the InputLocator class to access files in the temporary scenario.
-# This approach is more explicit, easier to debug, and prevents nested path problems.
 
 
 # Setup function for the creator based on optimization mode

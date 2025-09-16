@@ -139,7 +139,7 @@ def calc_Ctot_network_pump(network_cost_features, locator):
     return Capex_a_pump_USD, Opex_fixed_pump_USD, Opex_var
 
 
-def calc_Ctot_cooling_plants(thermal_network_type, thermal_network_name, locator):
+def calc_Ctot_cooling_plants(thermal_network_type, thermal_network_name, locator, cooling_cop=None):
     """
     Calculate the costs of centralized cooling plants (chillers and cooling towers).
 
@@ -149,6 +149,10 @@ def calc_Ctot_cooling_plants(thermal_network_type, thermal_network_name, locator
     :return: fixed operational expenditure, variable operational expenditure, annualized capital expenditure for chiller,
              and annualized capital expenditure for cooling tower
     """
+    # Skip plant cost calculation for DH networks (no central plant costs in Part 3)
+    if thermal_network_type != 'DC':
+        return 0.0, 0.0, 0.0, 0.0
+
     # Read in plant heat requirement
     plant_heat_hourly_kWh = pd.read_csv(
         locator.get_thermal_network_plant_heat_requirement_file(thermal_network_type, thermal_network_name), index_col=0)
@@ -196,8 +200,8 @@ def calc_Ctot_cooling_plants(thermal_network_type, thermal_network_name, locator
             peak_demand_W = plant_heat_peak_kW * 1000  # convert to W
             print('Calculating cost of heat production at plant number: ', (plant_number + 1))
 
-            # For simplicity, we'll use a constant COP for the chiller
-            COP_plant = 4.0  # Typical value for a centralized chiller
+            # Use manual cooling COP from config if provided; otherwise default to 4.0
+            COP_plant = float(cooling_cop) if (cooling_cop is not None and float(cooling_cop) > 0.0) else 4.0
             COP_chiller = 4.5  # Slightly higher than system COP
 
             # Calculate cost of producing cooling
@@ -329,8 +333,9 @@ def main(config):
         # Network Pumps
         Capex_a_pump, Opex_fixed_pump, Opex_var_pump = calc_Ctot_network_pump(network_cost_features, locator)
 
-        # Centralized plant
-        Opex_fixed_plant, Opex_var_plant, Capex_a_chiller, Capex_a_CT = calc_Ctot_cooling_plants(network_type, network_name, locator)
+        # Centralized plant (DC only). Use manual cooling COP from config.
+        cooling_cop = getattr(config.thermal_network_costs, 'cooling_cop', 4.0)
+        Opex_fixed_plant, Opex_var_plant, Capex_a_chiller, Capex_a_CT = calc_Ctot_cooling_plants(network_type, network_name, locator, cooling_cop)
 
         # Heat exchangers
         Capex_a_hex, Opex_fixed_hex = calc_Cinv_HEX_modified(network_type, network_name, locator)

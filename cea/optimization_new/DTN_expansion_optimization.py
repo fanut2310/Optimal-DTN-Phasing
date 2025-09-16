@@ -69,6 +69,8 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 from deap import base, tools, algorithms, creator
+from cea.optimization.prices import Prices
+from cea.technologies.supply_systems_database import SupplySystemsDatabase
 
 # Setup function for the creator based on optimization mode
 def setup_creator(multi_objective=False, objective_function='NPV', multi_objective_functions=None):
@@ -352,6 +354,21 @@ class DTNExpansionOptimizer:
         self.multi_objective_mode = multi_objective_mode
         self.multi_objective_functions = multi_objective_functions
         self.testing_clusters = testing_clusters
+
+        # Initialize buy prices using CEA Prices (USD/kWh)
+        try:
+            _supply_db = SupplySystemsDatabase(self.locator)
+            _prices = Prices(_supply_db)
+            self.elec_price_buy_usd_per_kwh = float(np.mean(_prices.ELEC_PRICE) * 1000.0)
+            self.gas_price_buy_usd_per_kwh = float(np.mean(_prices.NG_PRICE) * 1000.0)
+        except Exception:
+            self.elec_price_buy_usd_per_kwh = 0.12
+            self.gas_price_buy_usd_per_kwh = 0.08
+        # Fixed O&M fraction and DH plant modeling defaults
+        self.om_fraction_of_capex = 0.025
+        self.dh_supply_tech = 'boiler'  # options: 'boiler', 'hp'
+        self.boiler_efficiency = 0.92
+        self.hp_cop_dh = 3.0
 
         # Set up the creator based on optimization mode and selected objectives
         setup_creator(multi_objective_mode, objective_function, multi_objective_functions)
@@ -961,7 +978,8 @@ class DTNExpansionOptimizer:
             'hex_capex': hex_capex * discount_factor,
             'pump_capex': pump_capex * discount_factor,
             'cooling_plant_capex': cooling_plant_capex * discount_factor,
-            'discount_factor': discount_factor
+            'discount_factor': discount_factor,
+            'base_total_capex': total_base_capex
         }
 
     def _calculate_phase_total_expenditure(self, cluster_set, phase):
@@ -987,7 +1005,7 @@ class DTNExpansionOptimizer:
         # ---------------------------------------------------------------------
 
         # Calculate CAPEX with interest rate adjustment
-        capex, _ = self._calculate_phase_capex(cluster_set, phase)
+        capex, capex_details = self._calculate_phase_capex(cluster_set, phase)
 
         # Get metrics for this cluster set
         key = '+'.join(map(str, sorted(cluster_set)))
@@ -1002,42 +1020,56 @@ class DTNExpansionOptimizer:
         else:
             annual_demand_kwh = metrics['total_annual_Qc_MWh'] * 1000  # Convert MWh to kWh
 
-        # Calculate annual O&M costs (typically 2-3% of CAPEX)
-        annual_om_cost = 0.025 * capex
+        # Fixed O&M as fraction of installed base CAPEX (USD/yr)
+        capex_base = capex_details.get('base_total_capex', capex / capex_details.get('discount_factor', 1.0))
+        annual_fixed_om = float(self.om_fraction_of_capex) * capex_base
 
-        # Get the duration of this phase
-        phase_duration = self.phase_durations[phase-1]
+        # Variable OPEX monetization (USD/yr)
+        # Pump electricity from detailed calc (Wh/yr)
+        _, annual_pump_elec_Wh = self.calculate_pump_costs(cluster_set)
+        annual_pump_opex = (annual_pump_elec_Wh / 1000.0) * self.elec_price_buy_usd_per_kwh
 
-        # Calculate present value of OPEX for all years in the phase
-        opex_present_value = 0
-        for year in range(phase_duration):
-            discount_factor = 1 / ((1 + self.interest_rate) ** (year + 1))
-            opex_present_value += annual_om_cost * discount_factor
+        # Plant energy OPEX (USD/yr)
+        annual_plant_opex = 0.0
+        if self.network_type == 'DC':
+            # Cooling plant electricity (kWh/yr) from detailed calc
+            _, annual_plant_elec_kwh = self.calculate_cooling_plant_costs(cluster_set)
+            annual_plant_opex = annual_plant_elec_kwh * self.elec_price_buy_usd_per_kwh
+        else:  # DH
+            annual_delivered_kwh = annual_demand_kwh
+            if str(getattr(self, 'dh_supply_tech', 'boiler')).lower() == 'hp':
+                cop = max(float(getattr(self, 'hp_cop_dh', 3.0)), 1e-6)
+                annual_plant_opex = (annual_delivered_kwh / cop) * self.elec_price_buy_usd_per_kwh
+            else:
+                eta = max(float(getattr(self, 'boiler_efficiency', 0.92)), 1e-6)
+                annual_fuel_kwh = annual_delivered_kwh / eta
+                annual_plant_opex = annual_fuel_kwh * self.gas_price_buy_usd_per_kwh
 
-        # Total expenditure is CAPEX (happens once) plus OPEX (recurring) in present value
+        # Total annual OPEX for the phase
+        annual_opex = annual_fixed_om + (annual_pump_opex + annual_plant_opex if getattr(self, 'include_variable_opex', True) else 0.0)
+
+        # Discount OPEX from phase start over its duration
+        phase_duration = int(self.phase_durations[phase-1])
+        year_offset = 0
+        for p in range(1, phase):
+            year_offset += int(self.phase_durations[p-1])
+
+        opex_present_value = 0.0
+        for y in range(phase_duration):
+            t = year_offset + (y + 1)
+            opex_present_value += annual_opex / ((1.0 + self.interest_rate) ** t)
+
         total_expenditure = capex + opex_present_value
-
         return total_expenditure
 
     def calculate_roi(self, cluster_set, phase):
         """
         Calculate Discounted ROI for a cluster set in a specific phase.
 
-        Discounted ROI = present value of net annual returns over phase duration / CAPEX
+        Discounted ROI = PV of net annual returns over the remaining plan years / CAPEX
 
-        This calculation fully discounts all future cash flows to account for the time value of money.
-
-        Parameters:
-        -----------
-        cluster_set : tuple or list
-            Tuple or list of cluster IDs
-        phase : int
-            Phase number (1-based)
-
-        Returns:
-        --------
-        float
-            Discounted Return on Investment (ROI)
+        Cash-flow composition is aligned with NPV: revenue − [fixed O&M + optional variable OPEX].
+        All cash flows are discounted from the true phase start year.
         """
         # For phase 0, return 0 as per requirements
         if phase == 0:
@@ -1050,60 +1082,73 @@ class DTNExpansionOptimizer:
 
         metrics = self.cluster_metrics[key]
 
-        # Calculate CAPEX with interest rate adjustment
-        capex, _ = self._calculate_phase_capex(cluster_set, phase)
+        # Calculate CAPEX with interest rate adjustment (placed at phase start)
+        capex, capex_details = self._calculate_phase_capex(cluster_set, phase)
 
-        # Calculate annual revenue (energy price * annual demand)
+        # Annual revenue (energy price * annual delivered energy)
         if self.network_type == 'DH':
-            annual_demand_kwh = metrics['total_annual_Qh_MWh'] * 1000  # Convert MWh to kWh
+            annual_demand_kwh = metrics['total_annual_Qh_MWh'] * 1000  # MWh -> kWh
         else:
-            annual_demand_kwh = metrics['total_annual_Qc_MWh'] * 1000  # Convert MWh to kWh
-
+            annual_demand_kwh = metrics['total_annual_Qc_MWh'] * 1000  # MWh -> kWh
         annual_revenue = annual_demand_kwh * self.energy_price
 
-        # Calculate annual O&M costs (typically 2-3% of CAPEX)
-        annual_om_cost = 0.025 * capex
+        # Fixed O&M (fraction of installed base CAPEX) – USD/yr
+        capex_base = capex_details.get('base_total_capex', capex / capex_details.get('discount_factor', 1.0))
+        annual_fixed_om = float(self.om_fraction_of_capex) * capex_base
 
-        # Net annual return
-        net_annual_return = annual_revenue - annual_om_cost
+        # Variable OPEX (pump electricity + central plant energy) – USD/yr
+        # Pump electricity from detailed calc (Wh/yr)
+        _, annual_pump_elec_Wh = self.calculate_pump_costs(cluster_set)
+        annual_pump_opex = (annual_pump_elec_Wh / 1000.0) * self.elec_price_buy_usd_per_kwh
 
-        # Get the duration of this phase
-        phase_duration = self.phase_durations[phase-1]
+        # Plant energy OPEX (USD/yr)
+        annual_plant_opex = 0.0
+        if self.network_type == 'DC':
+            # Cooling plant electricity (kWh/yr) from detailed calc
+            _, annual_plant_elec_kwh = self.calculate_cooling_plant_costs(cluster_set)
+            annual_plant_opex = annual_plant_elec_kwh * self.elec_price_buy_usd_per_kwh
+        else:  # DH
+            annual_delivered_kwh = annual_demand_kwh
+            if str(getattr(self, 'dh_supply_tech', 'boiler')).lower() == 'hp':
+                cop = max(float(getattr(self, 'hp_cop_dh', 3.0)), 1e-6)
+                annual_plant_opex = (annual_delivered_kwh / cop) * self.elec_price_buy_usd_per_kwh
+            else:
+                eta = max(float(getattr(self, 'boiler_efficiency', 0.92)), 1e-6)
+                annual_fuel_kwh = annual_delivered_kwh / eta
+                annual_plant_opex = annual_fuel_kwh * self.gas_price_buy_usd_per_kwh
 
-        # Calculate present value of net annual returns over the entire phase duration
-        present_value_of_returns = 0
-        for year in range(phase_duration):
-            discount_factor = 1 / ((1 + self.interest_rate) ** (year + 1))
-            present_value_of_returns += net_annual_return * discount_factor
-
-        # Calculate Discounted ROI (present value of net annual returns / CAPEX)
-        if capex > 0:
-            roi = present_value_of_returns / capex
+        # Apply include_variable_opex gate
+        if getattr(self, 'include_variable_opex', True):
+            annual_costs = annual_fixed_om + annual_pump_opex + annual_plant_opex
         else:
-            roi = 0
+            annual_costs = annual_fixed_om
 
+        net_annual_return = annual_revenue - annual_costs
+
+        # Discounting window: use finance horizon years if set (>0), otherwise remaining plan years from phase start
+        cfg_horizon = int(getattr(self, 'finance_horizon_years', 0) or 0)
+        horizon_years = cfg_horizon if cfg_horizon > 0 else sum(int(d) for d in self.phase_durations[phase-1:])
+        year_offset = sum(int(self.phase_durations[p-1]) for p in range(1, phase))
+
+        present_value_of_returns = 0.0
+        for y in range(horizon_years):
+            t = year_offset + (y + 1)
+            present_value_of_returns += net_annual_return / ((1.0 + self.interest_rate) ** t)
+
+        # Discounted ROI (dimensionless)
+        roi = (present_value_of_returns / capex) if capex > 0 else 0.0
         return roi
 
-    def calculate_npv(self, cluster_set, phase, years=20):
+    def calculate_npv(self, cluster_set, phase, years=None):
         """
         Calculate Net Present Value for a cluster set in a specific phase.
 
-        Parameters:
-        -----------
-        cluster_set : tuple or list
-            Tuple or list of cluster IDs
-        phase : int
-            Phase number (1-based)
-        years : int
-            Number of years for NPV calculation
-
-        Returns:
-        --------
-        float
-            Net Present Value (NPV)
+        Cash-flow composition matches ROI: revenue − [fixed O&M + optional variable OPEX].
+        Returns are discounted from the true phase start year.
+        If years is None, the horizon defaults to the remaining plan years from the phase start.
         """
         # Calculate CAPEX with interest rate adjustment
-        capex, _ = self._calculate_phase_capex(cluster_set, phase)
+        capex, capex_details = self._calculate_phase_capex(cluster_set, phase)
 
         # For phase 0, return negative CAPEX as per requirements
         if phase == 0:
@@ -1116,40 +1161,56 @@ class DTNExpansionOptimizer:
 
         metrics = self.cluster_metrics[key]
 
-        # Calculate annual revenue and O&M costs
+        # Annual revenue (energy price * annual delivered energy)
         if self.network_type == 'DH':
-            annual_demand_kwh = metrics['total_annual_Qh_MWh'] * 1000  # Convert MWh to kWh
+            annual_demand_kwh = metrics['total_annual_Qh_MWh'] * 1000  # MWh -> kWh
         else:
-            annual_demand_kwh = metrics['total_annual_Qc_MWh'] * 1000  # Convert MWh to kWh
-
+            annual_demand_kwh = metrics['total_annual_Qc_MWh'] * 1000  # MWh -> kWh
         annual_revenue = annual_demand_kwh * self.energy_price
-        annual_om_cost = 0.025 * capex
-        net_annual_return = annual_revenue - annual_om_cost
 
-        # Calculate the year when this phase starts
-        phase_start_year = 0
-        for p in range(1, phase):
-            phase_start_year += self.phase_durations[p-1]
+        # Fixed O&M (fraction of installed base CAPEX) – USD/yr
+        capex_base = capex_details.get('base_total_capex', capex / capex_details.get('discount_factor', 1.0))
+        annual_fixed_om = float(self.om_fraction_of_capex) * capex_base
 
-        # Calculate NPV
-        npv = -capex  # Initial investment (negative) at the start of the phase
+        # Variable OPEX (pump electricity + central plant energy) – USD/yr
+        _, annual_pump_elec_Wh = self.calculate_pump_costs(cluster_set)
+        annual_pump_opex = (annual_pump_elec_Wh / 1000.0) * self.elec_price_buy_usd_per_kwh
 
-        for year in range(years):
-            # Only count returns for years after the phase starts
-            if year >= phase_start_year:
-                # Determine which phase this year belongs to
-                current_phase = 1
-                year_in_phases = year
-                while current_phase <= self.num_phases:
-                    if year_in_phases < self.phase_durations[current_phase-1]:
-                        break
-                    year_in_phases -= self.phase_durations[current_phase-1]
-                    current_phase += 1
+        annual_plant_opex = 0.0
+        if self.network_type == 'DC':
+            _, annual_plant_elec_kwh = self.calculate_cooling_plant_costs(cluster_set)
+            annual_plant_opex = annual_plant_elec_kwh * self.elec_price_buy_usd_per_kwh
+        else:
+            annual_delivered_kwh = annual_demand_kwh
+            if str(getattr(self, 'dh_supply_tech', 'boiler')).lower() == 'hp':
+                cop = max(float(getattr(self, 'hp_cop_dh', 3.0)), 1e-6)
+                annual_plant_opex = (annual_delivered_kwh / cop) * self.elec_price_buy_usd_per_kwh
+            else:
+                eta = max(float(getattr(self, 'boiler_efficiency', 0.92)), 1e-6)
+                annual_fuel_kwh = annual_delivered_kwh / eta
+                annual_plant_opex = annual_fuel_kwh * self.gas_price_buy_usd_per_kwh
 
-                # Only count returns if we're in or after the current phase
-                if current_phase >= phase:
-                    discount_factor = 1 / ((1 + self.interest_rate) ** (year + 1))
-                    npv += net_annual_return * discount_factor
+        # Apply include_variable_opex gate
+        if getattr(self, 'include_variable_opex', True):
+            annual_costs = annual_fixed_om + annual_pump_opex + annual_plant_opex
+        else:
+            annual_costs = annual_fixed_om
+
+        net_annual_return = annual_revenue - annual_costs
+
+        # Horizon: finance horizon years if set (>0), else remaining plan years by default
+        if years is None:
+            cfg_horizon = int(getattr(self, 'finance_horizon_years', 0) or 0)
+            years = cfg_horizon if cfg_horizon > 0 else sum(int(d) for d in self.phase_durations[phase-1:])
+
+        # Phase start offset (years from project start)
+        phase_start_year = sum(int(self.phase_durations[p-1]) for p in range(1, phase))
+
+        # NPV: negative CAPEX at phase start plus discounted annual returns
+        npv = -capex
+        for y in range(years):
+            t = phase_start_year + (y + 1)
+            npv += net_annual_return / ((1.0 + self.interest_rate) ** t)
 
         return npv
 
@@ -4435,6 +4496,14 @@ class DTNExpansionOptimizer:
                     except StopIteration:
                         p.rmdir()
                         log().info(f"Removed empty legacy directory: {p}")
+            # Also remove an empty 'plots' folder if present (no plots generated in this run)
+            plots_dir = dtn_dir / 'plots'
+            if plots_dir.exists() and plots_dir.is_dir():
+                try:
+                    next(plots_dir.iterdir())
+                except StopIteration:
+                    plots_dir.rmdir()
+                    log().info(f"Removed empty legacy directory: {plots_dir}")
         except Exception:
             pass
 
@@ -4466,7 +4535,7 @@ class PipeLayoutGenerator:
         self.testing_clusters = testing_clusters
         self.chosen_buildings = chosen_buildings
         self.output_folder = Path(locator.get_dtn_expansion_optimization_results_folder()) / f"phase_{phase}"
-        self.output_folder.mkdir(parents=True, exist_ok=True)
+        # Do not create the folder unless a file is actually written to it.
 
         # Load input data
         self._load_inputs()
@@ -4919,6 +4988,7 @@ def main(config):
                 "total_expenditure_budget_per_phase": total_expenditure_budget_per_phase,
                 "ghg_budget_per_phase": ghg_budget_per_phase,
                 "interest_rate": interest_rate,
+                "finance_horizon_years": int(getattr(config.dtn_expansion_optimization, 'finance_horizon_years', 0) or 0),
                 "cost_model": cost_model,
                 "diversity_factor": diversity_factor,
                 "temperature_difference_dh": temperature_difference_dh,
@@ -4967,6 +5037,43 @@ def main(config):
             multi_objective_functions=multi_objective_functions,
             testing_clusters=testing_clusters
         )
+
+        # Apply OPEX-related overrides from config if provided
+        try:
+            if hasattr(config.dtn_expansion_optimization, 'include_variable_opex'):
+                optimizer.include_variable_opex = bool(config.dtn_expansion_optimization.include_variable_opex)
+            if hasattr(config.dtn_expansion_optimization, 'om_fraction_of_capex') and config.dtn_expansion_optimization.om_fraction_of_capex is not None:
+                optimizer.om_fraction_of_capex = float(config.dtn_expansion_optimization.om_fraction_of_capex)
+            if hasattr(config.dtn_expansion_optimization, 'dh_supply_tech') and config.dtn_expansion_optimization.dh_supply_tech:
+                optimizer.dh_supply_tech = str(config.dtn_expansion_optimization.dh_supply_tech)
+            if hasattr(config.dtn_expansion_optimization, 'boiler_efficiency') and config.dtn_expansion_optimization.boiler_efficiency:
+                optimizer.boiler_efficiency = float(config.dtn_expansion_optimization.boiler_efficiency)
+            if hasattr(config.dtn_expansion_optimization, 'hp_cop_dh') and config.dtn_expansion_optimization.hp_cop_dh:
+                optimizer.hp_cop_dh = float(config.dtn_expansion_optimization.hp_cop_dh)
+            # Manual energy tariff for revenue (USD per kWh of delivered thermal energy)
+            if hasattr(config.dtn_expansion_optimization, 'energy_price') and config.dtn_expansion_optimization.energy_price is not None:
+                try:
+                    optimizer.energy_price = float(config.dtn_expansion_optimization.energy_price)
+                    log().info(f"Using manual energy tariff for revenue: {optimizer.energy_price:.3f} USD/kWh of delivered thermal energy (heat for DH, cooling for DC).")
+                except Exception:
+                    pass
+            # Finance horizon (years): if >0, per-phase NPV/ROI integrate returns over this horizon from phase start
+            if hasattr(config.dtn_expansion_optimization, 'finance_horizon_years') and config.dtn_expansion_optimization.finance_horizon_years is not None:
+                try:
+                    optimizer.finance_horizon_years = int(config.dtn_expansion_optimization.finance_horizon_years)
+                    if optimizer.finance_horizon_years > 0:
+                        log().info(f"Using finance horizon years for NPV/ROI: {optimizer.finance_horizon_years} years from phase start.")
+                except Exception:
+                    pass
+            if hasattr(config.dtn_expansion_optimization, 'elec_price_override_usd_per_kwh') and float(config.dtn_expansion_optimization.elec_price_override_usd_per_kwh) > 0:
+                optimizer.elec_price_buy_usd_per_kwh = float(config.dtn_expansion_optimization.elec_price_override_usd_per_kwh)
+            if hasattr(config.dtn_expansion_optimization, 'gas_price_override_usd_per_kwh') and float(config.dtn_expansion_optimization.gas_price_override_usd_per_kwh) > 0:
+                optimizer.gas_price_buy_usd_per_kwh = float(config.dtn_expansion_optimization.gas_price_override_usd_per_kwh)
+        except Exception as e:
+            try:
+                log().warning(f"Failed to apply OPEX overrides: {e}")
+            except Exception:
+                pass
 
         # Emissions are LCA-only; compute-emissions-from-cop is deprecated and ignored
         try:

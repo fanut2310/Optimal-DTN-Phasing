@@ -288,22 +288,43 @@ def _load_baseline_and_rerun_genomes(locator: cea.inputlocator.InputLocator, net
     rerun_summary = rerun_root / 'rerun_summary.json'
     rerun_genome: List[int] = []
     rerun_metrics: Dict = {}
+    # 1) Try JSON (genome + objective), if present
     if rerun_summary.exists():
         try:
             with open(rerun_summary, 'r') as f:
                 data = json.load(f)
                 rerun_genome = _safe_literal_list(data.get('genome', []))
-                rerun_metrics['objective_function'] = data.get('objective_function')
+                if data.get('objective_function'):
+                    rerun_metrics['objective_function'] = data.get('objective_function')
         except Exception as e:
             log().warning(f"Failed to load rerun_summary.json: {e}")
-    if not rerun_genome:
-        # Try parse optimization_results CSV
+    # 2) Always try to merge rerun fitness metrics from CSV (even if JSON exists)
+    try:
+        # Primary expected location written by Part 2
         opt_dir = rerun_root / 'optimization_results'
         rerun_csv = opt_dir / f"all_evaluated_individuals_{network_type}.csv"
-        if rerun_csv.exists():
-            rerun_genome, rerun_metrics = _load_best_genome_from_results(rerun_csv, objective)
+        csv_candidates = [rerun_csv]
+        # Fallback: some builds save under dtn_expansion/
+        csv_candidates.append(rerun_root / 'dtn_expansion' / f"all_evaluated_individuals_{network_type}.csv")
+        csv_genome: List[int] = []
+        csv_metrics: Dict = {}
+        found_csv = None
+        for cand in csv_candidates:
+            if cand.exists():
+                found_csv = cand
+                csv_genome, csv_metrics = _load_best_genome_from_results(cand, objective)
+                break
+        if found_csv:
+            # Merge metrics (adds fitness_* like fitness_NPV / fitness_ROI)
+            if csv_metrics:
+                rerun_metrics.update(csv_metrics)
+            # Prefer CSV genome if JSON didn't provide one
+            if csv_genome and not rerun_genome:
+                rerun_genome = csv_genome
         else:
-            log().warning(f"Rerun optimization results not found at {rerun_csv}")
+            log().warning(f"Rerun optimization results CSV not found at any expected path under {rerun_root}")
+    except Exception as e:
+        log().warning(f"Failed to load rerun optimization CSV metrics: {e}")
     return baseline_genome, rerun_genome, baseline_metrics, rerun_metrics
 
 
@@ -1025,6 +1046,25 @@ def main(config):
         pass
     master_row.update({f"baseline_{k}": v for k, v in baseline_metrics.items()})
     master_row.update({f"rerun_{k}": v for k, v in rerun_metrics.items()})
+    
+    # Compute simple deltas for common fitness metrics if both baseline and rerun are present
+    try:
+        for metric in [
+            'fitness_NPV',
+            'fitness_ROI',
+            'fitness_emissions'
+        ]:
+            b_key = f'baseline_{metric}'
+            r_key = f'rerun_{metric}'
+            d_key = f'delta_{metric}'
+            if b_key in master_row and r_key in master_row:
+                b_val = pd.to_numeric(master_row[b_key], errors='coerce')
+                r_val = pd.to_numeric(master_row[r_key], errors='coerce')
+                if pd.notna(b_val) and pd.notna(r_val):
+                    master_row[d_key] = float(r_val - b_val)
+    except Exception:
+        pass
+
     master_row.update(emissions_summary)
 
     # Save outputs (robust aligned writer to avoid schema drift)

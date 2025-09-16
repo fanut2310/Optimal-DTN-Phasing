@@ -350,8 +350,9 @@ Energy Supply System Optimisation:
                   'dtn-expansion-optimization:run-optimization', 'dtn-expansion-optimization:capex-budget-per-phase', 
                   'dtn-expansion-optimization:total-expenditure-budget-per-phase',
                   'dtn-expansion-optimization:num-phases', 'dtn-expansion-optimization:phase-durations', 'dtn-expansion-optimization:interest-rate',
+                  'dtn-expansion-optimization:finance-horizon-years',
                   'dtn-expansion-optimization:population-size', 'dtn-expansion-optimization:num-generations',
-                  'dtn-expansion-optimization:objective-function', 'dtn-expansion-optimization:roi-phase-weights',
+                  'dtn-expansion-optimization:objective-function', 'dtn-expansion-optimization:energy-price', 'dtn-expansion-optimization:roi-phase-weights',
                   'dtn-expansion-optimization:diversity-factor', 'dtn-expansion-optimization:temperature-difference-dh', 
                   'dtn-expansion-optimization:temperature-difference-dc', 'dtn-expansion-optimization:pressure-loss-pa-per-m',
                   'dtn-expansion-optimization:pump-operation-hours', 'dtn-expansion-optimization:pump-efficiency',
@@ -363,6 +364,14 @@ Energy Supply System Optimisation:
                   'dtn-expansion-optimization:ga-tournament-size',
                   'dtn-expansion-optimization:ga-mutation-indpb',
                   'dtn-expansion-optimization:ga-random-seed',
+                  # OPEX controls
+                  'dtn-expansion-optimization:include-variable-opex',
+                  'dtn-expansion-optimization:om-fraction-of-capex',
+                  'dtn-expansion-optimization:dh-supply-tech',
+                  'dtn-expansion-optimization:boiler-efficiency',
+                  'dtn-expansion-optimization:hp-cop-dh',
+                  'dtn-expansion-optimization:elec-price-override-usd-per-kwh',
+                  'dtn-expansion-optimization:gas-price-override-usd-per-kwh',
                   ]
     input-files:
       - [get_street_network]
@@ -458,8 +467,9 @@ Energy Supply System Optimisation:
                   'dtn-expansion-optimization:capex-budget-per-phase',
                   'dtn-expansion-optimization:total-expenditure-budget-per-phase',
                   'dtn-expansion-optimization:interest-rate',
+                  'dtn-expansion-optimization:finance-horizon-years',
                   'dtn-expansion-optimization:cost-model',
-                  'dtn-expansion-optimization:objective-function',
+                  'dtn-expansion-optimization:objective-function', 'dtn-expansion-optimization:energy-price',
                   'dtn-expansion-optimization:diversity-factor',
                   'dtn-expansion-optimization:temperature-difference-dh',
                   'dtn-expansion-optimization:temperature-difference-dc',
@@ -488,6 +498,14 @@ Energy Supply System Optimisation:
                   'dtn-expansion-optimization:ga-tournament-size',
                   'dtn-expansion-optimization:ga-mutation-indpb',
                   'dtn-expansion-optimization:ga-random-seed',
+                  # OPEX controls
+                  'dtn-expansion-optimization:include-variable-opex',
+                  'dtn-expansion-optimization:om-fraction-of-capex',
+                  'dtn-expansion-optimization:dh-supply-tech',
+                  'dtn-expansion-optimization:boiler-efficiency',
+                  'dtn-expansion-optimization:hp-cop-dh',
+                  'dtn-expansion-optimization:elec-price-override-usd-per-kwh',
+                  'dtn-expansion-optimization:gas-price-override-usd-per-kwh',
                   'dynamic-dtn-optimization:include-in-part3',
                   'dynamic-dtn-optimization:run-label'
                   ]
